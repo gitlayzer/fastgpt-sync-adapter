@@ -217,9 +217,11 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "node is not a file")
 		return
 	}
-	// 中文文件名按 RFC 5987 编码，保证 FastGPT/浏览器正确解析文件名
+	// inline 而非 attachment：浏览器可直接预览 PDF/图片/文本等，
+	// 不支持预览的格式（如 docx）仍会自动下载；对 FastGPT 抓取无影响（它只读字节流）。
+	// 中文文件名按 RFC 5987 编码，保证 FastGPT/浏览器正确解析文件名。
 	encoded := url.PathEscape(node.Name)
-	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+encoded)
+	w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+encoded)
 	http.ServeFile(w, r, node.AbsPath())
 }
 
