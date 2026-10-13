@@ -18,6 +18,12 @@ import (
 )
 
 func main() {
+	// serve 子命令：API 文件库模式（previewUrl 文件服务器）
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		serveMain(os.Args[2:])
+		return
+	}
+
 	cfgPath := flag.String("config", "config.yaml", "配置文件路径")
 	flag.Parse()
 

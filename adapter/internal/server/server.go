@@ -3,12 +3,21 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 
-	"fastgpt-sync-adapter/adapter/internal/config"
-	"fastgpt-sync-adapter/adapter/internal/extract"
 	"fastgpt-sync-adapter/adapter/internal/store"
 )
+
+// Options serve 模式（API 文件库 + 文件服务器）的运行参数。
+type Options struct {
+	Addr  string // 监听地址，如 :8080
+	Token string // FastGPT 调用时携带的 Bearer token
+	// 外部可访问地址（用于拼 previewUrl/read 链接）。
+	// 例如经 cloudflared 暴露时填 https://xxx.trycloudflare.com；
+	// 留空则从请求头推断（X-Forwarded-Proto/Host 或直连 Host）。
+	ExternalURL string
+}
 
 // FastGPT 统一响应格式
 type resp struct {
@@ -18,13 +27,13 @@ type resp struct {
 }
 
 type Server struct {
-	cfg   *config.Config
+	opts  Options
 	store *store.Store
 	mux   *http.ServeMux
 }
 
-func New(cfg *config.Config, st *store.Store) *Server {
-	s := &Server{cfg: cfg, store: st, mux: http.NewServeMux()}
+func New(opts Options, st *store.Store) *Server {
+	s := &Server{opts: opts, store: st, mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
@@ -34,23 +43,67 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/file/content", s.withAuth(s.handleContent))
 	s.mux.HandleFunc("/v1/file/read", s.withAuth(s.handleRead))
 	s.mux.HandleFunc("/v1/file/detail", s.withAuth(s.handleDetail))
-	s.mux.HandleFunc("/v1/file/download", s.withAuth(s.handleDownload))
+	// download 允许 query token（FastGPT 拉 previewUrl 时不带 Authorization 头）
+	s.mux.HandleFunc("/v1/file/download", s.withAuthOrQueryToken(s.handleDownload))
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 }
 
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// withAuth 校验 Authorization: Bearer <token>
+// tokenValid 校验 Bearer header。
+func (s *Server) tokenValid(r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	return strings.HasPrefix(auth, prefix) && strings.TrimPrefix(auth, prefix) == s.opts.Token
+}
+
+// withAuth 仅接受 Authorization: Bearer <token>。
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(auth, prefix) || strings.TrimPrefix(auth, prefix) != s.cfg.Token {
+		if !s.tokenValid(r) {
 			writeErr(w, http.StatusUnauthorized, "invalid or missing bearer token")
 			return
 		}
 		next(w, r)
 	}
+}
+
+// withAuthOrQueryToken Bearer 或 ?token= 均可（用于文件下载外链）。
+func (s *Server) withAuthOrQueryToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.tokenValid(r) && r.URL.Query().Get("token") != s.opts.Token {
+			writeErr(w, http.StatusUnauthorized, "invalid or missing token")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// externalBase 计算对外可访问的 base URL。
+func (s *Server) externalBase(r *http.Request) string {
+	if s.opts.ExternalURL != "" {
+		return strings.TrimRight(s.opts.ExternalURL, "/")
+	}
+	scheme := r.Header.Get("X-Forwarded-Proto")
+	if scheme == "" {
+		scheme = "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+	}
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
+}
+
+// fileURL 拼某个文件的下载外链（带 token，供 FastGPT/浏览器直接访问）。
+func (s *Server) fileURL(r *http.Request, id string) string {
+	q := url.Values{}
+	q.Set("id", id)
+	q.Set("token", s.opts.Token)
+	return s.externalBase(r) + "/v1/file/download?" + q.Encode()
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -94,6 +147,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /v1/file/content?id=xx
+// 改为返回 previewUrl：FastGPT 通过该外链下载原文件并自行解析（支持 PDF/Word/Excel 等），
+// 本服务不再做文本提取，文件内容原样提供。
 func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
@@ -109,14 +164,9 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "node is not a file")
 		return
 	}
-	content, err := extract.Text(node.AbsPath())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "read file: "+err.Error())
-		return
-	}
 	writeOK(w, map[string]string{
-		"title":   node.Name,
-		"content": content,
+		"title":      node.Name,
+		"previewUrl": s.fileURL(r, id),
 	})
 }
 
@@ -131,15 +181,8 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	// 提供一个可访问的下载链接。本地测试时返回本服务的下载端点。
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	host := r.Host
-	url := scheme + "://" + host + "/v1/file/download?id=" + id
 	writeOK(w, map[string]string{
-		"url": url,
+		"url": s.fileURL(r, id),
 	})
 }
 
@@ -158,7 +201,7 @@ func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, node)
 }
 
-// GET /v1/file/download?id=xx  原样返回文件字节流（供 read/previewUrl 使用）
+// GET /v1/file/download?id=xx&token=xx  原样返回文件字节流（供 previewUrl/read 使用）
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
@@ -174,7 +217,9 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "node is not a file")
 		return
 	}
-	w.Header().Set("Content-Disposition", "attachment; filename=\""+node.Name+"\"")
+	// 中文文件名按 RFC 5987 编码，保证 FastGPT/浏览器正确解析文件名
+	encoded := url.PathEscape(node.Name)
+	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+encoded)
 	http.ServeFile(w, r, node.AbsPath())
 }
 
