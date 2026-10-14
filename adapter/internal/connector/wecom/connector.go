@@ -126,6 +126,7 @@ func messageToRecord(m *Message) model.Record {
 		ID:          m.MsgID,
 		Timestamp:   m.MsgTime,
 		OwnerIDs:    owners,
+		SenderID:    m.From,
 		GroupID:     m.RoomID, // 空=单聊
 		Body:        m.Raw,
 		Attachments: extractAttachments(m),

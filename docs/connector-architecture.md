@@ -108,44 +108,58 @@ connector/wecom/
 
 映射关系：企微 `msgid→Record.ID`，`from+tolist→OwnerIDs`，`roomid→GroupID`，`msgtime→Timestamp`，解密后的完整 JSON→`Body`（原样保留），`sdkfileid→Attachment.FileID`。checkpoint 就是 `seq`。
 
-## 4. Sink 现状（复用已有代码）
+## 4. Sink 现状
 
-| Sink | 现有模块 | 行为 |
+| Sink | 模块 | 行为 |
 |---|---|---|
-| NAS | `internal/synology` | Record.Body 落 `<root>/<GroupID>/<ID>.json`；附件原样字节落同目录 |
-| FastGPT 上传（方案A） | `internal/uploader` + `syncer` | 扫描 NAS 目录上传+重命名（已实测） |
-| FastGPT 文件库（方案B） | `internal/server` + `store` | serve 模式提供 previewUrl 外链（已实测） |
+| NAS（归档） | `internal/sink/nas` | Record.Body 落 `<root>/<source>/<发送者>/<群ID\|direct>/<ID>.json`；附件经连接器回调拉字节后原样落 `attachments/` |
+| FastGPT（直传） | `internal/sink/fastgpt` | 只上传文件附件（消息体不进知识库）：上传 + 二次调 API 改回真实文件名；按 sdkfileid 去重 |
 
-方案 A/B 仍是评审的二选一，与连接器架构正交——连接器只保证数据到 NAS。
+方案 B（FastGPT API 文件库 serve 模式，`internal/server` + `store`）保留为独立子命令，不参与 daemon 管线。
 
 ## 5. 配置结构（按连接器组织）
 
 ```yaml
 engine:
-  state_file: ./state.json        # 各连接器 checkpoint 统一存这里
+  state_file: ./connector_state.json   # 各连接器 checkpoint 统一存这里
+  run_on_start: true
 connectors:
   wecom:
     enabled: true
-    interval: 60s                 # 该连接器的拉取间隔
+    interval: 60s                      # 该连接器的拉取间隔
+    batch_limit: 100
     corp_id: ""
     secret: ""
     rsa_private_key_file: ""
     sdk_lib_path: ./lib/arm64
-  feishu:                          # TODO，占位
+  feishu:                              # TODO，占位
     enabled: false
-sinks:
-  nas:
+sinks:                                 # 出口二选一，同时只能启用一个
+  nas:                                 # 归档出口：消息体+附件原样落盘
     enabled: true
     url: https://nas.example.com:5001
     username: FastGPT
     password: ""
     root_path: /FastGPT-test
-  fastgpt:
-    enabled: false                 # 评审定 A/B 后启用对应模式
+    user_dirs:                         # 按 FastGPT 用户列表自动建目录（人工上传区）
+      enabled: false
+      fastgpt_base_url: ""
+      fastgpt_api_key: ""              # 需账号级 key
+  fastgpt:                             # 直传出口：仅文件附件进知识库（字节直供，不经本地目录）
+    enabled: false
     base_url: ""
     api_key: ""
     dataset_id: ""
+    image_index: true
+    state_file: ./fastgpt_upload_state.json  # 附件按 sdkfileid 去重
 ```
+
+**关键决策（已确认）**：
+- FastGPT 知识库只进**文件附件**，聊天消息 JSON 只归档到 NAS，不进知识库。
+- NAS 与 FastGPT 两个出口**二选一**（归档 vs 直传），配置校验强制互斥。
+- NAS 落盘目录**按发送者归属**：`<root>/<来源>/<发送者>/<群ID|direct>/`。
+- **无本地目录依赖**：附件字节由连接器经回调直供 Sink，全链路不扫盘、不挂载。
+- serve 子命令（方案 B，FastGPT 经 previewUrl 来拉）保留，与 daemon 互不影响。
 
 ## 6. 目录结构规划（目标态 vs 现状）
 

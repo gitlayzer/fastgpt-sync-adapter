@@ -1,5 +1,5 @@
 // fastgpt-sync-adapter：多源数据连接器平台。
-// 默认（无子命令）= daemon 模式：连接器拉数据 → Sink 落盘；
+// 默认（无子命令）= daemon 模式：连接器拉数据 → Sink 出口（NAS 归档 / FastGPT 附件直传，二选一）；
 // serve 子命令 = FastGPT API 文件库模式（previewUrl 文件服务器，方案 B）。
 package main
 
@@ -16,8 +16,8 @@ import (
 	"fastgpt-sync-adapter/adapter/internal/connector/wecom"
 	"fastgpt-sync-adapter/adapter/internal/engine"
 	"fastgpt-sync-adapter/adapter/internal/fastgpt"
-	nassink "fastgpt-sync-adapter/adapter/internal/sink/nas"
 	fastgptsink "fastgpt-sync-adapter/adapter/internal/sink/fastgpt"
+	nassink "fastgpt-sync-adapter/adapter/internal/sink/nas"
 )
 
 func main() {
@@ -38,29 +38,32 @@ func main() {
 	log.Printf("==============================================")
 	log.Printf(" fastgpt-sync-adapter（连接器平台）")
 	log.Printf(" 企微连接器 : enabled=%v", cfg.Connectors.WeCom.Enabled)
-	log.Printf(" NAS Sink   : enabled=%v", cfg.Sinks.NAS.Enabled)
-	log.Printf(" FastGPT上传: enabled=%v", cfg.Sinks.FastGPT.Enabled)
+	log.Printf(" NAS Sink   : enabled=%v（归档：消息+附件原样落盘）", cfg.Sinks.NAS.Enabled)
+	log.Printf(" FastGPT S.: enabled=%v（直传：仅附件进知识库）", cfg.Sinks.FastGPT.Enabled)
 	log.Printf("==============================================")
 
 	eng := engine.New(cfg.Engine.StateFile)
 
-	// ===== Sink：NAS =====
-	var nas *nassink.Sink
+	// ===== Sink 二选一 =====
 	if cfg.Sinks.NAS.Enabled {
-		nas = nassink.New(cfg.Sinks.NAS.Config)
+		nas := nassink.New(cfg.Sinks.NAS.Config)
 		if err := nas.Login(); err != nil {
 			log.Fatalf("群晖 NAS 登录失败: %v", err)
 		}
 		log.Printf("[OK] 群晖 NAS 登录成功（root=%s）", cfg.Sinks.NAS.RootPath)
 		eng.AddSink(nas)
 
-		// 按 FastGPT 用户列表在 NAS 建目录（需账号级 api_key）
-		if cfg.Sinks.FastGPT.APIKey != "" {
-			userClient := fastgpt.NewUserClient(cfg.Sinks.FastGPT.BaseURL, cfg.Sinks.FastGPT.APIKey)
+		// 按 FastGPT 用户列表在 NAS 自动建目录（账号级 api_key）
+		if ud := cfg.Sinks.NAS.UserDirs; ud.Enabled {
+			userClient := fastgpt.NewUserClient(ud.FastGPTBaseURL, ud.FastGPTAPIKey)
 			if err := ensureUserDirs(nas, userClient, cfg.Sinks.NAS.RootPath); err != nil {
 				log.Printf("[警告] 用户目录创建: %v", err)
 			}
 		}
+	}
+	if cfg.Sinks.FastGPT.Enabled {
+		eng.AddSink(fastgptsink.New(cfg.Sinks.FastGPT.Config))
+		log.Printf("[OK] FastGPT Sink 已注册（dataset=%s）", cfg.Sinks.FastGPT.DatasetID)
 	}
 
 	// ===== 连接器：企业微信 =====
@@ -73,14 +76,8 @@ func main() {
 			RunOnStart: cfg.Engine.RunOnStart,
 		})
 		log.Printf("[OK] 企微连接器已注册（间隔 %s，批 %d）", cfg.Connectors.WeCom.Interval.D(), cfg.Connectors.WeCom.BatchLimit)
-	}
-
-	// ===== Sink：FastGPT 上传（方案 A，旁路扫描任务）=====
-	if cfg.Sinks.FastGPT.Enabled {
-		fcfg := cfg.Sinks.FastGPT.Config
-		fcfg.Interval = cfg.Sinks.FastGPT.Interval.D()
-		eng.AddTask(fastgptsink.NewUploadTask(fcfg))
-		log.Printf("[OK] FastGPT 上传任务已注册（watch=%s，间隔 %s）", fcfg.WatchPath, fcfg.Interval)
+	} else {
+		log.Printf("[提示] 未启用任何连接器，引擎空转（仅 Sink 就绪）")
 	}
 
 	// 优雅退出

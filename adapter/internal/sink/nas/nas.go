@@ -41,14 +41,19 @@ func (s *Sink) Login() error {
 func (s *Sink) Client() *synology.Client { return s.client }
 
 // WriteRecord 原样落盘：Body 存 JSON 文件，附件经 read 拉字节后原样上传。
+// 目录归属：按发送者归档 <root>/<source>/<发送者>/<群ID|direct>/<msgid>.json，
+// 与「FastGPT 用户列表自动建目录」对应（sender userid = 目录名）。
 func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.AttachmentReader) error {
+	owner := r.SenderID
+	if owner == "" {
+		owner = "unknown"
+	}
 	group := r.GroupID
 	if group == "" {
 		group = "direct" // 单聊
 	}
 	// 清洗路径段，防止源端 ID 里的分隔符穿透目录
-	group = sanitize(group)
-	dir := path.Join(s.cfg.RootPath, r.Source, group)
+	dir := path.Join(s.cfg.RootPath, r.Source, sanitize(owner), sanitize(group))
 
 	if err := s.client.UploadBytes(r.ID+".json", dir, r.Body); err != nil {
 		return fmt.Errorf("写入消息体: %w", err)

@@ -10,6 +10,7 @@ type Record struct {
 	ID        string          `json:"id"`        // 源端唯一 ID（msgid / 文档 token / 文件路径）
 	Timestamp int64           `json:"timestamp"` // 源端时间（毫秒）
 	OwnerIDs  []string        `json:"owner_ids"` // 归属人 ID 列表（权限元数据：发送者/接收者/协作者）
+	SenderID  string          `json:"sender_id"` // 发送者 ID（企微 from；目录归属按它）
 	GroupID   string          `json:"group_id"`  // 群/空间标识（企微 roomid；空=单聊）
 	Body      json.RawMessage `json:"body"`      // 原始内容（企微为解密后的完整消息 JSON，原样保留）
 

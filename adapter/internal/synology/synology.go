@@ -2,6 +2,7 @@ package synology
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,7 +30,13 @@ func New(baseURL, username, password string) *Client {
 		BaseURL:  strings.TrimRight(baseURL, "/"),
 		Username: username,
 		Password: password,
-		HTTP:     &http.Client{Timeout: 60 * time.Second},
+		// 群晖在内网用自签名证书（IP 无 SAN），跳过证书校验；仅建议内网使用
+		HTTP: &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		},
 	}
 }
 

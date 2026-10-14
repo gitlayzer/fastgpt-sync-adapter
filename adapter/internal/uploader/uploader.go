@@ -79,21 +79,25 @@ func (c *Client) ListCollections() ([]Collection, error) {
 
 // UploadFile 上传单个文件到知识库，返回 collectionId。
 func (c *Client) UploadFile(localPath, name string) (string, error) {
-	f, err := os.Open(localPath)
+	data, err := os.ReadFile(localPath)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	return c.UploadBytes(name, filepath.Base(localPath), data)
+}
 
+// UploadBytes 直接把字节内容上传到知识库（不经本地文件），返回 collectionId。
+// name 为知识库内显示名，filename 为上传表单的文件名（S3 落盘名，之后用 RenameCollection 修正）。
+func (c *Client) UploadBytes(name, filename string, fileData []byte) (string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 
 	// 文件字段
-	fw, err := w.CreateFormFile("file", filepath.Base(localPath))
+	fw, err := w.CreateFormFile("file", filename)
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(fw, f); err != nil {
+	if _, err := fw.Write(fileData); err != nil {
 		return "", err
 	}
 
