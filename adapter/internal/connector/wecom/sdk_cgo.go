@@ -3,7 +3,8 @@
 package wecom
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../lib
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/../../../lib/amd64
+#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/../../../lib/arm64
 #cgo LDFLAGS: -lWeWorkFinanceSdk_C
 #cgo linux LDFLAGS: -lstdc++ -lm -lpthread
 #cgo darwin LDFLAGS: -lstdc++ -lm -lpthread

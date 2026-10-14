@@ -1,66 +1,88 @@
+// Package config 配置加载。结构按「引擎 / 连接器 / Sink」三组组织：
+// connectors 下每个数据源一节（enabled 开关 + 各自凭证），sinks 下每个出口一节。
 package config
 
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"fastgpt-sync-adapter/adapter/internal/connector/wecom"
+	nassink "fastgpt-sync-adapter/adapter/internal/sink/nas"
+	fastgptsink "fastgpt-sync-adapter/adapter/internal/sink/fastgpt"
 )
 
-// Config 中间件三方配置。
+// Duration 支持 YAML 里写 "60s" / "10m" 这类字符串，也兼容整数（纳秒）。
+type Duration time.Duration
+
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return err
+	}
+	if v, err := time.ParseDuration(s); err == nil {
+		*d = Duration(v)
+		return nil
+	}
+	// 退化为整数纳秒
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return fmt.Errorf("非法时长 %q（示例: 60s / 10m / 1h）", s)
+	}
+	*d = Duration(n)
+	return nil
+}
+
+// D 返回 time.Duration。
+func (d Duration) D() time.Duration { return time.Duration(d) }
+
+// Config 顶层配置。
 type Config struct {
-	// 1. FastGPT：连接、上传知识库；并用其用户列表在 NAS 建目录
-	FastGPT FastGPTConfig `yaml:"fastgpt"`
-	// 2. 群晖 NAS：企微/飞书文件落盘位置
-	NAS NASConfig `yaml:"nas"`
-	// 3. 企业微信会话内容存档
-	WeCom WeComConfig `yaml:"wecom"`
+	Engine EngineConfig `yaml:"engine"`
 
-	// 同步行为
-	Sync SyncConfig `yaml:"sync"`
+	Connectors struct {
+		WeCom WeComConnectorConfig `yaml:"wecom"`
+		// feishu: TODO
+	} `yaml:"connectors"`
+
+	Sinks struct {
+		NAS     NASSinkConfig     `yaml:"nas"`
+		FastGPT FastGPTSinkConfig `yaml:"fastgpt"`
+	} `yaml:"sinks"`
 }
 
-type FastGPTConfig struct {
-	BaseURL   string `yaml:"base_url"`   // 如 https://aanshixbkhrk.sealoshzh.site
-	APIKey    string `yaml:"api_key"`    // fastgpt-xxx（需账号级，能调用户列表接口）
-	DatasetID string `yaml:"dataset_id"` // 目标知识库 id
-	// 上传解析参数
-	ImageIndex     bool `yaml:"image_index"`
-	AutoIndexes    bool `yaml:"auto_indexes"`
-	CustomPdfParse bool `yaml:"custom_pdf_parse"`
+// EngineConfig 引擎全局配置。
+type EngineConfig struct {
+	StateFile  string   `yaml:"state_file"`  // 各连接器 checkpoint 统一存放
+	RunOnStart bool     `yaml:"run_on_start"`
 }
 
-type NASConfig struct {
-	URL      string `yaml:"url"`      // 群晖地址，如 http://192.168.1.10:5000
-	Username string `yaml:"username"` // 群晖账号
-	Password string `yaml:"password"` // 群晖密码
-	// 落盘根路径：企微/飞书数据按「用户名」在此下建子目录
-	// 例: /fastgpt-sync → /fastgpt-sync/zhangsan/...
-	RootPath string `yaml:"root_path"`
+// WeComConnectorConfig 企微连接器配置节。
+type WeComConnectorConfig struct {
+	Enabled    bool         `yaml:"enabled"`
+	Interval   Duration     `yaml:"interval"`     // 拉取间隔（需高于媒体附件 3 天保留期，建议分钟级）
+	BatchLimit int          `yaml:"batch_limit"`  // 单批条数，默认 100（SDK 上限 1000）
+	WeCom      wecom.Config `yaml:",inline"`      // corp_id/secret/rsa_private_key(_file)/sdk_lib_path
 }
 
-type WeComConfig struct {
-	CorpID string `yaml:"corp_id"` // 企业 corpid
-	Secret string `yaml:"secret"`  // 会话存档 secret
-	// RSA 私钥：可直接给 PEM 文本，或给文件路径
-	RSAPrivateKey     string `yaml:"rsa_private_key"`      // PEM 文本（与 file 二选一）
-	RSAPrivateKeyFile string `yaml:"rsa_private_key_file"` // PEM 文件路径
-	// 可选：企微会话存档 SDK 动态库路径（libWeWorkFinanceSdk_C.so / .dylib）
-	SDKLibPath string `yaml:"sdk_lib_path"`
+// NASSinkConfig NAS Sink 配置节。
+type NASSinkConfig struct {
+	Enabled bool `yaml:"enabled"`
+	nassink.Config `yaml:",inline"`
 }
 
-type SyncConfig struct {
-	Interval   time.Duration `yaml:"interval"`   // 上传/同步间隔
-	StateFile  string        `yaml:"state_file"` // 增量状态文件
-	RunOnStart bool          `yaml:"run_on_start"`
-	// NAS 文件被删除后，是否同步删除 FastGPT 里的对应文件。
-	// 默认 false（保留）：NAS 是单向归集终点，为溯源默认保留远端副本；
-	// 设为 true 则本地删除时同步删除远端。
-	SyncDelete bool `yaml:"sync_delete"`
+// FastGPTSinkConfig FastGPT 上传 Sink（方案 A）配置节。
+type FastGPTSinkConfig struct {
+	Enabled  bool     `yaml:"enabled"`
+	Interval Duration `yaml:"interval"` // 扫描上传间隔
+	fastgptsink.Config `yaml:",inline"`
 }
 
-// Load 从 YAML 配置文件加载。
+// Load 从 YAML 配置文件加载并校验。
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -76,52 +98,52 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Validate 校验必填项。
+// Validate 校验必填项（仅校验 enabled 的模块）并填默认值。
 func (c *Config) Validate() error {
-	if c.FastGPT.BaseURL == "" {
-		return fmt.Errorf("fastgpt.base_url 必填")
+	if c.Engine.StateFile == "" {
+		c.Engine.StateFile = "./connector_state.json"
 	}
-	if c.FastGPT.APIKey == "" {
-		return fmt.Errorf("fastgpt.api_key 必填")
-	}
-	if c.FastGPT.DatasetID == "" {
-		return fmt.Errorf("fastgpt.dataset_id 必填")
-	}
-	if c.NAS.URL == "" || c.NAS.Username == "" || c.NAS.Password == "" {
-		return fmt.Errorf("nas.url / nas.username / nas.password 必填")
-	}
-	if c.NAS.RootPath == "" {
-		return fmt.Errorf("nas.root_path 必填")
-	}
-	// 企微可选（飞书链路可单独跑），但若配了就要配全
-	w := c.WeCom
-	partial := w.CorpID != "" || w.Secret != "" || w.RSAPrivateKey != "" || w.RSAPrivateKeyFile != ""
-	if partial {
-		if w.CorpID == "" || w.Secret == "" {
-			return fmt.Errorf("wecom.corp_id / wecom.secret 需同时配置")
+
+	// 企微连接器
+	if w := &c.Connectors.WeCom; w.Enabled {
+		if w.WeCom.CorpID == "" || w.WeCom.Secret == "" {
+			return fmt.Errorf("connectors.wecom.corp_id / secret 必填")
 		}
-		if w.RSAPrivateKey == "" && w.RSAPrivateKeyFile == "" {
-			return fmt.Errorf("wecom.rsa_private_key 或 wecom.rsa_private_key_file 需配置其一")
+		if w.WeCom.RSAPrivateKey == "" && w.WeCom.RSAPrivateKeyFile == "" {
+			return fmt.Errorf("connectors.wecom.rsa_private_key 或 rsa_private_key_file 需配置其一")
+		}
+		if w.Interval.D() <= 0 {
+			w.Interval = Duration(60 * time.Second)
+		}
+		if w.BatchLimit <= 0 {
+			w.BatchLimit = 100
 		}
 	}
-	// 默认值
-	if c.Sync.Interval <= 0 {
-		c.Sync.Interval = 10 * time.Minute
+
+	// NAS Sink
+	if n := &c.Sinks.NAS; n.Enabled {
+		if n.URL == "" || n.Username == "" || n.Password == "" {
+			return fmt.Errorf("sinks.nas.url / username / password 必填")
+		}
+		if n.RootPath == "" {
+			return fmt.Errorf("sinks.nas.root_path 必填")
+		}
 	}
-	if c.Sync.StateFile == "" {
-		c.Sync.StateFile = "./sync_state.json"
+
+	// FastGPT 上传 Sink
+	if f := &c.Sinks.FastGPT; f.Enabled {
+		if f.BaseURL == "" || f.APIKey == "" || f.DatasetID == "" {
+			return fmt.Errorf("sinks.fastgpt.base_url / api_key / dataset_id 必填")
+		}
+		if f.WatchPath == "" {
+			return fmt.Errorf("sinks.fastgpt.watch_path 必填（要扫描上传的目录）")
+		}
+		if f.Interval.D() <= 0 {
+			f.Interval = Duration(10 * time.Minute)
+		}
+		if f.StateFile == "" {
+			f.StateFile = "./fastgpt_upload_state.json"
+		}
 	}
 	return nil
-}
-
-// WeComPrivateKeyPEM 返回 RSA 私钥 PEM 内容。
-func (c *Config) WeComPrivateKeyPEM() (string, error) {
-	if c.WeCom.RSAPrivateKey != "" {
-		return c.WeCom.RSAPrivateKey, nil
-	}
-	data, err := os.ReadFile(c.WeCom.RSAPrivateKeyFile)
-	if err != nil {
-		return "", fmt.Errorf("读取 RSA 私钥文件: %w", err)
-	}
-	return string(data), nil
 }

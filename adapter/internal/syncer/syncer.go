@@ -34,6 +34,8 @@ type Syncer struct {
 	Root      string
 	Client    *uploader.Client
 	StatePath string
+	// SyncDelete 本地删除后是否同步删除 FastGPT 里的对应文件（默认 false：保留远端副本）。
+	SyncDelete bool
 
 	state map[string]*stateEntry // key: relPath
 }
@@ -191,13 +193,15 @@ func (s *Syncer) Run() error {
 	}
 	for rel, prev := range s.state {
 		if _, stillLocal := local[rel]; !stillLocal {
-			// 本地删除了这个文件
+			// 本地删除了这个文件；SyncDelete=false 时保留远端副本，仅清理本地状态
 			name := filepath.Base(rel)
-			if existing, ok := remoteByName[name]; ok {
-				log.Printf("  [删除] 本地已移除 %s，删除远端", rel)
-				if err := s.Client.DeleteCollection(existing.ID); err != nil {
-					log.Printf("    删除失败: %v", err)
-					continue
+			if s.SyncDelete {
+				if existing, ok := remoteByName[name]; ok {
+					log.Printf("  [删除] 本地已移除 %s，删除远端", rel)
+					if err := s.Client.DeleteCollection(existing.ID); err != nil {
+						log.Printf("    删除失败: %v", err)
+						continue
+					}
 				}
 			}
 			delete(s.state, rel)

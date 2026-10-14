@@ -156,16 +156,20 @@ func (c *Client) MkdirAll(fullPath string) error {
 
 // UploadFile 上传本地文件到 NAS 的 destDir 目录。
 func (c *Client) UploadFile(localPath, destDir string) error {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return err
+	}
+	return c.UploadBytes(path.Base(localPath), destDir, data)
+}
+
+// UploadBytes 直接把字节内容以 filename 命名上传到 NAS 的 destDir 目录。
+func (c *Client) UploadBytes(filename, destDir string, data []byte) error {
 	if err := c.ensureLogin(); err != nil {
 		return err
 	}
 	// 确保目标目录存在
 	if err := c.MkdirAll(destDir); err != nil {
-		return err
-	}
-
-	data, err := os.ReadFile(localPath)
-	if err != nil {
 		return err
 	}
 
@@ -178,7 +182,7 @@ func (c *Client) UploadFile(localPath, destDir string) error {
 	_ = w.WriteField("path", destDir)
 	_ = w.WriteField("create_parents", "true")
 	_ = w.WriteField("overwrite", "true")
-	fw, err := w.CreateFormFile("file", path.Base(localPath))
+	fw, err := w.CreateFormFile("file", filename)
 	if err != nil {
 		return err
 	}
