@@ -105,17 +105,23 @@ func (s *cgoSDK) GetChatData(seq int64, limit int) (*ChatDataResponse, error) {
 }
 
 func (s *cgoSDK) GetMediaData(sdkFileID, indexBuf string) ([]byte, string, bool, error) {
-	var md C.MediaData_t // 无 NewMediaData：结构体由调用方分配，SDK 只填内部指针
+	// MediaData_t 必须在 C 堆分配：FreeMediaData 会连结构体一起释放（同 Slice 的坑，已实测）
+	md := (*C.MediaData_t)(C.malloc(C.size_t(unsafe.Sizeof(C.MediaData_t{}))))
+	if md == nil {
+		return nil, indexBuf, false, fmt.Errorf("malloc MediaData_t 失败")
+	}
+	*md = C.MediaData_t{}
 	cFileID := C.CString(sdkFileID)
 	cIndex := C.CString(indexBuf)
 	defer C.free(unsafe.Pointer(cFileID))
 	defer C.free(unsafe.Pointer(cIndex))
 
-	ret := C.GetMediaData(s.sdk, cIndex, cFileID, nil, nil, 10, &md)
+	ret := C.GetMediaData(s.sdk, cIndex, cFileID, nil, nil, 10, md)
 	if ret != 0 {
+		C.FreeMediaData(md)
 		return nil, indexBuf, false, fmt.Errorf("GetMediaData ret=%d", int(ret))
 	}
-	defer C.FreeMediaData(&md) // 释放 SDK 内部分配的 data/outindexbuf
+	defer C.FreeMediaData(md) // 释放 SDK 内部分配的 data/outindexbuf 及结构体本身
 
 	var data []byte
 	if md.data != nil && md.data_len > 0 {

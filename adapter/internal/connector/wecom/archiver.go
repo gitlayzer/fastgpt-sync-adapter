@@ -1,6 +1,7 @@
 package wecom
 
 import (
+	"log"
 	"encoding/json"
 	"fmt"
 )
@@ -69,33 +70,56 @@ func (a *Archiver) FetchAndDecrypt(seq int64, limit int) ([]*Message, int64, err
 	if resp.ErrCode != 0 {
 		return nil, seq, fmt.Errorf("企微返回错误 errcode=%d errmsg=%s", resp.ErrCode, resp.ErrMsg)
 	}
+	log.Printf("[wecom] GetChatData 返回 errcode=0，加密记录 %d 条", len(resp.ChatData))
 
 	var out []*Message
 	maxSeq := seq
+	decryptFail := 0
+	var firstErr error
 	for _, item := range resp.ChatData {
-		// 优先用 SDK 内置解密（更可靠）；SDK 无 DecryptData 时用纯 Go Crypto 兜底
+		if item.Seq > maxSeq {
+			maxSeq = item.Seq // 无论解密成败都推进游标，避免卡在同一批
+		}
+		// 正确的两步解密（这个 SDK 版本的 DecryptData 只做 AES）：
+		// 1. 用我们的 RSA 私钥解 encrypt_random_key → 会话密钥（纯 Go，crypto.go）
+		// 2. 会话密钥 + encrypt_chat_msg → SDK DecryptData 做 AES 解密
+		//    若 SDK 解密失败，退回纯 Go 的 DecryptChatMsg 兜底
 		var plain string
-		var derr error
+		sessionKey, kerr := a.Crypto.DecryptRandomKey(item.EncryptRandomKey)
+		if kerr != nil {
+			decryptFail++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("RSA 解 random_key 失败: %w", kerr)
+			}
+			continue
+		}
 		if sdkWithDecrypt, ok := a.SDK.(interface {
 			DecryptData(string, string) (string, error)
 		}); ok {
-			plain, derr = sdkWithDecrypt.DecryptData(item.EncryptRandomKey, item.EncryptChatMsg)
+			plain, kerr = sdkWithDecrypt.DecryptData(sessionKey, item.EncryptChatMsg)
 		} else {
-			plain, derr = a.Crypto.DecryptMessage(item.EncryptRandomKey, item.EncryptChatMsg)
+			plain, kerr = a.Crypto.DecryptChatMsg(sessionKey, item.EncryptChatMsg)
 		}
-		if derr != nil {
-			// 单条解密失败不阻塞整批，记录后跳过
+		if kerr != nil {
+			decryptFail++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("AES 解消息体失败: %w", kerr)
+			}
 			continue
 		}
 		var msg Message
 		if err := json.Unmarshal([]byte(plain), &msg); err != nil {
+			decryptFail++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("消息 JSON 解析失败: %w", err)
+			}
 			continue
 		}
 		msg.Raw = json.RawMessage(plain)
 		out = append(out, &msg)
-		if item.Seq > maxSeq {
-			maxSeq = item.Seq
-		}
+	}
+	if decryptFail > 0 {
+		log.Printf("[wecom] 本批 %d 条中解密失败 %d 条，首个错误: %v", len(resp.ChatData), decryptFail, firstErr)
 	}
 	return out, maxSeq, nil
 }

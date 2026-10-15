@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"fastgpt-sync-adapter/adapter/internal/model"
 )
@@ -71,6 +73,7 @@ func (c *Connector) Fetch(ctx context.Context, checkpoint string, limit int) ([]
 	if err != nil {
 		return nil, checkpoint, err
 	}
+	log.Printf("[wecom] GetChatData(seq=%d, limit=%d) → 解密成功 %d 条，maxSeq=%d", seq, limit, len(msgs), maxSeq)
 	records := make([]model.Record, 0, len(msgs))
 	for _, m := range msgs {
 		records = append(records, messageToRecord(m))
@@ -79,6 +82,7 @@ func (c *Connector) Fetch(ctx context.Context, checkpoint string, limit int) ([]
 }
 
 // FetchAttachment 按 sdkfileid 分片拉取附件完整字节（is_finish 前持续续传）。
+// 网络类错误（ret=10001 等）做指数退避重试：附件在企微侧只留 ~3 天，丢不得。
 func (c *Connector) FetchAttachment(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
 	if c.sdk == nil {
 		return nil, fmt.Errorf("企微 SDK 未初始化")
@@ -86,9 +90,24 @@ func (c *Connector) FetchAttachment(ctx context.Context, a *model.Attachment) (i
 	var buf bytes.Buffer
 	index := ""
 	for {
-		chunk, next, finish, err := c.sdk.GetMediaData(a.FileID, index)
-		if err != nil {
-			return nil, fmt.Errorf("GetMediaData(%s): %w", a.FileID, err)
+		var chunk []byte
+		var next string
+		var finish bool
+		var err error
+		// 单分片最多重试 4 次（1s/2s/4s/8s），续传点 index 保持不动
+		for attempt := 0; ; attempt++ {
+			chunk, next, finish, err = c.sdk.GetMediaData(a.FileID, index)
+			if err == nil {
+				break
+			}
+			if attempt >= 3 {
+				return nil, fmt.Errorf("GetMediaData(%s) 重试耗尽: %w", a.FileID, err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(1<<attempt) * time.Second):
+			}
 		}
 		buf.Write(chunk)
 		if finish {
