@@ -125,6 +125,7 @@ func (e *Engine) runConnector(ctx context.Context, j ConnectorJob) {
 			return
 		}
 		if len(records) == 0 {
+			log.Printf("[%s] 无新数据（游标 %s）", name, cp)
 			return // 没有新数据
 		}
 
