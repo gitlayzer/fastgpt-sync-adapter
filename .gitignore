@@ -1,3 +1,5 @@
 bin/
 sync_state.json
 *.log
+private.pem
+connector_state.json
