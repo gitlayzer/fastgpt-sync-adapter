@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -175,3 +176,27 @@ func (s *Store) buildNode(rel string) (*Node, error) {
 
 // AbsPath 返回节点真实磁盘路径（仅服务端内部使用）。
 func (n *Node) AbsPath() string { return n.absPath }
+
+// NewExternalNode 供非本地后端（如 NAS）构造节点：backendPath 是后端的定位键（NAS 路径）。
+func NewExternalNode(id string, parentID *string, name, typ string, mtime time.Time, backendPath string) *Node {
+	return &Node{
+		ID:         id,
+		ParentID:   parentID,
+		Name:       name,
+		Type:       typ,
+		UpdateTime: mtime,
+		CreateTime: mtime,
+		absPath:    backendPath,
+	}
+}
+
+// HashID 用任意路径字符串生成稳定 id（与本地 Store 同一套规则，供外部后端复用）。
+func HashID(p string) string {
+	h := sha1.Sum([]byte(p))
+	return hex.EncodeToString(h[:])
+}
+
+// Open 打开本地节点的文件流（本地后端的下载实现）。
+func (s *Store) Open(n *Node) (io.ReadCloser, error) {
+	return os.Open(n.absPath)
+}

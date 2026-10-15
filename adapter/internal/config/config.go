@@ -12,8 +12,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"fastgpt-sync-adapter/adapter/internal/classifier"
 	"fastgpt-sync-adapter/adapter/internal/connector/wecom"
-	fastgptsink "fastgpt-sync-adapter/adapter/internal/sink/fastgpt"
 	nassink "fastgpt-sync-adapter/adapter/internal/sink/nas"
 )
 
@@ -46,12 +46,14 @@ type Config struct {
 
 	Connectors struct {
 		WeCom WeComConnectorConfig `yaml:"wecom"`
-		// feishu: TODO
+		// feishu: 暂不做（客户决策：先把企微跑通）
 	} `yaml:"connectors"`
 
+	// Classifier 文件用途分类器（可配规则；客户决策：无 LLM 端点，先用规则关键词）
+	Classifier classifier.Config `yaml:"classifier"`
+
 	Sinks struct {
-		NAS     NASSinkConfig     `yaml:"nas"`
-		FastGPT FastGPTSinkConfig `yaml:"fastgpt"`
+		NAS NASSinkConfig `yaml:"nas"`
 	} `yaml:"sinks"`
 }
 
@@ -83,12 +85,6 @@ type NASSinkConfig struct {
 	nassink.Config `yaml:",inline"`
 }
 
-// FastGPTSinkConfig FastGPT Sink 配置节（直传出口：仅文件附件进知识库）。
-type FastGPTSinkConfig struct {
-	Enabled bool `yaml:"enabled"`
-	fastgptsink.Config `yaml:",inline"`
-}
-
 // Load 从 YAML 配置文件加载并校验。
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -111,12 +107,9 @@ func (c *Config) Validate() error {
 		c.Engine.StateFile = "./connector_state.json"
 	}
 
-	// 出口二选一
-	if c.Sinks.NAS.Enabled && c.Sinks.FastGPT.Enabled {
-		return fmt.Errorf("sinks.nas 与 sinks.fastgpt 二选一，不能同时启用（归档 vs 直传知识库）")
-	}
-	if !c.Sinks.NAS.Enabled && !c.Sinks.FastGPT.Enabled {
-		return fmt.Errorf("需启用一个出口：sinks.nas（归档）或 sinks.fastgpt（附件直传知识库）")
+	// 出口：FastGPT 由 serve 模式来拉（方案 B 已选定），daemon 只做 NAS 归档
+	if !c.Sinks.NAS.Enabled {
+		return fmt.Errorf("sinks.nas 必须启用（daemon 的唯一出口；FastGPT 侧由 serve 模式提供 previewUrl）")
 	}
 
 	// 企微连接器
@@ -148,14 +141,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// FastGPT Sink
-	if f := &c.Sinks.FastGPT; f.Enabled {
-		if f.BaseURL == "" || f.APIKey == "" || f.DatasetID == "" {
-			return fmt.Errorf("sinks.fastgpt.base_url / api_key / dataset_id 必填")
-		}
-		if f.StateFile == "" {
-			f.StateFile = "./fastgpt_upload_state.json"
-		}
-	}
+	// 分类器默认值
+	c.Classifier.ApplyDefaults()
 	return nil
 }

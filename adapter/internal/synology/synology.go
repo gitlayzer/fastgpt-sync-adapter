@@ -119,6 +119,82 @@ func (c *Client) apiCall(api, method string, params url.Values) (json.RawMessage
 	return r.Data, nil
 }
 
+// FileEntry NAS 上的一个文件/目录项。
+type FileEntry struct {
+	Name  string
+	Path  string // 完整路径
+	IsDir bool
+	Size  int64
+	MTime time.Time
+}
+
+// List 列目录（SYNO.FileStation.List）。folderPath 须以共享文件夹开头（如 /FastGPT-test/企业微信）。
+func (c *Client) List(folderPath string) ([]FileEntry, error) {
+	params := url.Values{}
+	params.Set("version", "2")
+	params.Set("folder_path", folderPath)
+	params.Set("additional", `["size","time"]`)
+	data, err := c.apiCall("SYNO.FileStation.List", "list", params)
+	if err != nil {
+		return nil, err
+	}
+	var d struct {
+		Files []struct {
+			Name  string `json:"name"`
+			Path  string `json:"path"`
+			IsDir bool   `json:"isdir"`
+			Add   struct {
+				Size int64 `json:"size"`
+				Time struct {
+					MTime int64 `json:"mtime"`
+				} `json:"time"`
+			} `json:"additional"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("list 响应解析失败: %w", err)
+	}
+	out := make([]FileEntry, 0, len(d.Files))
+	for _, f := range d.Files {
+		out = append(out, FileEntry{
+			Name:  f.Name,
+			Path:  f.Path,
+			IsDir: f.IsDir,
+			Size:  f.Add.Size,
+			MTime: time.Unix(f.Add.Time.MTime, 0),
+		})
+	}
+	return out, nil
+}
+
+// Download 下载文件字节流（SYNO.FileStation.Download）。调用方负责关闭。
+func (c *Client) Download(filePath string) (io.ReadCloser, error) {
+	if err := c.ensureLogin(); err != nil {
+		return nil, err
+	}
+	params := url.Values{}
+	params.Set("api", "SYNO.FileStation.Download")
+	params.Set("version", "2")
+	params.Set("method", "download")
+	params.Set("path", filePath)
+	params.Set("mode", "download")
+	params.Set("_sid", c.sid)
+	u := fmt.Sprintf("%s/webapi/entry.cgi?%s", c.BaseURL, params.Encode())
+
+	resp, err := c.HTTP.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	// 下载失败时 NAS 返回 JSON 错误而非文件流
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "application/json") {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("下载失败 %s: %s", filePath, truncate(string(body), 200))
+	}
+	return resp.Body, nil
+}
+
 // CreateFolder 在 parentPath 下创建名为 name 的文件夹（已存在则忽略错误）。
 func (c *Client) CreateFolder(parentPath, name string) error {
 	params := url.Values{}
@@ -149,8 +225,16 @@ func (c *Client) MkdirAll(fullPath string) error {
 		if cur == "" {
 			parent = "/"
 		}
+		target := "/" + p
+		if cur != "" {
+			target = "/" + cur + "/" + p
+		}
 		if err := c.CreateFolder(parent, p); err != nil {
-			return fmt.Errorf("创建目录 %s 失败: %w", parent+p, err)
+			// 共享文件夹根等场景 CreateFolder 会报 1100（无权限创建），
+			// 但目录可能已存在——用 List 探测，能列出来就当存在继续
+			if _, lerr := c.List(target); lerr != nil {
+				return fmt.Errorf("创建目录 %s 失败: %w", target, err)
+			}
 		}
 		if cur == "" {
 			cur = p

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -19,6 +20,20 @@ type Options struct {
 	ExternalURL string
 }
 
+// Backend 文件库后端：本地目录或群晖 NAS（WebAPI）。
+type Backend interface {
+	Get(id string) (*store.Node, error)
+	Children(parentID string) ([]*store.Node, error)
+	Search(key string) ([]*store.Node, error)
+	// Open 打开文件字节流（previewUrl 下载的最终数据源）。
+	Open(n *store.Node) (io.ReadCloser, error)
+}
+
+// LocalBackend 本地目录后端（包装 store.Store 补上 Open）。
+type LocalBackend struct{ *store.Store }
+
+func (l LocalBackend) Open(n *store.Node) (io.ReadCloser, error) { return l.Store.Open(n) }
+
 // FastGPT 统一响应格式
 type resp struct {
 	Success bool   `json:"success"`
@@ -27,13 +42,13 @@ type resp struct {
 }
 
 type Server struct {
-	opts  Options
-	store *store.Store
-	mux   *http.ServeMux
+	opts    Options
+	backend Backend
+	mux     *http.ServeMux
 }
 
-func New(opts Options, st *store.Store) *Server {
-	s := &Server{opts: opts, store: st, mux: http.NewServeMux()}
+func New(opts Options, b Backend) *Server {
+	s := &Server{opts: opts, backend: b, mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
@@ -128,13 +143,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	var nodes []*store.Node
 	var err error
 	if strings.TrimSpace(body.SearchKey) != "" {
-		nodes, err = s.store.Search(body.SearchKey)
+		nodes, err = s.backend.Search(body.SearchKey)
 	} else {
 		pid := ""
 		if body.ParentID != nil {
 			pid = *body.ParentID
 		}
-		nodes, err = s.store.Children(pid)
+		nodes, err = s.backend.Children(pid)
 	}
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
@@ -155,7 +170,7 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	node, err := s.store.Get(id)
+	node, err := s.backend.Get(id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -177,7 +192,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	if _, err := s.store.Get(id); err != nil {
+	if _, err := s.backend.Get(id); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -193,7 +208,7 @@ func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	node, err := s.store.Get(id)
+	node, err := s.backend.Get(id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -208,7 +223,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	node, err := s.store.Get(id)
+	node, err := s.backend.Get(id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -222,7 +237,16 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// 中文文件名按 RFC 5987 编码，保证 FastGPT/浏览器正确解析文件名。
 	encoded := url.PathEscape(node.Name)
 	w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+encoded)
-	http.ServeFile(w, r, node.AbsPath())
+	rc, err := s.backend.Open(node)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "open file: "+err.Error())
+		return
+	}
+	defer rc.Close()
+	if _, err := io.Copy(w, rc); err != nil {
+		// 响应头可能已写出，只能记日志
+		_ = err
+	}
 }
 
 func writeOK(w http.ResponseWriter, data any) {
