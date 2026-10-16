@@ -24,6 +24,8 @@ type Client struct {
 	AutoIndexes    bool // 自动生成索引
 	CustomPdfParse bool // 自定义 PDF 解析（需服务端配置解析服务）
 	IndexPrefixTitle bool // 索引前缀标题
+	// Tags 上传时打的标签（FastGPT 源码确认 create/localFile 支持；元素为字符串或 {"tag","value"} 对象）
+	Tags []any
 }
 
 func NewClient(baseURL, apiKey, datasetID string) *Client {
@@ -115,6 +117,11 @@ func (c *Client) UploadBytes(name, filename string, fileData []byte) (string, er
 	if c.CustomPdfParse {
 		data["customPdfParse"] = true
 	}
+	// 标签：源码确认 create/localFile 支持（ApiCreateCollectionRequestBaseSchema.tags）。
+	// 两种格式：纯字符串 ["合同"]；或键值对象 [{"tag":"类型","value":"合同"}]。
+	if len(c.Tags) > 0 {
+		data["tags"] = c.Tags
+	}
 	dataJSON, _ := json.Marshal(data)
 	if err := w.WriteField("data", string(dataJSON)); err != nil {
 		return "", err
@@ -156,6 +163,15 @@ func (c *Client) RenameCollection(collectionID, newName string) error {
 	body := map[string]any{
 		"id":   collectionID,
 		"name": newName,
+	}
+	return c.post("/api/core/dataset/collection/update", body, nil)
+}
+
+// UpdateTags 事后修改 collection 的标签（update 接口源码确认支持 tags 字段）。
+func (c *Client) UpdateTags(collectionID string, tags []any) error {
+	body := map[string]any{
+		"id":   collectionID,
+		"tags": tags,
 	}
 	return c.post("/api/core/dataset/collection/update", body, nil)
 }
