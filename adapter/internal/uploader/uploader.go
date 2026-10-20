@@ -7,8 +7,11 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -94,8 +97,10 @@ func (c *Client) UploadBytes(name, filename string, fileData []byte) (string, er
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 
-	// 文件字段
-	fw, err := w.CreateFormFile("file", filename)
+	// 文件字段：中文文件名必须走 RFC 5987（filename*=UTF-8''...），
+	// 否则服务端 busboy/multer 会把 raw UTF-8 按 latin1 解码成乱码（实测：合同.docx → å å .docx）。
+	// 注意：FastGPT localFile 接口用表单文件名作为知识库内的显示名（data.name 会被忽略）。
+	fw, err := createFormFileUTF8(w, "file", filename)
 	if err != nil {
 		return "", err
 	}
@@ -221,6 +226,24 @@ func (c *Client) post(path string, payload any, out any) error {
 		}
 	}
 	return nil
+}
+
+// createFormFileUTF8 手工构造 multipart 文件头：
+// filename 给 ASCII 兜底（非 ASCII 替换为 _），filename* 按 RFC 5987 携带 UTF-8 原名。
+// Go 标准库 CreateFormFile 直接写 raw UTF-8 字节，部分服务端解析器会按 latin1 误读。
+func createFormFileUTF8(w *multipart.Writer, fieldname, filename string) (io.Writer, error) {
+	ascii := strings.Map(func(r rune) rune {
+		if r < 128 && r != '"' && r != '\\' {
+			return r
+		}
+		return '_'
+	}, filename)
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition",
+		fmt.Sprintf(`form-data; name="%s"; filename="%s"; filename*=UTF-8''%s`,
+			fieldname, ascii, url.PathEscape(filename)))
+	h.Set("Content-Type", "application/octet-stream")
+	return w.CreatePart(h)
 }
 
 func truncate(s string, n int) string {

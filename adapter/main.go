@@ -17,7 +17,9 @@ import (
 	"fastgpt-sync-adapter/adapter/internal/connector/wecom"
 	"fastgpt-sync-adapter/adapter/internal/engine"
 	"fastgpt-sync-adapter/adapter/internal/fastgpt"
+	"fastgpt-sync-adapter/adapter/internal/identity"
 	nassink "fastgpt-sync-adapter/adapter/internal/sink/nas"
+	"fastgpt-sync-adapter/adapter/internal/storage"
 )
 
 func main() {
@@ -44,9 +46,21 @@ func main() {
 
 	eng := engine.New(cfg.Engine.StateFile)
 
+	// ===== 存储层（SQLite：授权/身份/台账/去重）=====
+	st, err := storage.Open(cfg.Storage.DBFile)
+	if err != nil {
+		log.Fatalf("存储层初始化失败: %v", err)
+	}
+	defer st.Close()
+	log.Printf("[OK] SQLite 存储就绪（%s）", cfg.Storage.DBFile)
+
+	// ===== 身份解析器（多维表格未到位前用本地映射兜底）=====
+	ids := identity.NewLocalResolver(cfg.Identity.LocalFile, st)
+	log.Printf("[OK] 身份解析器：source=%s（%s）", cfg.Identity.Source, cfg.Identity.LocalFile)
+
 	// ===== Sink：NAS 归档 =====
 	clf := classifier.New(cfg.Classifier)
-	nas := nassink.New(cfg.Sinks.NAS.Config, clf)
+	nas := nassink.New(cfg.Sinks.NAS.Config, clf, ids, st)
 	if err := nas.Login(); err != nil {
 		log.Fatalf("群晖 NAS 登录失败: %v", err)
 	}

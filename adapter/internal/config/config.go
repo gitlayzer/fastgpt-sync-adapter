@@ -46,14 +46,24 @@ type Config struct {
 
 	Connectors struct {
 		WeCom WeComConnectorConfig `yaml:"wecom"`
-		// feishu: 暂不做（客户决策：先把企微跑通）
+		Feishu FeishuConnectorConfig `yaml:"feishu"`
 	} `yaml:"connectors"`
 
 	// Classifier 文件用途分类器（可配规则；客户决策：无 LLM 端点，先用规则关键词）
 	Classifier classifier.Config `yaml:"classifier"`
 
+	// Storage SQLite 存储（授权/身份/文件台账/游标）
+	Storage StorageConfig `yaml:"storage"`
+
+	// Auth 飞书 OAuth 授权 webhook（常驻，与 daemon 同进程）
+	Auth AuthConfig `yaml:"auth"`
+
+	// Identity 身份解析（企微 userid → 飞书用户 → 姓名；多维表格未到位前用本地映射）
+	Identity IdentityConfig `yaml:"identity"`
+
 	Sinks struct {
-		NAS NASSinkConfig `yaml:"nas"`
+		NAS     NASSinkConfig     `yaml:"nas"`
+		FastGPT FastGPTSinkConfig `yaml:"fastgpt"`
 	} `yaml:"sinks"`
 }
 
@@ -69,6 +79,50 @@ type WeComConnectorConfig struct {
 	Interval   Duration     `yaml:"interval"`    // 拉取间隔（需远小于媒体附件 3 天保留期，建议分钟级）
 	BatchLimit int          `yaml:"batch_limit"` // 单批条数，默认 100（SDK 上限 1000）
 	WeCom      wecom.Config `yaml:",inline"`     // corp_id/secret/rsa_private_key(_file)/sdk_lib_path
+}
+
+// FeishuConnectorConfig 飞书连接器配置节。
+type FeishuConnectorConfig struct {
+	Enabled    bool     `yaml:"enabled"`
+	Interval   Duration `yaml:"interval"`
+	BatchLimit int      `yaml:"batch_limit"`
+	AppID      string   `yaml:"app_id"`
+	AppSecret  string   `yaml:"app_secret"`
+	// Mode: tenant（应用身份遍历共享区/知识库）/ user（按已授权用户逐个拉个人云文档）/ both
+	Mode string `yaml:"mode"`
+}
+
+// StorageConfig SQLite 存储配置。
+type StorageConfig struct {
+	DBFile string `yaml:"db_file"` // 如 ./adapter.db
+}
+
+// AuthConfig 飞书 OAuth 授权 webhook 配置。
+type AuthConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Addr        string `yaml:"addr"`         // 监听地址，如 :8089
+	ExternalURL string `yaml:"external_url"` // 外部可访问地址（拼 redirect_uri 用，需与飞书后台一致）
+	// RefreshInterval token 刷新巡检间隔（默认 1h）
+	RefreshInterval Duration `yaml:"refresh_interval"`
+}
+
+// IdentityConfig 身份解析配置。
+type IdentityConfig struct {
+	// Source: local（本地 JSON 映射文件，兜底）/ bitable（飞书多维表格，TODO 待表格到位）
+	Source    string `yaml:"source"`
+	LocalFile string `yaml:"local_file"` // source=local 时的映射文件路径
+	Bitable   struct {
+		AppToken string `yaml:"app_token"` // TODO: 多维表格 app_token
+		TableID  string `yaml:"table_id"`  // TODO: 表 id
+	} `yaml:"bitable"`
+}
+
+// FastGPTSinkConfig FastGPT 推送 sink 配置（方案 A：按人建库主动推）。
+type FastGPTSinkConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	BaseURL  string `yaml:"base_url"` // https://cloud.fastgpt.cn
+	APIKey   string `yaml:"api_key"`
+	Interval Duration `yaml:"interval"` // 推送巡检间隔
 }
 
 // UserDirsConfig 按 FastGPT 用户列表在 NAS 自动建目录（账号级 api_key）。
@@ -106,10 +160,8 @@ func (c *Config) Validate() error {
 	if c.Engine.StateFile == "" {
 		c.Engine.StateFile = "./connector_state.json"
 	}
-
-	// 出口：FastGPT 由 serve 模式来拉（方案 B 已选定），daemon 只做 NAS 归档
-	if !c.Sinks.NAS.Enabled {
-		return fmt.Errorf("sinks.nas 必须启用（daemon 的唯一出口；FastGPT 侧由 serve 模式提供 previewUrl）")
+	if c.Storage.DBFile == "" {
+		c.Storage.DBFile = "./adapter.db"
 	}
 
 	// 企微连接器
@@ -128,6 +180,49 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// 飞书连接器
+	if f := &c.Connectors.Feishu; f.Enabled {
+		if f.AppID == "" || f.AppSecret == "" {
+			return fmt.Errorf("connectors.feishu.app_id / app_secret 必填")
+		}
+		if f.Mode == "" {
+			f.Mode = "tenant"
+		}
+		if f.Interval.D() <= 0 {
+			f.Interval = Duration(5 * time.Minute)
+		}
+		if f.BatchLimit <= 0 {
+			f.BatchLimit = 50
+		}
+	}
+
+	// 授权 webhook：user 模式必须开授权（否则拿不到用户 token）
+	if a := &c.Auth; a.Enabled {
+		if a.Addr == "" {
+			a.Addr = ":8089"
+		}
+		if a.RefreshInterval.D() <= 0 {
+			a.RefreshInterval = Duration(time.Hour)
+		}
+		if !c.Connectors.Feishu.Enabled || c.Connectors.Feishu.AppID == "" {
+			return fmt.Errorf("auth 启用时 connectors.feishu 必须启用并配置 app_id/app_secret")
+		}
+	}
+	if c.Connectors.Feishu.Enabled && c.Connectors.Feishu.Mode != "tenant" && !c.Auth.Enabled {
+		return fmt.Errorf("connectors.feishu.mode=%s 需要启用 auth（OAuth 授权 webhook）", c.Connectors.Feishu.Mode)
+	}
+
+	// 身份解析
+	if c.Identity.Source == "" {
+		c.Identity.Source = "local"
+	}
+	if c.Identity.Source == "local" && c.Identity.LocalFile == "" {
+		c.Identity.LocalFile = "./identity_map.json"
+	}
+	if c.Identity.Source == "bitable" && (c.Identity.Bitable.AppToken == "" || c.Identity.Bitable.TableID == "") {
+		return fmt.Errorf("identity.source=bitable 时 bitable.app_token / table_id 必填")
+	}
+
 	// NAS Sink
 	if n := &c.Sinks.NAS; n.Enabled {
 		if n.URL == "" || n.Username == "" || n.Password == "" {
@@ -139,6 +234,21 @@ func (c *Config) Validate() error {
 		if n.UserDirs.Enabled && (n.UserDirs.FastGPTBaseURL == "" || n.UserDirs.FastGPTAPIKey == "") {
 			return fmt.Errorf("sinks.nas.user_dirs 启用时 fastgpt_base_url / fastgpt_api_key 必填")
 		}
+	}
+
+	// FastGPT sink
+	if g := &c.Sinks.FastGPT; g.Enabled {
+		if g.BaseURL == "" || g.APIKey == "" {
+			return fmt.Errorf("sinks.fastgpt.base_url / api_key 必填")
+		}
+		if g.Interval.D() <= 0 {
+			g.Interval = Duration(5 * time.Minute)
+		}
+	}
+
+	// 至少启用一个出口
+	if !c.Sinks.NAS.Enabled && !c.Sinks.FastGPT.Enabled {
+		return fmt.Errorf("sinks.nas 与 sinks.fastgpt 至少启用一个")
 	}
 
 	// 分类器默认值
