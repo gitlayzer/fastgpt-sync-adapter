@@ -98,16 +98,16 @@
 
 ## 五、开发周期（约 11 人日，不含外部前置等待）
 
-| 阶段 | 内容 | 工期 |
-|------|------|------|
-| P0 | config 扩展、SQLite 存储层与建表、迁移脚本 | 0.5 d |
-| P1 | auth webhook + token refresher（含 status 页） | 1.5 d |
-| P2 | identity resolver（Bitable 客户端 + identities 缓存） | 1.0 d |
-| P3 | 企微：会话归组 + Markdown 渲染 + 按人多份 + NAS 新结构 | 2.0 d |
-| P4 | 飞书 connector（tenant+user 双模式、文档/附件、限流/断点） | 2.5 d |
-| P5 | fastgpt push sink（按人建库、上传、标签、幂等映射） | 1.5 d |
-| P6 | serve 校验 + 端到端联调 | 1.0 d |
-| P7 | 加固（重试/限流/日志）+ 部署 + 文档 | 1.0 d |
+| 阶段 | 内容 | 工期 | 状态 |
+|------|------|------|------|
+| P0 | config 扩展、SQLite 存储层与建表、迁移脚本 | 0.5 d | ✅ 已完成（六张表，测试通过） |
+| P1 | auth webhook + token refresher（含 status 页） | 1.5 d | ✅ 代码完成（测试通过）；待飞书凭证联调 |
+| P2 | identity resolver（Bitable 客户端 + identities 缓存） | 1.0 d | ✅ 本地映射兜底完成；Bitable 数据源 TODO |
+| P3 | 企微：会话归组 + Markdown 渲染 + 按人多份 + NAS 新结构 | 2.0 d | ✅ 已完成（测试通过）；待本机实跑验证 |
+| P4 | 飞书 connector（tenant+user 双模式、文档/附件、限流/断点） | 2.5 d | ⬜ 待 P1 凭证 + 授权 |
+| P5 | fastgpt push sink（按人建库、上传、标签、幂等映射） | 1.5 d | ⬜ TODO（用户要求暂缓）；待确认云端 key 建库权限 |
+| P6 | serve 校验 + 端到端联调 | 1.0 d | ⬜ 待 P4/P5 |
+| P7 | 加固（重试/限流/日志）+ 部署 + 文档 | 1.0 d | ⬜ |
 
 ## 六、外部前置条件（不在工时内，需你提供）
 
