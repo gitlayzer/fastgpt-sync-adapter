@@ -12,11 +12,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"fastgpt-sync-adapter/adapter/internal/auth"
 	"fastgpt-sync-adapter/adapter/internal/classifier"
 	"fastgpt-sync-adapter/adapter/internal/config"
 	"fastgpt-sync-adapter/adapter/internal/connector/wecom"
 	"fastgpt-sync-adapter/adapter/internal/engine"
 	"fastgpt-sync-adapter/adapter/internal/fastgpt"
+	"fastgpt-sync-adapter/adapter/internal/feishu"
 	"fastgpt-sync-adapter/adapter/internal/identity"
 	nassink "fastgpt-sync-adapter/adapter/internal/sink/nas"
 	"fastgpt-sync-adapter/adapter/internal/storage"
@@ -85,8 +87,33 @@ func main() {
 			RunOnStart: cfg.Engine.RunOnStart,
 		})
 		log.Printf("[OK] 企微连接器已注册（间隔 %s，批 %d）", cfg.Connectors.WeCom.Interval.D(), cfg.Connectors.WeCom.BatchLimit)
-	} else {
-		log.Printf("[提示] 未启用任何连接器，引擎空转（仅 Sink 就绪）")
+	}
+
+	// ===== 飞书客户端 + OAuth 授权 webhook =====
+	fc := cfg.Connectors.Feishu
+	var feishuClient *feishu.Client
+	if fc.AppID != "" {
+		feishuClient = feishu.New(fc.AppID, fc.AppSecret)
+	}
+	if cfg.Auth.Enabled && feishuClient != nil {
+		authSvc := auth.New(auth.Config{
+			Addr:            cfg.Auth.Addr,
+			ExternalURL:     cfg.Auth.ExternalURL,
+			RefreshInterval: cfg.Auth.RefreshInterval.D(),
+		}, feishuClient, st)
+		// HTTP 服务单独 goroutine
+		go func() {
+			if err := authSvc.Start(); err != nil {
+				log.Printf("[auth] webhook 退出: %v", err)
+			}
+		}()
+		// token 刷新注册为引擎周期任务
+		eng.AddTask(authSvc)
+		log.Printf("[OK] 飞书授权 webhook 已启动（%s），token 刷新间隔 %s", cfg.Auth.Addr, cfg.Auth.RefreshInterval.D())
+	}
+
+	if !cfg.Connectors.WeCom.Enabled && !cfg.Connectors.Feishu.Enabled {
+		log.Printf("[提示] 未启用任何连接器，引擎空转（仅 Sink/授权 就绪）")
 	}
 
 	// 优雅退出
