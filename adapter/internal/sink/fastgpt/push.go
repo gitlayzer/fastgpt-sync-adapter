@@ -198,10 +198,12 @@ func (t *Task) pushFile(ctx context.Context, person, source, category string, f 
 		}
 	}
 
-	// 标签：分类 + 来源平台（两个维度，避免混在一起分不清）
+	// 标签：分类 + 来源平台（前缀字符串形式）。
+	// 注：FastGPT 对象式 {tag,value} 标签要求库内预先创建标签定义（仅 Pro UI 可建，无公开 API，
+	// 否则报 tagNotExist）；字符串标签自动归并进 default_tag 数组，前缀保留维度区分。
 	tags := []any{
-		map[string]string{"tag": "分类", "value": category},
-		map[string]string{"tag": "来源", "value": platformLabel(source)},
+		"分类:" + category,
+		"来源:" + platformLabel(source),
 	}
 
 	c := t.manager.ClientFor(datasetID)
