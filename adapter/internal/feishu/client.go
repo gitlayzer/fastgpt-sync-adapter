@@ -68,10 +68,20 @@ func (c *Client) TenantAccessToken() (string, error) {
 	return out.TenantAccessToken, nil
 }
 
+// RequiredScopes 授权链接要请求的权限集合。
+// offline_access 必须——只有它能让飞书返回 refresh_token（否则 token 2 小时后死掉无法续期）。
+// drive:drive 读云空间元数据+下载文件；search:docs:read 搜索；auth:user.id:read 识别授权人。
+const RequiredScopes = "offline_access drive:drive search:docs:read auth:user.id:read"
+
 // AuthorizeURL 拼 OAuth 授权链接（用户浏览器打开并确认）。
+// scope 必须显式带上 offline_access，否则飞书不返回 refresh_token。
 func AuthorizeURL(appID, redirectURI, state string) string {
-	return fmt.Sprintf("https://accounts.feishu.cn/open-apis/authen/v1/authorize?app_id=%s&redirect_uri=%s&state=%s",
-		appID, urlQueryEscape(redirectURI), urlQueryEscape(state))
+	q := "client_id=" + appID +
+		"&response_type=code" +
+		"&redirect_uri=" + urlQueryEscape(redirectURI) +
+		"&scope=" + urlQueryEscape(RequiredScopes) +
+		"&state=" + urlQueryEscape(state)
+	return "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + q
 }
 
 // UserTokenResp code/refresh 换来的用户 token 响应。

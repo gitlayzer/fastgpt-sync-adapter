@@ -1,0 +1,33 @@
+package feishu
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestAuthorizeURL(t *testing.T) {
+	u := AuthorizeURL("cli_test", "http://127.0.0.1:8089/oauth/feishu/callback", "st1")
+	if !strings.HasPrefix(u, "https://accounts.feishu.cn/open-apis/authen/v1/authorize?") {
+		t.Fatalf("前缀不对: %s", u)
+	}
+	if !strings.Contains(u, "client_id=cli_test") {
+		t.Fatalf("应为 client_id 参数: %s", u)
+	}
+	if !strings.Contains(u, "response_type=code") {
+		t.Fatalf("缺 response_type: %s", u)
+	}
+	// scope 里必须含 offline_access（否则飞书不返回 refresh_token）
+	if !strings.Contains(u, "offline_access") {
+		t.Fatalf("scope 缺 offline_access: %s", u)
+	}
+	if !strings.Contains(u, "drive") {
+		t.Fatalf("scope 缺 drive: %s", u)
+	}
+	if !strings.Contains(u, "state=st1") {
+		t.Fatalf("缺 state: %s", u)
+	}
+	// redirect_uri 必须编码
+	if !strings.Contains(u, "redirect_uri=http%3A%2F%2F127.0.0.1") {
+		t.Fatalf("redirect_uri 未编码: %s", u)
+	}
+}
