@@ -52,7 +52,7 @@
 - `GET /oauth/feishu/callback` → code 换 user_access_token → 写 `oauth_grants`
 - `GET /oauth/status` → 已授权/未授权名单（便于催收授权）
 - refresher：每小时扫 `oauth_grants`，临近过期（剩 <10min）就用 refresh_token 换新并写回（滚动续期，30 天内不断授权）
-- 复用 `tools/feishu_oauth_server.py` 的逻辑，只是改成 Go、常驻、写 SQLite
+- 已在 `internal/auth` 落地：Go 实现、常驻进程、写 SQLite
 
 ### 3. identity resolver（新建）
 - Bitable 客户端：读你提供的多维表格，缓存进 `identities`

@@ -64,7 +64,13 @@ func main() {
 
 	// ===== Sink：NAS 归档 =====
 	clf := classifier.New(cfg.Classifier)
-	nas := nassink.New(cfg.Sinks.NAS.Config, clf, ids, st)
+	// NAS_URL 可覆盖 config.yaml（Docker 中通过 host.docker.internal 访问宿主机中继）。
+	nasCfg := cfg.Sinks.NAS.Config
+	if v := os.Getenv("NAS_URL"); v != "" {
+		nasCfg.URL = v
+		log.Printf("[NAS] 使用环境变量 NAS_URL=%s", v)
+	}
+	nas := nassink.New(nasCfg, clf, ids, st)
 	if err := nas.Login(); err != nil {
 		log.Fatalf("群晖 NAS 登录失败: %v", err)
 	}

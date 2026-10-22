@@ -1,5 +1,28 @@
+# ==== 构建产物 ====
 bin/
-sync_state.json
-*.log
+*.exe
+*.test
+*.out
+
+# ==== 运行时状态（含真实凭证/数据，绝不提交）====
+config.yaml
 private.pem
+*.pem
+*.key
+adapter.db
+adapter.db-journal
+adapter.db-wal
+adapter.db-shm
 connector_state.json
+sync_state.json
+identity_map.json
+feishu_user_token.json
+*.log
+
+# ==== macOS ====
+.DS_Store
+._*
+
+# ==== 编辑器 ====
+.idea/
+.vscode/

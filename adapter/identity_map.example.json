@@ -1,0 +1,4 @@
+[
+  { "wecom_user_id": "zhangsan", "feishu_user_id": "ou_xxx", "person_name": "张三" },
+  { "wecom_user_id": "lisi",     "feishu_user_id": "ou_yyy", "person_name": "李四" }
+]

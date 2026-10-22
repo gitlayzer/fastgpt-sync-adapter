@@ -1,0 +1,93 @@
+# fastgpt-sync-adapter 配置模板
+# 复制为 config.yaml 后再填自己的凭证：cp config.example.yaml config.yaml
+# config.yaml 已被 .gitignore 忽略，不要把真实凭证提交到仓库。
+
+# ===== 引擎 =====
+engine:
+  state_file: "./connector_state.json"  # 各连接器 checkpoint（企微为 seq）
+  run_on_start: true                    # 启动后立即跑一轮
+
+# ===== 存储层（SQLite：授权/身份/文件台账/消息去重）=====
+storage:
+  db_file: "./adapter.db"
+
+# ===== 身份解析（企微 userid → 人员姓名；多维表格未到位前用本地映射兜底）=====
+identity:
+  source: local                    # local（本地映射文件）/ bitable（飞书多维表格）
+  local_file: "./identity_map.json"
+  bitable:
+    app_token: ""                  # 多维表格 app_token（source=bitable 时必填）
+    table_id: ""                   # 数据表 id
+
+# ===== 飞书 OAuth 授权 webhook（常驻；飞书 user 模式必须开）=====
+auth:
+  enabled: true
+  addr: ":8089"
+  external_url: ""                 # 本机测试留空（按请求推断 127.0.0.1:8089）；挂隧道时填公网地址
+  refresh_interval: 1h             # user_access_token 刷新巡检间隔
+
+# ===== 连接器（数据源）=====
+connectors:
+  # 企业微信会话内容存档
+  wecom:
+    enabled: false                 # 填好凭证后改 true
+    interval: 60s                  # 拉取间隔（媒体附件企微侧只留 ~3 天，务必远小于它）
+    batch_limit: 100               # 单批条数（SDK 上限 1000）
+    corp_id: ""                    # 企业 corpid
+    secret: ""                     # 会话存档 secret
+    # RSA 私钥：直接贴 PEM 文本（rsa_private_key），或用 rsa_private_key_file 指文件路径（二选一）
+    rsa_private_key_file: "./private.pem"
+    # SDK 动态库目录（开发机 arm64 用 ./lib/arm64，生产 amd64 用 ./lib/amd64）
+    sdk_lib_path: "./lib/arm64"
+
+  # 飞书云文档
+  feishu:
+    enabled: false
+    interval: 5m
+    batch_limit: 50
+    app_id: ""
+    app_secret: ""
+    mode: both                     # tenant（共享区/知识库）+ user（已授权用户个人云文档）
+    folders: []                    # tenant 模式：共享文件夹 token 列表
+
+# ===== 文件用途分类器（R4，可配规则；命中关键词即归类，只影响归档子目录与标签，不动原文）=====
+classifier:
+  enabled: true
+  default_label: "其他"            # 未命中规则的归类
+  rules:                           # 可自由增改：label=分类目录名，keywords=关键词（不区分大小写）
+    - label: "合同"
+      keywords: ["合同", "协议", "contract", "agreement", "订单", "采购"]
+    - label: "方案"
+      keywords: ["方案", "plan", "proposal", "设计", "规划"]
+    - label: "手册"
+      keywords: ["手册", "说明书", "指南", "manual", "guide", "白皮书"]
+    - label: "专利"
+      keywords: ["专利", "patent", "cn1"]
+    - label: "报告"
+      keywords: ["报告", "report", "周报", "月报", "总结"]
+    - label: "数据表"
+      keywords: ["数据", "报表", "台账", "清单", ".xlsx", ".csv"]
+
+# ===== Sink =====
+# NAS 归档结构：<root>/<人名>/<企微|飞书>/messages/<msgid>.json      （消息原文，幂等覆盖）
+#               <root>/<人名>/<企微|飞书>/conversations/<会话>.md   （会话 Markdown，滚动追加）
+#               <root>/<人名>/<企微|飞书>/<分类>/<msgid>_<附件名>    （附件 + .meta.json 侧边车）
+sinks:
+  nas:
+    enabled: true
+    url: "https://nas.example.com:5001"    # 也可用环境变量 NAS_URL 覆盖
+    username: ""
+    password: ""
+    root_path: "/FastGPT-test"             # 必须是 NAS 上已存在的共享文件夹开头
+    # 按 FastGPT 用户列表在 NAS 自动建目录（人工上传区；需账号级 api_key）
+    user_dirs:
+      enabled: false
+      fastgpt_base_url: ""
+      fastgpt_api_key: ""
+
+  # FastGPT 推送（方案 A：按人建知识库，主动推；本期不做文档级权限）
+  fastgpt:
+    enabled: false
+    base_url: "https://cloud.fastgpt.cn"
+    api_key: ""
+    interval: 5m                   # 推送巡检间隔
