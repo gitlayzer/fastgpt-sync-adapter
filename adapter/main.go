@@ -20,6 +20,7 @@ import (
 	"fastgpt-sync-adapter/adapter/internal/fastgpt"
 	"fastgpt-sync-adapter/adapter/internal/feishu"
 	"fastgpt-sync-adapter/adapter/internal/identity"
+	fastgmtsink "fastgpt-sync-adapter/adapter/internal/sink/fastgpt"
 	nassink "fastgpt-sync-adapter/adapter/internal/sink/nas"
 	"fastgpt-sync-adapter/adapter/internal/storage"
 )
@@ -110,6 +111,17 @@ func main() {
 		// token 刷新注册为引擎周期任务
 		eng.AddTask(authSvc)
 		log.Printf("[OK] 飞书授权 webhook 已启动（%s），token 刷新间隔 %s", cfg.Auth.Addr, cfg.Auth.RefreshInterval.D())
+	}
+
+	// ===== FastGPT 按人推送任务 =====
+	if cfg.Sinks.FastGPT.Enabled {
+		pushTask := fastgmtsink.New(fastgmtsink.Config{
+			BaseURL:  cfg.Sinks.FastGPT.BaseURL,
+			APIKey:   cfg.Sinks.FastGPT.APIKey,
+			Interval: cfg.Sinks.FastGPT.Interval.D(),
+		}, nas.Client(), cfg.Sinks.NAS.RootPath, st)
+		eng.AddTask(pushTask)
+		log.Printf("[OK] FastGPT 推送任务已注册（间隔 %s，%s）", cfg.Sinks.FastGPT.Interval.D(), cfg.Sinks.FastGPT.BaseURL)
 	}
 
 	if !cfg.Connectors.WeCom.Enabled && !cfg.Connectors.Feishu.Enabled {
