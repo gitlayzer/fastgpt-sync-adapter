@@ -116,6 +116,13 @@ CREATE TABLE IF NOT EXISTS room_members (
   user_id    TEXT NOT NULL,
   updated_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (room_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS feishu_doc_state (
+  token      TEXT PRIMARY KEY,
+  edit_time  INTEGER NOT NULL DEFAULT 0,
+  title      TEXT NOT NULL DEFAULT '',
+  owner_id   TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0
 );`)
 	if err != nil {
 		return fmt.Errorf("建表迁移: %w", err)
@@ -300,6 +307,8 @@ ON CONFLICT(room_id, user_id) DO UPDATE SET updated_at=excluded.updated_at`,
 	return err
 }
 
+// ===== 飞书文档变更状态（token → edit_time，增量拉取依据）=====
+
 // ListRoomParticipants 返回已学习到的群成员 user_id 列表。
 func (s *Store) ListRoomParticipants(roomID string) ([]string, error) {
 	rows, err := s.db.Query(`SELECT user_id FROM room_members WHERE room_id=?`, roomID)
@@ -316,4 +325,23 @@ func (s *Store) ListRoomParticipants(roomID string) ([]string, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// GetDocEditTime 返回已记录的文档修改时间（秒）；未见过返回 0。
+func (s *Store) GetDocEditTime(token string) int64 {
+	var v int64
+	if err := s.db.QueryRow(`SELECT edit_time FROM feishu_doc_state WHERE token=?`, token).Scan(&v); err != nil {
+		return 0
+	}
+	return v
+}
+
+// UpsertDocState 记录文档本次已同步到的修改时间。
+func (s *Store) UpsertDocState(token, title, ownerID string, editTime int64) error {
+	_, err := s.db.Exec(`
+INSERT INTO feishu_doc_state (token, edit_time, title, owner_id, updated_at) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(token) DO UPDATE SET edit_time=excluded.edit_time, title=excluded.title,
+  owner_id=excluded.owner_id, updated_at=excluded.updated_at`,
+		token, editTime, title, ownerID, time.Now().Unix())
+	return err
 }

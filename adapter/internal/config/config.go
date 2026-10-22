@@ -90,6 +90,8 @@ type FeishuConnectorConfig struct {
 	AppSecret  string   `yaml:"app_secret"`
 	// Mode: tenant（应用身份遍历共享区/知识库）/ user（按已授权用户逐个拉个人云文档）/ both
 	Mode string `yaml:"mode"`
+	// Folders tenant 模式遍历的共享文件夹 token 列表（拥有者把文件夹分享给应用后填 token）
+	Folders []string `yaml:"folders"`
 }
 
 // StorageConfig SQLite 存储配置。

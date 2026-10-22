@@ -15,6 +15,7 @@ import (
 	"fastgpt-sync-adapter/adapter/internal/auth"
 	"fastgpt-sync-adapter/adapter/internal/classifier"
 	"fastgpt-sync-adapter/adapter/internal/config"
+	feishuconnector "fastgpt-sync-adapter/adapter/internal/connector/feishu"
 	"fastgpt-sync-adapter/adapter/internal/connector/wecom"
 	"fastgpt-sync-adapter/adapter/internal/engine"
 	"fastgpt-sync-adapter/adapter/internal/fastgpt"
@@ -95,6 +96,19 @@ func main() {
 	var feishuClient *feishu.Client
 	if fc.AppID != "" {
 		feishuClient = feishu.New(fc.AppID, fc.AppSecret)
+	}
+	// ===== 连接器：飞书云文档 =====
+	if fc.Enabled {
+		fcConn := feishuconnector.New(feishuconnector.Config{
+			AppID: fc.AppID, AppSecret: fc.AppSecret, Mode: fc.Mode, Folders: fc.Folders,
+		}, st)
+		eng.AddConnector(engine.ConnectorJob{
+			Conn:       fcConn,
+			Interval:   fc.Interval.D(),
+			BatchLimit: fc.BatchLimit,
+			RunOnStart: cfg.Engine.RunOnStart,
+		})
+		log.Printf("[OK] 飞书连接器已注册（mode=%s，共享文件夹 %d 个，间隔 %s）", fc.Mode, len(fc.Folders), fc.Interval.D())
 	}
 	if cfg.Auth.Enabled && feishuClient != nil {
 		authSvc := auth.New(auth.Config{

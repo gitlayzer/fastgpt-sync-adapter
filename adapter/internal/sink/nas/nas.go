@@ -7,6 +7,7 @@
 package nas
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -96,6 +97,25 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 
 	m, parseErr := render.Parse(r.Body)
 
+	// 附件字节缓存：一条记录 fan-out 到多人时，同一附件只拉一次（飞书文档 owner+可见人场景省一半下载）
+	attCache := map[string][]byte{}
+	cachedRead := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
+		if data, ok := attCache[a.FileID]; ok {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+		rc, err := read(ctx, a)
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		attCache[a.FileID] = data
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+
 	// 群成员学习：企微群聊 tolist 为空，靠发言记录逐步积累成员
 	if parseErr == nil && m.RoomID != "" {
 		if err := s.store.AddRoomParticipant(m.RoomID, m.From); err != nil {
@@ -103,7 +123,8 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 		}
 	}
 
-	// 参与者集合：from + tolist + 已知群成员
+	// 参与者集合：OwnerIDs（可见人集合：企微=from+tolist / 飞书=owner+可见授权用户）
+	// + 消息解析出的参与者 + 已知群成员
 	var users []string
 	seen := map[string]bool{}
 	add := func(u string) {
@@ -111,6 +132,9 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 			seen[u] = true
 			users = append(users, u)
 		}
+	}
+	for _, u := range r.OwnerIDs {
+		add(u)
 	}
 	if parseErr == nil {
 		for _, u := range m.Participants() {
@@ -141,7 +165,7 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 		if person == "" {
 			person = "unknown"
 		}
-		if err := s.writeForPerson(ctx, r, m, parseErr == nil, person, uid, platform, read, users, nameOf); err != nil {
+		if err := s.writeForPerson(ctx, r, m, parseErr == nil, person, uid, platform, cachedRead, users, nameOf); err != nil {
 			log.Printf("[nas] 写入失败 person=%s id=%s: %v", person, r.ID, err)
 			if firstErr == nil {
 				firstErr = err
@@ -162,8 +186,8 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 		return fmt.Errorf("写入消息体: %w", err)
 	}
 
-	// 2) 会话 Markdown 滚动追加（按 消息×人 去重）
-	if msgOK {
+	// 2) 会话 Markdown 滚动追加（仅企微对话；飞书文档无会话概念，按 消息×人 去重）
+	if msgOK && r.Source == "wecom" {
 		if logged, err := s.store.IsMessageLogged(r.ID, person); err == nil && !logged {
 			if line, skip := render.RenderLine(m, nameOf); !skip {
 				convFile := m.ConvFileName(uid, nameOf)

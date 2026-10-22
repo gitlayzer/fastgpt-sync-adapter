@@ -1,0 +1,184 @@
+// 飞书 Drive / Docx API：云文档遍历与内容下载。
+// 调用方按身份传入 token（tenant_access_token 或 user_access_token），本文件不感知鉴权细节。
+package feishu
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"time"
+)
+
+// DriveFile drive/v1/files 返回的文件条目。
+type DriveFile struct {
+	Token        string `json:"token"`
+	Name         string `json:"name"`
+	Type         string `json:"type"` // folder/doc/docx/sheet/bitable/file/slides/mindnote/shortcut
+	ParentToken  string `json:"parent_token"`
+	OwnerID      string `json:"owner_id"`
+	CreatedTime  string `json:"created_time"`  // 秒级时间戳字符串
+	ModifiedTime string `json:"modified_time"` // 秒级时间戳字符串
+	URL          string `json:"url"`
+}
+
+// get 带鉴权的 GET（data 字段解到 out）。
+func (c *Client) get(path, token string, query url.Values, out any) error {
+	u := baseURL + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var ar apiResp
+	if err := json.Unmarshal(body, &ar); err != nil {
+		return fmt.Errorf("解析响应失败: %w, body: %s", err, truncate(string(body), 300))
+	}
+	if ar.Code != 0 {
+		return fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+	}
+	if out != nil {
+		if err := json.Unmarshal(body, out); err != nil {
+			return fmt.Errorf("解析响应数据失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// ListFolderChildren 列文件夹直接子项（自动翻页）。
+func (c *Client) ListFolderChildren(token, folderToken string) ([]DriveFile, error) {
+	var all []DriveFile
+	pageToken := ""
+	for {
+		q := url.Values{}
+		q.Set("page_size", "200")
+		if folderToken != "" {
+			q.Set("folder_token", folderToken)
+		}
+		if pageToken != "" {
+			q.Set("page_token", pageToken)
+		}
+		var out struct {
+			apiResp
+			Data struct {
+				Files     []DriveFile `json:"files"`
+				HasMore   bool        `json:"has_more"`
+				PageToken string      `json:"page_token"`
+			} `json:"data"`
+		}
+		if err := c.get("/drive/v1/files", token, q, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data.Files...)
+		if !out.Data.HasMore {
+			return all, nil
+		}
+		pageToken = out.Data.PageToken
+	}
+}
+
+// WalkFolder 递归遍历文件夹（含子文件夹），回调每个非文件夹条目；深度封顶防失控。
+func (c *Client) WalkFolder(token, folderToken string, depth int, fn func(DriveFile)) error {
+	if depth <= 0 {
+		return nil
+	}
+	children, err := c.ListFolderChildren(token, folderToken)
+	if err != nil {
+		return err
+	}
+	for _, f := range children {
+		if f.Type == "folder" {
+			if err := c.WalkFolder(token, f.Token, depth-1, fn); err != nil {
+				return err
+			}
+			continue
+		}
+		if f.Type == "shortcut" {
+			continue // 快捷方式不跟（防环）
+		}
+		fn(f)
+	}
+	return nil
+}
+
+// RootFolderMeta 当前身份的云空间根目录 token（user token 调）。
+func (c *Client) RootFolderMeta(token string) (string, error) {
+	var out struct {
+		apiResp
+		Data struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	if err := c.get("/drive/explorer/v2/root_folder/meta", token, nil, &out); err != nil {
+		return "", err
+	}
+	return out.Data.Token, nil
+}
+
+// DownloadFile 下载 drive 里上传类文件（type=file）的原始字节。
+// 注意限流：drive 下载约 5 QPS、约 1 万次/天/应用，调用方要自控速。
+func (c *Client) DownloadFile(token, fileToken string) (io.ReadCloser, error) {
+	req, err := http.NewRequest("GET", baseURL+"/drive/v1/files/"+fileToken+"/download", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("下载失败 http=%d: %s", resp.StatusCode, truncate(string(body), 300))
+	}
+	return resp.Body, nil
+}
+
+// DocxRawContent 新版文档（docx）纯文本内容。
+func (c *Client) DocxRawContent(token, documentID string) (string, error) {
+	var out struct {
+		apiResp
+		Data struct {
+			Content string `json:"content"`
+		} `json:"data"`
+	}
+	if err := c.get("/docx/v1/documents/"+documentID+"/raw_content", token, nil, &out); err != nil {
+		return "", err
+	}
+	return out.Data.Content, nil
+}
+
+// DocRawContent 旧版文档（doc）纯文本内容。
+func (c *Client) DocRawContent(token, docToken string) (string, error) {
+	var out struct {
+		apiResp
+		Data struct {
+			Content string `json:"content"`
+		} `json:"data"`
+	}
+	if err := c.get("/doc/v2/"+docToken+"/raw_content", token, nil, &out); err != nil {
+		return "", err
+	}
+	return out.Data.Content, nil
+}
+
+// UnixSeconds 解析飞书的秒级时间戳字符串（失败返回 0）。
+func UnixSeconds(s string) int64 {
+	var v int64
+	fmt.Sscanf(s, "%d", &v)
+	return v
+}
+
+// NowUnix 当前秒级时间戳。
+func NowUnix() int64 { return time.Now().Unix() }
