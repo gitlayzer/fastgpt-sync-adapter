@@ -29,3 +29,14 @@ type Connector interface {
 	// Close 释放资源。
 	Close() error
 }
+
+// AckConnector 可选接口：需要「写入成功后才确认已处理」的连接器实现它。
+//
+// 为什么需要：像飞书文档这类没有单调游标的源，变更检测靠 doc_state 记录
+// （token + edit_time）。如果 Fetch 阶段就把状态写成「已处理」，一旦后续
+// 写 Sink 失败，下一轮会被判为「未变化」而永久跳过该文档——数据静默丢失。
+// 实现此接口后，状态改由引擎在 Sink 全部写入成功后回调 Ack 来记录。
+type AckConnector interface {
+	// Ack 标记一条记录已成功落地。实现方应在此时持久化变更检测状态。
+	Ack(recordID string) error
+}

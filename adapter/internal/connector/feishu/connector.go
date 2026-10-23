@@ -24,6 +24,9 @@ type Config struct {
 	AppSecret string   `yaml:"app_secret"`
 	Mode      string   `yaml:"mode"`    // tenant / user / both
 	Folders   []string `yaml:"folders"` // tenant 模式遍历的共享文件夹 token 列表
+	// WikiSpaceIDs 额外遍历的知识库空间 ID。用于「我的文档库」这类
+	// wiki/v2/spaces 不返回、但按 ID 可以正常列节点的空间。
+	WikiSpaceIDs []string `yaml:"wiki_space_ids"`
 }
 
 // API 抽象（便于测试替换；feishuapi.Client 适配实现）。
@@ -35,6 +38,10 @@ type API interface {
 	DocxRawContent(token, documentID string) (string, error)
 	DocRawContent(token, docToken string) (string, error)
 	TenantAccessToken() (string, error)
+
+	// 知识库（wiki）：飞书新版「我的文档库」只能从这里列出来
+	ListWikiSpaces(token string) ([]feishuapi.WikiSpace, error)
+	WalkWikiSpace(token, spaceID string, maxDepth int, fn func(feishuapi.WikiSpace, feishuapi.WikiNode)) error
 }
 
 // 限流：drive 下载约 5 QPS，FetchAttachment 前统一减速。
@@ -47,17 +54,27 @@ type Connector struct {
 	store *storage.Store
 
 	tenantToken string
-	pending     []model.Record // 本轮已扫描出的待产出行列（增量）
-	lastDl      atomic.Int64   // 上次下载时间（纳秒），限流用
+	pending     []model.Record        // 本轮已扫描出的待产出行列（增量）
+	pendingMeta map[string]pendingDoc // 待 Ack 的文档元数据（id → 状态）
+	lastDl      atomic.Int64          // 上次下载时间（纳秒），限流用
 }
 
 func New(cfg Config, store *storage.Store) *Connector {
-	return &Connector{cfg: cfg, store: store}
+	return &Connector{
+		cfg:         cfg,
+		store:       store,
+		pendingMeta: map[string]pendingDoc{},
+	}
 }
 
 // NewWithAPI 注入自定义 API（测试用）。
 func NewWithAPI(cfg Config, store *storage.Store, api API) *Connector {
-	return &Connector{cfg: cfg, store: store, api: api}
+	return &Connector{
+		cfg:         cfg,
+		store:       store,
+		api:         api,
+		pendingMeta: map[string]pendingDoc{},
+	}
 }
 
 func (c *Connector) Name() string { return "feishu" }
@@ -169,7 +186,7 @@ func (c *Connector) scan(ctx context.Context) error {
 	if (mode == "tenant" || mode == "both") && c.tenantToken != "" {
 		for _, folder := range c.cfg.Folders {
 			err := c.api.WalkFolder(c.tenantToken, folder, 10, func(f feishuapi.DriveFile) {
-				c.collect(f, "", seen)
+				c.collect(docToRecord(f, ""), seen)
 			})
 			if err != nil {
 				log.Printf("[feishu] 遍历共享文件夹 %s 失败: %v", folder, err)
@@ -189,37 +206,144 @@ func (c *Connector) scan(ctx context.Context) error {
 				log.Printf("[feishu] 用户 %s 授权无效（status=%s），跳过", g.ExternalUserID, g.Status)
 				continue
 			}
+			// a) 云空间（drive）：老式文件夹结构
 			root, err := c.api.RootFolderMeta(g.AccessToken)
 			if err != nil {
 				log.Printf("[feishu] 拿 %s 根目录失败: %v", g.ExternalUserID, err)
-				continue
+			} else {
+				driveN := 0
+				err = c.api.WalkFolder(g.AccessToken, root, 10, func(f feishuapi.DriveFile) {
+					driveN++
+					c.collect(docToRecord(f, g.ExternalUserID), seen)
+				})
+				if err != nil {
+					log.Printf("[feishu] 遍历 %s 云空间失败: %v", g.ExternalUserID, err)
+				} else {
+					log.Printf("[feishu] %s 云空间：%d 个条目", g.ExternalUserID, driveN)
+				}
 			}
-			err = c.api.WalkFolder(g.AccessToken, root, 10, func(f feishuapi.DriveFile) {
-				c.collect(f, g.ExternalUserID, seen)
-			})
+
+			// b) 团队知识库：wiki/v2/spaces 返回的空间
+			spaceIDs := append([]string{}, c.cfg.WikiSpaceIDs...)
+			spaces, err := c.api.ListWikiSpaces(g.AccessToken)
 			if err != nil {
-				log.Printf("[feishu] 遍历 %s 云空间失败: %v", g.ExternalUserID, err)
+				// 缺 wiki:wiki:readonly 时这里会报 99991679，提示需要重新授权
+				log.Printf("[feishu] 列 %s 知识库失败（可能缺 wiki:wiki:readonly，需重新授权）: %v",
+					g.ExternalUserID, err)
+			} else {
+				for _, sp := range spaces {
+					spaceIDs = append(spaceIDs, sp.SpaceID)
+				}
 			}
+
+			// ListWikiSpaces 不返回「我的文档库」（官方明确说明），
+			// 这类空间只能通过配置 wiki_space_ids 显式指定，再按 ID 列节点。
+			total := 0
+			seenSpace := map[string]bool{}
+			for _, sid := range spaceIDs {
+				if sid == "" || seenSpace[sid] {
+					continue
+				}
+				seenSpace[sid] = true
+				n := 0
+				err := c.api.WalkWikiSpace(g.AccessToken, sid, 10, func(_ feishuapi.WikiSpace, node feishuapi.WikiNode) {
+					if rec, ok := wikiNodeToRecord(node, g.ExternalUserID); ok {
+						n++
+						c.collect(rec, seen)
+					}
+				})
+				if err != nil {
+					log.Printf("[feishu] 遍历知识库 %s 失败: %v", sid, err)
+					continue
+				}
+				total += n
+				if n > 0 {
+					log.Printf("[feishu] 知识库 %s：%d 篇", sid, n)
+				}
+			}
+			log.Printf("[feishu] %s 知识库：%d 个空间，%d 篇文档", g.ExternalUserID, len(seenSpace), total)
 		}
 	}
 	log.Printf("[feishu] 扫描完成，待产出 %d 篇", len(c.pending))
 	return nil
 }
 
+// wikiNodeToRecord wiki 节点 → Record。
+// 只处理可下载的类型；sheet/bitable/slides 等暂时跳过（FetchAttachment 不支持）。
+func wikiNodeToRecord(n feishuapi.WikiNode, viewerID string) (model.Record, bool) {
+	switch n.ObjType {
+	case "doc", "docx", "file":
+	default:
+		return model.Record{}, false
+	}
+	token := n.ObjToken
+	if token == "" {
+		return model.Record{}, false
+	}
+	f := feishuapi.DriveFile{
+		Token:        token,
+		Name:         n.Title,
+		Type:         n.ObjType,
+		ModifiedTime: n.NodeEditTime,
+	}
+	if f.ModifiedTime == "" {
+		f.ModifiedTime = n.NodeCreateTime
+	}
+	// wiki 节点不返回文档 owner，用授权人自己作为归属人：
+	// 这批文档是通过他的授权才可见的，归到他名下符合业务预期。
+	if viewerID != "" {
+		f.OwnerID = viewerID
+	}
+	return docToRecord(f, viewerID), true
+}
+
 // collect 变更检测 + 入队（同 token 只入一次）。
-func (c *Connector) collect(f feishuapi.DriveFile, viewerID string, seen map[string]bool) {
-	if seen[f.Token] {
+// 入参是已构造好的 Record，drive 与 wiki 两条来源共用同一套去重与台账逻辑。
+func (c *Connector) collect(rec model.Record, seen map[string]bool) {
+	if seen[rec.ID] {
 		return
 	}
-	seen[f.Token] = true
-	editTime := feishuapi.UnixSeconds(f.ModifiedTime)
-	if editTime > 0 && editTime <= c.store.GetDocEditTime(f.Token) {
+	seen[rec.ID] = true
+	editTime := rec.Timestamp / 1000
+	if editTime > 0 && editTime <= c.store.GetDocEditTime(rec.ID) {
 		return // 未变化
 	}
-	rec := docToRecord(f, viewerID)
 	c.pending = append(c.pending, rec)
-	// 产出即记录状态（附件拉取失败下轮还会重试，因为 checkpoint 由引擎管）
-	c.store.UpsertDocState(f.Token, f.Name, f.OwnerID, editTime)
+
+	// 这里只入队，不写 doc_state。
+	// 状态必须等 Sink 全部写入成功后再由 Ack 记录，否则写 NAS 失败时
+	// 下一轮会被判为「未变化」而永久跳过——文档静默丢失。
+	// 待确认的记录暂存在 pendingMeta，供 Ack 取用元数据。
+	c.pendingMeta[rec.ID] = pendingDoc{
+		title:    attachmentNameOf(rec),
+		ownerID:  rec.SenderID,
+		editTime: editTime,
+	}
+}
+
+// pendingDoc 待确认文档的元数据（Ack 时写 doc_state 用）。
+type pendingDoc struct {
+	title    string
+	ownerID  string
+	editTime int64
+}
+
+// Ack 实现 connector.AckConnector：Sink 写入成功后记录变更检测状态。
+func (c *Connector) Ack(recordID string) error {
+	meta, ok := c.pendingMeta[recordID]
+	if !ok {
+		return nil // 非本连接器产出的记录，忽略
+	}
+	delete(c.pendingMeta, recordID)
+	return c.store.UpsertDocState(recordID, meta.title, meta.ownerID, meta.editTime)
+}
+
+// attachmentNameOf 取 Record 里第一个附件的名字（写 doc_state 用）。
+func attachmentNameOf(rec model.Record) string {
+	if len(rec.Attachments) > 0 {
+		return rec.Attachments[0].Name
+	}
+	return ""
 }
 
 // FetchAttachment 拉取文档内容（file 原始字节 / docx·doc 纯文本），带限流。

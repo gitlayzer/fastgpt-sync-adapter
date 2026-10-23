@@ -23,6 +23,20 @@ func TestAuthorizeURL(t *testing.T) {
 	if !strings.Contains(u, "drive") {
 		t.Fatalf("scope 缺 drive: %s", u)
 	}
+	// 逐项校验：飞书只授予链接里显式请求的 scope，漏一个就少一个，
+	// 而症状是「后台明明开了权限但 token 里没有」，极难排查。
+	for _, want := range []string{
+		"offline_access",
+		"drive%3Adrive",
+		"wiki%3Awiki%3Areadonly",
+		"docx%3Adocument%3Areadonly",
+		"search%3Adocs%3Aread",
+		"auth%3Auser.id%3Aread",
+	} {
+		if !strings.Contains(u, want) {
+			t.Fatalf("scope 缺 %s: %s", want, u)
+		}
+	}
 	if !strings.Contains(u, "state=st1") {
 		t.Fatalf("缺 state: %s", u)
 	}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -23,36 +24,51 @@ type DriveFile struct {
 	URL          string `json:"url"`
 }
 
-// get 带鉴权的 GET（data 字段解到 out）。
+// get 带鉴权的 GET（data 字段解到 out）。网络错误与限流类错误自动重试。
 func (c *Client) get(path, token string, query url.Values, out any) error {
 	u := baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	req, err := http.NewRequest("GET", u, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var ar apiResp
-	if err := json.Unmarshal(body, &ar); err != nil {
-		return fmt.Errorf("解析响应失败: %w, body: %s", err, truncate(string(body), 300))
-	}
-	if ar.Code != 0 {
-		return fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
-	}
-	if out != nil {
-		if err := json.Unmarshal(body, out); err != nil {
-			return fmt.Errorf("解析响应数据失败: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < apiAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+			log.Printf("[feishu] GET %s 重试 %d/%d（上次: %v）", path, attempt+1, apiAttempts, lastErr)
 		}
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var ar apiResp
+		if err := json.Unmarshal(body, &ar); err != nil {
+			lastErr = fmt.Errorf("解析响应失败: %w, body: %s", err, truncate(string(body), 300))
+			continue
+		}
+		if ar.Code != 0 {
+			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+			if retryableCode(ar.Code) {
+				continue
+			}
+			return lastErr
+		}
+		if out != nil {
+			if err := json.Unmarshal(body, out); err != nil {
+				return fmt.Errorf("解析响应数据失败: %w", err)
+			}
+		}
+		return nil
 	}
-	return nil
+	return lastErr
 }
 
 // ListFolderChildren 列文件夹直接子项（自动翻页）。

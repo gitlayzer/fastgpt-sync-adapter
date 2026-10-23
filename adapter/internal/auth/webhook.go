@@ -101,6 +101,13 @@ func (s *Service) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().Unix()
+	// refresh_token 的有效期以接口返回为准；接口没给（未授予 offline_access，
+	// 或字段缺失）时留 0 表示「未知」，而不是写成 now（那等于立刻过期）。
+	var refreshExpireAt int64
+	if tok.RefreshExpiresIn > 0 {
+		refreshExpireAt = now + tok.RefreshExpiresIn
+	}
+
 	grant := &storage.OAuthGrant{
 		Platform:        "feishu",
 		ExternalUserID:  externalID,
@@ -108,7 +115,7 @@ func (s *Service) handleCallback(w http.ResponseWriter, r *http.Request) {
 		AccessToken:     tok.AccessToken,
 		RefreshToken:    tok.RefreshToken,
 		ExpireAt:        now + tok.ExpiresIn,
-		RefreshExpireAt: now + tok.RefreshExpiresIn,
+		RefreshExpireAt: refreshExpireAt,
 		Status:          "authorized",
 	}
 	if err := s.store.UpsertOAuthGrant(grant); err != nil {
@@ -191,7 +198,10 @@ func (s *Service) refreshExpiring() int {
 		if g.Status != "authorized" || g.RefreshToken == "" {
 			continue
 		}
-		if g.RefreshExpireAt <= now {
+		// RefreshExpireAt 为 0 表示历史记录没记下有效期（旧版本字段名写错导致解析为 0）。
+		// 不能据此判定「已过期」——refresh_token 本身还在，直接尝试刷新一次即可，
+		// 刷新成功会把正确的有效期补上。真正的过期由刷新接口返回错误来暴露。
+		if g.RefreshExpireAt > 0 && g.RefreshExpireAt <= now {
 			if g.Status != "expired" {
 				g.Status = "expired"
 				s.store.UpsertOAuthGrant(g)

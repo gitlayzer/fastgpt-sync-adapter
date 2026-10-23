@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"fastgpt-sync-adapter/adapter/internal/auth"
 	"fastgpt-sync-adapter/adapter/internal/classifier"
@@ -58,9 +59,32 @@ func main() {
 	defer st.Close()
 	log.Printf("[OK] SQLite 存储就绪（%s）", cfg.Storage.DBFile)
 
-	// ===== 身份解析器（多维表格未到位前用本地映射兜底）=====
-	ids := identity.NewLocalResolver(cfg.Identity.LocalFile, st)
-	log.Printf("[OK] 身份解析器：source=%s（%s）", cfg.Identity.Source, cfg.Identity.LocalFile)
+	// ===== 身份解析器 =====
+	var ids identity.Resolver
+	switch cfg.Identity.Source {
+	case "bitable":
+		bt := cfg.Identity.Bitable
+		bc := feishu.New(bt.AppID, bt.AppSecret)
+		br := identity.NewBitableResolver(identity.BitableConfig{
+			AppToken:        bt.AppToken,
+			TableID:         bt.TableID,
+			Refresh:         bt.RefreshInterval.D(),
+			FieldWeComID:    bt.FieldWeComID,
+			FieldWeComName:  bt.FieldWeComName,
+			FieldFeishuUser: bt.FieldFeishuUser,
+			FieldOpenID:     bt.FieldOpenID,
+		}, bc, st)
+		// 启动时先同步一次，避免首轮归档用空缓存把目录建成 userid
+		if err := br.Sync(); err != nil {
+			log.Printf("[警告] 多维表格首次同步失败（将按间隔重试）: %v", err)
+		}
+		ids = br
+		log.Printf("[OK] 身份解析器：source=bitable（表格 %s/%s，间隔 %s）",
+			bt.AppToken, bt.TableID, bt.RefreshInterval.D())
+	default:
+		ids = identity.NewLocalResolver(cfg.Identity.LocalFile, st)
+		log.Printf("[OK] 身份解析器：source=local（%s）", cfg.Identity.LocalFile)
+	}
 
 	// ===== Sink：NAS 归档 =====
 	clf := classifier.New(cfg.Classifier)
@@ -107,6 +131,7 @@ func main() {
 	if fc.Enabled {
 		fcConn := feishuconnector.New(feishuconnector.Config{
 			AppID: fc.AppID, AppSecret: fc.AppSecret, Mode: fc.Mode, Folders: fc.Folders,
+			WikiSpaceIDs: fc.WikiSpaceIDs,
 		}, st)
 		eng.AddConnector(engine.ConnectorJob{
 			Conn:       fcConn,
@@ -154,8 +179,20 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stop
-		log.Printf("收到退出信号，停止。")
+		log.Printf("收到退出信号，正在停止（再按一次 Ctrl+C 强制退出）…")
 		cancel()
+
+		// 兜底：SDK 的 C 调用是同步阻塞的，单个 GetMediaData 最长要等到
+		// mediaTimeoutSec 才返回，卡在最坏路径上时优雅退出仍会拖一会。
+		// 第二次信号立即强退；否则 15 秒后也强退，避免用户以为进程卡死。
+		select {
+		case <-stop:
+			log.Printf("再次收到中断信号，强制退出")
+			os.Exit(130)
+		case <-time.After(15 * time.Second):
+			log.Printf("优雅退出超时（15s），强制退出")
+			os.Exit(130)
+		}
 	}()
 
 	if err := eng.Run(ctx); err != nil {

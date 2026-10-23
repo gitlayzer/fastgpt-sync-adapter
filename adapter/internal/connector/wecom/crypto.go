@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"regexp"
 )
 
 // Crypto 企业微信会话内容存档的加解密。
@@ -25,7 +26,13 @@ type Crypto struct {
 func NewCrypto(privateKeyPEM string) (*Crypto, error) {
 	block, _ := pem.Decode([]byte(privateKeyPEM))
 	if block == nil {
-		return nil, fmt.Errorf("无法解析 RSA 私钥 PEM（请确认是 PKCS#1 或 PKCS#8 格式）")
+		// pem.Decode 返回 nil 最常见的原因不是格式，而是 PEM 结构本身不完整：
+		// 首尾标签不一致（改标签只改了一行）、缺 END 行、复制时丢了换行。
+		// 这里先做一次针对性检查，避免把用户引到「格式不对」的岔路上。
+		if msg := checkPEMShape(privateKeyPEM); msg != "" {
+			return nil, fmt.Errorf("无法解析 RSA 私钥 PEM: %s", msg)
+		}
+		return nil, fmt.Errorf("无法解析 RSA 私钥 PEM（未找到完整的 BEGIN/END 块，请确认是 PKCS#1 或 PKCS#8 格式）")
 	}
 	// 先试 PKCS#1
 	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
@@ -41,6 +48,26 @@ func NewCrypto(privateKeyPEM string) (*Crypto, error) {
 		return nil, fmt.Errorf("私钥不是 RSA 类型")
 	}
 	return &Crypto{privateKey: rsaKey}, nil
+}
+
+// checkPEMShape 在 pem.Decode 失败后给出更具体的原因。
+// 返回空串表示没查出明显问题（交给调用方给通用提示）。
+func checkPEMShape(s string) string {
+	beginRe := regexp.MustCompile(`-----BEGIN ([A-Z0-9 ]+)-----`)
+	endRe := regexp.MustCompile(`-----END ([A-Z0-9 ]+)-----`)
+	b := beginRe.FindStringSubmatch(s)
+	e := endRe.FindStringSubmatch(s)
+	switch {
+	case b == nil && e == nil:
+		return "文件内容里没有 BEGIN/END 行，确认是不是把 .pem 的内容贴成了别的文件"
+	case b == nil:
+		return fmt.Sprintf("缺少 -----BEGIN ...----- 行（找到 END %s）", e[1])
+	case e == nil:
+		return fmt.Sprintf("缺少 -----END %s----- 行，文件可能被截断或复制不完整", b[1])
+	case b[1] != e[1]:
+		return fmt.Sprintf("首尾标签不一致：BEGIN %s 对 END %s，两行必须同名", b[1], e[1])
+	}
+	return ""
 }
 
 // DecryptRandomKey 用 RSA 私钥解密 encrypt_random_key，得到 base64 编码的会话密钥。

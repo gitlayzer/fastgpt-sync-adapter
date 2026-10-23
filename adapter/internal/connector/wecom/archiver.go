@@ -1,9 +1,10 @@
 package wecom
 
 import (
-	"log"
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 )
 
 // ===== 企微会话存档数据结构 =====
@@ -37,11 +38,14 @@ type Message struct {
 }
 
 // SDK 抽象：真实拉取通过官方 C SDK（cgo），这里定义接口便于替换/测试。
+//
+// 两个拉取方法都接收 ctx：SDK 内部对 10001 做多次重试并带退避等待，
+// 若不能在重试之间响应取消，进程停止时会把整批拉完才退出（实测可卡数分钟）。
 type SDK interface {
 	// GetChatData 拉取从 seq 开始的 limit 条加密记录。
-	GetChatData(seq int64, limit int) (*ChatDataResponse, error)
+	GetChatData(ctx context.Context, seq int64, limit int) (*ChatDataResponse, error)
 	// GetMediaData 拉取媒体附件（sdkfileid），支持分片。返回文件字节。
-	GetMediaData(sdkFileID, indexBuf string) (data []byte, nextIndexBuf string, isFinish bool, err error)
+	GetMediaData(ctx context.Context, sdkFileID, indexBuf string) (data []byte, nextIndexBuf string, isFinish bool, err error)
 	// DecryptData SDK 内置解密：直接解 encrypt_random_key + encrypt_chat_msg。
 	DecryptData(encryptRandomKey, encryptChatMsg string) (string, error)
 }
@@ -59,11 +63,11 @@ func NewArchiver(corpID, secret string, crypto *Crypto, sdk SDK) *Archiver {
 }
 
 // FetchAndDecrypt 从 seq 拉取并解密一批消息。
-func (a *Archiver) FetchAndDecrypt(seq int64, limit int) ([]*Message, int64, error) {
+func (a *Archiver) FetchAndDecrypt(ctx context.Context, seq int64, limit int) ([]*Message, int64, error) {
 	if a.SDK == nil {
 		return nil, seq, fmt.Errorf("企微 SDK 未初始化（需要 libWeWorkFinanceSdk_C 动态库，见配置 wecom.sdk_lib_path）")
 	}
-	resp, err := a.SDK.GetChatData(seq, limit)
+	resp, err := a.SDK.GetChatData(ctx, seq, limit)
 	if err != nil {
 		return nil, seq, fmt.Errorf("get_chat_data: %w", err)
 	}

@@ -19,14 +19,19 @@ type mockAPI struct {
 	fileData  map[string]string                // fileToken -> content
 	docxData  map[string]string
 	downloads int
+
+	wikiSpaces map[string][]feishuapi.WikiSpace // userToken -> spaces
+	wikiNodes  map[string][]feishuapi.WikiNode  // spaceID -> nodes
 }
 
 func newMockAPI() *mockAPI {
 	return &mockAPI{
-		folders:  map[string][]feishuapi.DriveFile{},
-		roots:    map[string]string{},
-		fileData: map[string]string{},
-		docxData: map[string]string{},
+		folders:    map[string][]feishuapi.DriveFile{},
+		roots:      map[string]string{},
+		fileData:   map[string]string{},
+		docxData:   map[string]string{},
+		wikiSpaces: map[string][]feishuapi.WikiSpace{},
+		wikiNodes:  map[string][]feishuapi.WikiNode{},
 	}
 }
 
@@ -67,6 +72,18 @@ func (m *mockAPI) DocxRawContent(token, documentID string) (string, error) {
 func (m *mockAPI) DocRawContent(token, docToken string) (string, error) {
 	m.downloads++
 	return m.docxData[docToken], nil
+}
+
+// wiki 相关：默认返回空，需要时在测试里赋值
+func (m *mockAPI) ListWikiSpaces(token string) ([]feishuapi.WikiSpace, error) {
+	return m.wikiSpaces[token], nil
+}
+
+func (m *mockAPI) WalkWikiSpace(token, spaceID string, maxDepth int, fn func(feishuapi.WikiSpace, feishuapi.WikiNode)) error {
+	for _, n := range m.wikiNodes[spaceID] {
+		fn(feishuapi.WikiSpace{SpaceID: spaceID}, n)
+	}
+	return nil
 }
 
 func TestTenantScanAndChangeDetection(t *testing.T) {
@@ -115,7 +132,13 @@ func TestTenantScanAndChangeDetection(t *testing.T) {
 		t.Fatalf("docx 内容不对: %q", data)
 	}
 
-	// 第二次扫描：都未变化 → 0 产出
+	// 第二次扫描：Ack 之后才视作已处理 → 0 产出
+	// （状态在 Ack 时才写，模拟引擎在 Sink 写入成功后的回调）
+	for _, r := range recs {
+		if err := c.Ack(r.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
 	recs2, _, _ := c.Fetch(context.Background(), "", 10)
 	if len(recs2) != 0 {
 		t.Fatalf("未变化应 0 产出, 实际 %d", len(recs2))
@@ -162,5 +185,110 @@ func TestUserModeOwnerAndViewerBothStored(t *testing.T) {
 	// owner + viewer 都在 OwnerIDs（NAS fan-out 各存一份）
 	if len(r.OwnerIDs) != 2 || r.OwnerIDs[0] != "ou_owner" || r.OwnerIDs[1] != "ou_viewer" {
 		t.Fatalf("OwnerIDs 应含 owner+viewer: %v", r.OwnerIDs)
+	}
+}
+
+// TestUserModeWikiOnly 复现真实场景：用户「我的文档库」里有文档，
+// 但 drive 根目录为空（飞书新版把个人文档库归入 wiki 体系）。
+// 只扫 drive 会得到 0 篇，必须走 wiki 才能正常产出。
+func TestUserModeWikiOnly(t *testing.T) {
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_u", AccessToken: "ut1", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+
+	api := newMockAPI()
+	api.roots["ut1"] = "rootU"
+	api.folders["rootU"] = nil // 云空间为空——这是关键前提
+
+	api.wikiSpaces["ut1"] = []feishuapi.WikiSpace{
+		{SpaceID: "sp1", Name: "我的文档库", SpaceType: "person"},
+	}
+	api.wikiNodes["sp1"] = []feishuapi.WikiNode{
+		{Token: "nd1", ObjToken: "doccn1", ObjType: "docx", Title: "杜新田的测试文档", NodeEditTime: "1700000100"},
+		{Token: "nd2", ObjToken: "sht1", ObjType: "sheet", Title: "表格（暂不支持）", NodeEditTime: "1700000100"},
+	}
+	api.docxData["doccn1"] = "# 测试内容"
+
+	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recs, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("应产出 1 篇 docx（sheet 不支持被跳过），实际 %d: %+v", len(recs), recs)
+	}
+	if recs[0].ID != "doccn1" {
+		t.Fatalf("ID 应为 obj_token, 得到 %s", recs[0].ID)
+	}
+	if recs[0].Attachments[0].FileID != "docx:doccn1" {
+		t.Fatalf("附件标识错误: %s", recs[0].Attachments[0].FileID)
+	}
+
+	// 第二轮应无新增（Ack 之后 doc_state 才记录）
+	for _, r := range recs {
+		if err := c.Ack(r.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs2, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil || len(recs2) != 0 {
+		t.Fatalf("第二轮应无新数据: n=%d err=%v", len(recs2), err)
+	}
+}
+
+// TestNotAckedMeansRetry 验证幂等性的关键语义：
+// 没有 Ack 的记录（模拟写入 Sink 失败）下一轮必须重新产出，
+// 否则数据会静默丢失。
+func TestNotAckedMeansRetry(t *testing.T) {
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_u", AccessToken: "ut1", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+
+	api := newMockAPI()
+	api.roots["ut1"] = "rootU"
+	api.wikiSpaces["ut1"] = []feishuapi.WikiSpace{{SpaceID: "sp1", Name: "我的文档库"}}
+	api.wikiNodes["sp1"] = []feishuapi.WikiNode{
+		{Token: "nd1", ObjToken: "doc1", ObjType: "docx", Title: "文档", NodeEditTime: "1700000100"},
+	}
+	api.docxData["doc1"] = "内容"
+
+	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第一轮产出但不 Ack（模拟写 NAS 失败）
+	recs1, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil || len(recs1) != 1 {
+		t.Fatalf("第一轮: n=%d err=%v", len(recs1), err)
+	}
+
+	// 第二轮必须重新产出同一篇——这是幂等性的保证
+	recs2, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs2) != 1 || recs2[0].ID != "doc1" {
+		t.Fatalf("未 Ack 的记录应重新产出, 实际 n=%d", len(recs2))
+	}
+
+	// Ack 之后不再产出
+	if err := c.Ack("doc1"); err != nil {
+		t.Fatal(err)
+	}
+	recs3, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil || len(recs3) != 0 {
+		t.Fatalf("Ack 后应无产出, 实际 n=%d err=%v", len(recs3), err)
 	}
 }

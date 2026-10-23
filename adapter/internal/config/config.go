@@ -92,6 +92,13 @@ type FeishuConnectorConfig struct {
 	Mode string `yaml:"mode"`
 	// Folders tenant 模式遍历的共享文件夹 token 列表（拥有者把文件夹分享给应用后填 token）
 	Folders []string `yaml:"folders"`
+	// WikiSpaceIDs 额外要遍历的知识库空间 ID 列表（纯数字）。
+	//
+	// 为什么需要：wiki/v2/spaces 不返回「我的文档库」（飞书官方明确说明），
+	// 但拿到 space_id 后 spaces/{id}/nodes 是可以正常列的。
+	// space_id 用一次 wiki/v2/spaces/get_node?token=<文档URL里的token> 反查即可：
+	// 返回里的 space_id 字段就是。
+	WikiSpaceIDs []string `yaml:"wiki_space_ids"`
 }
 
 // StorageConfig SQLite 存储配置。
@@ -110,12 +117,23 @@ type AuthConfig struct {
 
 // IdentityConfig 身份解析配置。
 type IdentityConfig struct {
-	// Source: local（本地 JSON 映射文件，兜底）/ bitable（飞书多维表格，TODO 待表格到位）
+	// Source: local（本地 JSON 映射文件）/ bitable（飞书多维表格，自动同步）
 	Source    string `yaml:"source"`
 	LocalFile string `yaml:"local_file"` // source=local 时的映射文件路径
 	Bitable   struct {
-		AppToken string `yaml:"app_token"` // TODO: 多维表格 app_token
-		TableID  string `yaml:"table_id"`  // TODO: 表 id
+		AppToken string `yaml:"app_token"` // 多维表格 app_token
+		TableID  string `yaml:"table_id"`  // 数据表 id
+		// 读表格用的应用凭证。可与 connectors.feishu 的应用不同：
+		// 现网里文档同步应用没有该表格权限，另有一个专门的应用。
+		AppID     string `yaml:"app_id"`
+		AppSecret string `yaml:"app_secret"`
+		// RefreshInterval 同步间隔（默认 1h）
+		RefreshInterval Duration `yaml:"refresh_interval"`
+		// 字段名可配，表格改列名时不用改代码
+		FieldWeComID   string `yaml:"field_wecom_id"`
+		FieldWeComName string `yaml:"field_wecom_name"`
+		FieldFeishuUser string `yaml:"field_feishu_user"`
+		FieldOpenID    string `yaml:"field_openid"`
 	} `yaml:"bitable"`
 }
 
@@ -221,8 +239,17 @@ func (c *Config) Validate() error {
 	if c.Identity.Source == "local" && c.Identity.LocalFile == "" {
 		c.Identity.LocalFile = "./identity_map.json"
 	}
-	if c.Identity.Source == "bitable" && (c.Identity.Bitable.AppToken == "" || c.Identity.Bitable.TableID == "") {
-		return fmt.Errorf("identity.source=bitable 时 bitable.app_token / table_id 必填")
+	if c.Identity.Source == "bitable" {
+		b := &c.Identity.Bitable
+		if b.AppToken == "" || b.TableID == "" {
+			return fmt.Errorf("identity.source=bitable 时 bitable.app_token / table_id 必填")
+		}
+		if b.AppID == "" || b.AppSecret == "" {
+			return fmt.Errorf("identity.source=bitable 时 bitable.app_id / app_secret 必填（读表格用的应用凭证）")
+		}
+		if b.RefreshInterval.D() <= 0 {
+			b.RefreshInterval = Duration(time.Hour)
+		}
 	}
 
 	// NAS Sink

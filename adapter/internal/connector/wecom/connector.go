@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"time"
 
 	"fastgpt-sync-adapter/adapter/internal/model"
 )
@@ -69,7 +68,7 @@ func (c *Connector) Fetch(ctx context.Context, checkpoint string, limit int) ([]
 		seq = v
 	}
 
-	msgs, maxSeq, err := c.arch.FetchAndDecrypt(seq, limit)
+	msgs, maxSeq, err := c.arch.FetchAndDecrypt(ctx, seq, limit)
 	if err != nil {
 		return nil, checkpoint, err
 	}
@@ -82,40 +81,41 @@ func (c *Connector) Fetch(ctx context.Context, checkpoint string, limit int) ([]
 }
 
 // FetchAttachment 按 sdkfileid 分片拉取附件完整字节（is_finish 前持续续传）。
-// 网络类错误（ret=10001 等）做指数退避重试：附件在企微侧只留 ~3 天，丢不得。
+//
+// 重试只在这里做一层：GetMediaData 本身已在 SDK 层对 10001 做了多次重试，
+// 这里再套一层会让最坏情况变成 10×N 次调用（实测大文件能卡 3 分钟以上）。
+// 因此这里只负责分片续传与取消，不再叠加退避重试。
+//
+// ctx 在分片之间检查：单次 GetMediaData 是同步 C 调用无法中断，
+// 但至少能在多分片的大文件上及时响应退出信号。
 func (c *Connector) FetchAttachment(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
 	if c.sdk == nil {
 		return nil, fmt.Errorf("企微 SDK 未初始化")
 	}
 	var buf bytes.Buffer
 	index := ""
-	for {
-		var chunk []byte
-		var next string
-		var finish bool
-		var err error
-		// 单分片最多重试 4 次（1s/2s/4s/8s），续传点 index 保持不动
-		for attempt := 0; ; attempt++ {
-			chunk, next, finish, err = c.sdk.GetMediaData(a.FileID, index)
-			if err == nil {
-				break
-			}
-			if attempt >= 3 {
-				return nil, fmt.Errorf("GetMediaData(%s) 重试耗尽: %w", a.FileID, err)
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(1<<attempt) * time.Second):
-			}
+	const maxChunks = 5000 // 防止异常时无限循环（5000 片 × 512KB ≈ 2.5GB，远超任何企微附件）
+	for part := 0; part < maxChunks; part++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		chunk, next, finish, err := c.sdk.GetMediaData(ctx, a.FileID, index)
+		if err != nil {
+			return nil, fmt.Errorf("GetMediaData(%s) 分片 %d 失败: %w", a.FileID, part+1, err)
 		}
 		buf.Write(chunk)
 		if finish {
-			break
+			return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+		}
+		if next == "" {
+			// 未完成却不给续传点，继续请求只会重复拿同一片
+			return nil, fmt.Errorf("GetMediaData(%s) 分片 %d 未完成但无续传点", a.FileID, part+1)
 		}
 		index = next
 	}
-	return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+	return nil, fmt.Errorf("GetMediaData(%s) 分片数超过上限 %d，疑似续传点异常", a.FileID, maxChunks)
 }
 
 func (c *Connector) Close() error { return nil }

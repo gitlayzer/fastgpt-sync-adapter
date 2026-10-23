@@ -11,13 +11,21 @@ engine:
 storage:
   db_file: "./adapter.db"
 
-# ===== 身份解析（企微 userid → 人员姓名；多维表格未到位前用本地映射兜底）=====
+# ===== 身份解析（企微 userid → 人员姓名）=====
 identity:
-  source: local                    # local（本地映射文件）/ bitable（飞书多维表格）
+  source: local                    # local（本地映射文件）/ bitable（飞书多维表格，自动同步）
   local_file: "./identity_map.json"
   bitable:
     app_token: ""                  # 多维表格 app_token（source=bitable 时必填）
     table_id: ""                   # 数据表 id
+    app_id: ""                     # 读表格的应用（可与 connectors.feishu 不同）
+    app_secret: ""
+    refresh_interval: 1h           # 同步间隔
+    # 字段名，表格改列名时改这里即可
+    field_wecom_id: "企业微信UserID"
+    field_wecom_name: "企业微信姓名"
+    field_feishu_user: "飞书人员"
+    field_openid: "飞书open_id"
 
 # ===== 飞书 OAuth 授权 webhook（常驻；飞书 user 模式必须开）=====
 auth:
@@ -49,6 +57,11 @@ connectors:
     app_secret: ""
     mode: both                     # tenant（共享区/知识库）+ user（已授权用户个人云文档）
     folders: []                    # tenant 模式：共享文件夹 token 列表
+    # 额外遍历的知识库空间 ID（纯数字）。
+    # 「我的文档库」不会被 wiki/v2/spaces 返回，必须在这里显式指定。
+    # 获取方式：打开文档，取 URL 里的 token（如 .../wiki/Ti5wwEEu2iHTlFkEbzFcGLWPnph），
+    # 调 GET /open-apis/wiki/v2/spaces/get_node?token=<该token>，返回的 space_id 即是。
+    wiki_space_ids: []
 
 # ===== 文件用途分类器（R4，可配规则；命中关键词即归类，只影响归档子目录与标签，不动原文）=====
 classifier:

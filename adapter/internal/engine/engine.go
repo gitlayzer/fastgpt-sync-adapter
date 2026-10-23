@@ -115,12 +115,22 @@ func (e *Engine) connectorLoop(ctx context.Context, j ConnectorJob) {
 }
 
 // runConnector 执行一轮：循环 Fetch（直到不足一批或达批数上限），逐条写入所有 Sink。
+//
+// 两个循环内部都检查 ctx：停止服务时不应把当前批（最多 BatchLimit 条，
+// 每条又可能下载多个附件）全部处理完才退出——实测一批 88 条含附件时
+// Ctrl+C 后要等十几分钟才响应。
 func (e *Engine) runConnector(ctx context.Context, j ConnectorJob) {
 	name := j.Conn.Name()
 	for batch := 0; batch < j.MaxBatchesPerTick; batch++ {
+		if ctx.Err() != nil {
+			return
+		}
 		cp := e.getCheckpoint(name)
 		records, next, err := j.Conn.Fetch(ctx, cp, j.BatchLimit)
 		if err != nil {
+			if ctx.Err() != nil {
+				return // 取消导致的错误，不必刷日志
+			}
 			log.Printf("[%s] Fetch 失败: %v（下轮重试，游标不动）", name, err)
 			return
 		}
@@ -130,13 +140,38 @@ func (e *Engine) runConnector(ctx context.Context, j ConnectorJob) {
 		}
 
 		ok := 0
+		interrupted := false
 		for i := range records {
+			if ctx.Err() != nil {
+				interrupted = true
+				break
+			}
 			if err := e.dispatch(ctx, j.Conn, &records[i]); err != nil {
+				if ctx.Err() != nil {
+					interrupted = true
+					break
+				}
+				// 写入失败的记录不 Ack：无游标连接器（如飞书）下一轮会重新扫描到它。
 				log.Printf("[%s] 记录 %s 写入失败: %v（跳过该条）", name, records[i].ID, err)
 				continue
 			}
+			// 写入成功后才确认：实现 AckConnector 的连接器在此刻持久化变更检测状态，
+			// 保证「状态已记录」等价于「数据已落地」。
+			if ack, ok := j.Conn.(connector.AckConnector); ok {
+				if err := ack.Ack(records[i].ID); err != nil {
+					log.Printf("[%s] 记录 %s 确认失败: %v", name, records[i].ID, err)
+				}
+			}
 			ok++
 		}
+
+		if interrupted {
+			// 中断时不推进游标：未处理的记录下轮会重拉（NAS 写入与消息去重都是幂等的）
+			log.Printf("[%s] 收到停止信号，本批已写入 %d/%d 条，游标保持 %s",
+				name, ok, len(records), cp)
+			return
+		}
+
 		// 整批处理完才推进游标（失败条已隔离，下轮不会重拉——企微侧以 seq 为准）
 		e.setCheckpoint(name, next)
 		log.Printf("[%s] 批次 %d：拉取 %d 条，写入成功 %d 条，游标 → %s", name, batch+1, len(records), ok, next)

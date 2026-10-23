@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -30,27 +31,169 @@ type apiResp struct {
 	Msg  string `json:"msg"`
 }
 
+// apiAttempts 飞书 API 最大尝试次数。
+const apiAttempts = 3
+
+// retryableCode 判断飞书错误码是否值得重试。
+// 只挑临时的：限流(99991400)、系统繁忙、内部错误。
+// 权限类(99991679/99991663)、参数类(131002) 重试无益，还会拖慢失败。
+func retryableCode(code int) bool {
+	switch code {
+	case 99991400, // 请求触发限流
+		99991401, // 请求触发限流（部分接口）
+		131001,   // rpc fail
+		131007,   // internal err
+		20050:    // server error
+		return true
+	}
+	return false
+}
+
 func (c *Client) post(path string, payload any, out any) error {
 	b, _ := json.Marshal(payload)
-	resp, err := c.HTTP.Post(baseURL+path, "application/json; charset=utf-8", bytes.NewReader(b))
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < apiAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+			log.Printf("[feishu] POST %s 重试 %d/%d（上次: %v）", path, attempt+1, apiAttempts, lastErr)
+		}
+		resp, err := c.HTTP.Post(baseURL+path, "application/json; charset=utf-8", bytes.NewReader(b))
+		if err != nil {
+			lastErr = err // 网络层，重试
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var ar apiResp
+		if err := json.Unmarshal(body, &ar); err != nil {
+			lastErr = fmt.Errorf("解析响应失败: %w, body: %s", err, truncate(string(body), 300))
+			continue
+		}
+		if ar.Code != 0 {
+			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+			if retryableCode(ar.Code) {
+				continue
+			}
+			return lastErr
+		}
+		if out != nil {
+			if err := json.Unmarshal(body, out); err != nil {
+				return fmt.Errorf("解析响应数据失败: %w", err)
+			}
+		}
+		return nil
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var ar apiResp
-	if err := json.Unmarshal(body, &ar); err != nil {
-		return fmt.Errorf("解析响应失败: %w, body: %s", err, truncate(string(body), 300))
+	return lastErr
+}
+
+// postJSON 带显式 bearer token 的 POST（bitable 等需要指定身份的场景）。
+// 与 post 的区别：不带 client_secret，token 由调用方给。
+func (c *Client) postJSON(fullURL string, payload any, token string, out any) error {
+	b, _ := json.Marshal(payload)
+	var lastErr error
+	for attempt := 0; attempt < apiAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+			log.Printf("[feishu] POST %s 重试 %d/%d（上次: %v）", shortURL(fullURL), attempt+1, apiAttempts, lastErr)
+		}
+		req, err := http.NewRequest("POST", fullURL, bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var ar apiResp
+		if err := json.Unmarshal(body, &ar); err != nil {
+			lastErr = fmt.Errorf("解析响应失败: %w, body: %s", err, truncate(string(body), 300))
+			continue
+		}
+		if ar.Code != 0 {
+			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+			if retryableCode(ar.Code) {
+				continue
+			}
+			return lastErr
+		}
+		if out != nil {
+			if err := json.Unmarshal(body, out); err != nil {
+				return fmt.Errorf("解析响应数据失败: %w", err)
+			}
+		}
+		return nil
 	}
-	if ar.Code != 0 {
-		return fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+	return lastErr
+}
+
+// getWithToken 带显式 bearer token 的 GET（完整 URL）。
+func (c *Client) getWithToken(fullURL, token string, out any) error {
+	var lastErr error
+	for attempt := 0; attempt < apiAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+			log.Printf("[feishu] GET %s 重试 %d/%d（上次: %v）", shortURL(fullURL), attempt+1, apiAttempts, lastErr)
+		}
+		req, err := http.NewRequest("GET", fullURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var ar apiResp
+		if err := json.Unmarshal(body, &ar); err != nil {
+			lastErr = fmt.Errorf("解析响应失败: %w, body: %s", err, truncate(string(body), 300))
+			continue
+		}
+		if ar.Code != 0 {
+			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+			if retryableCode(ar.Code) {
+				continue
+			}
+			return lastErr
+		}
+		if out != nil {
+			if err := json.Unmarshal(body, out); err != nil {
+				return fmt.Errorf("解析响应数据失败: %w", err)
+			}
+		}
+		return nil
 	}
-	if out != nil {
-		if err := json.Unmarshal(body, out); err != nil {
-			return fmt.Errorf("解析响应数据失败: %w", err)
+	return lastErr
+}
+
+// shortURL 日志里只打 path 部分，避免刷屏。
+func shortURL(u string) string {
+	const marker = "/open-apis"
+	if i := indexOf(u, marker); i >= 0 {
+		return u[i+len(marker):]
+	}
+	return u
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
 		}
 	}
-	return nil
+	return -1
 }
 
 // TenantAccessToken 应用身份 token（tenant 模式用）。
@@ -69,9 +212,17 @@ func (c *Client) TenantAccessToken() (string, error) {
 }
 
 // RequiredScopes 授权链接要请求的权限集合。
-// offline_access 必须——只有它能让飞书返回 refresh_token（否则 token 2 小时后死掉无法续期）。
-// drive:drive 读云空间元数据+下载文件；search:docs:read 搜索；auth:user.id:read 识别授权人。
-const RequiredScopes = "offline_access drive:drive search:docs:read auth:user.id:read"
+//
+// 重要：飞书只会授予这里显式列出的 scope。后台开通了但链接没请求，token 里就不会有，
+// 排障时极易误判成「后台没开」。新增权限必须同步改这里。
+//
+// offline_access        必须——只有它能让飞书返回 refresh_token（否则 2 小时后无法续期）
+// drive:drive           读云空间元数据、下载文件
+// wiki:wiki:readonly    列知识库节点（「我的文档库」归属 wiki 体系，drive 接口看不到）
+// docx:document:readonly 读新版文档正文（docx/v1/documents/{id}/raw_content）
+// search:docs:read      云文档搜索
+// auth:user.id:read     识别授权人身份
+const RequiredScopes = "offline_access drive:drive wiki:wiki:readonly docx:document:readonly search:docs:read auth:user.id:read"
 
 // AuthorizeURL 拼 OAuth 授权链接（用户浏览器打开并确认）。
 // scope 必须显式带上 offline_access，否则飞书不返回 refresh_token。
@@ -85,13 +236,20 @@ func AuthorizeURL(appID, redirectURI, state string) string {
 }
 
 // UserTokenResp code/refresh 换来的用户 token 响应。
+//
+// 注意字段名：飞书返回的是 refresh_token_expires_in（带 token_），
+// 不是 refresh_expires_in。写错会导致解析出 0，进而把 refresh_token 的
+// 过期时间算成「现在」，表现为授权完立刻提示「refresh_token 已过期」。
 type UserTokenResp struct {
-	AccessToken      string `json:"access_token"`
-	RefreshToken     string `json:"refresh_token"`
-	ExpiresIn        int64  `json:"expires_in"`         // access_token 秒数（约 7200）
-	RefreshExpiresIn int64  `json:"refresh_expires_in"` // refresh_token 秒数（约 30 天）
-	TokenType        string `json:"token_type"`
-	Scope            string `json:"scope"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"` // access_token 秒数（约 7200）
+
+	// RefreshExpiresIn 对应 refresh_token_expires_in，仅在授予 offline_access 时返回
+	RefreshExpiresIn int64 `json:"refresh_token_expires_in"`
+
+	TokenType string `json:"token_type"`
+	Scope     string `json:"scope"`
 }
 
 // ExchangeCode 授权 code → user_access_token。

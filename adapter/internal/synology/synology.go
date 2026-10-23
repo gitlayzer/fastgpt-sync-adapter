@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -40,13 +41,48 @@ func New(baseURL, username, password string) *Client {
 	}
 }
 
+// loginAttempts 登录尝试次数。群晖有「自动封锁」机制：短时间内多次失败会把来源 IP
+// 拉黑一段时间，表现为 TCP 能连上、TLS 刚起手就被对端断开（EOF）。这类故障是
+// 间歇性的，单次失败不代表配置有问题，重试通常能恢复。
+const loginAttempts = 4
+
+// uploadAttempts 上传重试次数。上传失败意味着数据永久丢失
+// （企微附件在服务端只保留约 3 天），所以给得比其他环节宽。
+const uploadAttempts = 4
+
 // Login 调用 webapi/auth.cgi 登录拿 sid。
+// 对网络层错误（连不上、被断开）做指数退避重试；对明确的 API 层错误
+// （账号密码错、被锁定）立即返回，重试没有意义。
 func (c *Client) Login() error {
+	var lastErr error
+	for i := 0; i < loginAttempts; i++ {
+		if i > 0 {
+			// 1s → 2s → 4s，给 NAS 的封锁窗口一点时间
+			wait := time.Duration(1<<uint(i-1)) * time.Second
+			log.Printf("[nas] 登录重试 %d/%d，等待 %s（上次错误: %v）",
+				i+1, loginAttempts, wait, lastErr)
+			time.Sleep(wait)
+		}
+		retryable, err := c.loginOnce()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retryable {
+			return err
+		}
+	}
+	return fmt.Errorf("nas 登录失败（已重试 %d 次）: %w", loginAttempts, lastErr)
+}
+
+// loginOnce 单次登录。retryable 表示失败时是否值得重试；成功时恒为 false。
+func (c *Client) loginOnce() (bool, error) {
 	u := fmt.Sprintf("%s/webapi/auth.cgi?api=SYNO.API.Auth&version=6&method=login&account=%s&passwd=%s&session=FileStation&format=sid",
 		c.BaseURL, url.QueryEscape(c.Username), url.QueryEscape(c.Password))
 	resp, err := c.HTTP.Get(u)
 	if err != nil {
-		return fmt.Errorf("nas 登录请求失败: %w", err)
+		// 网络层：EOF / 超时 / 连接重置 —— 多为间歇性，值得重试
+		return true, fmt.Errorf("nas 登录请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -61,13 +97,15 @@ func (c *Client) Login() error {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return fmt.Errorf("nas 登录响应解析失败: %w (body=%s)", err, truncate(string(body), 200))
+		// 响应体不是 JSON：可能是被拦截页或半截响应，值得重试一次
+		return true, fmt.Errorf("nas 登录响应解析失败: %w (body=%s)", err, truncate(string(body), 200))
 	}
 	if !r.Success {
-		return fmt.Errorf("nas 登录失败, error code=%d (401=账号密码错误, 403=被锁定, 404=账号不存在)", r.Error.Code)
+		// 明确的业务错误：账号密码错(400/401)、被锁定(403/407) 等，重试无益
+		return false, fmt.Errorf("nas 登录失败, error code=%d (400/401=账号密码错误, 403=无权限, 407=IP 被封锁, 404=账号不存在)", r.Error.Code)
 	}
 	c.sid = r.Data.Sid
-	return nil
+	return false, nil
 }
 
 // ensureLogin 确保已登录。
@@ -78,45 +116,62 @@ func (c *Client) ensureLogin() error {
 	return nil
 }
 
+// apiAttempts 单个 NAS API 调用的最大尝试次数（网络层错误）。
+// NAS 走 VPN，连接偶发被重置/EOF 是常态（实测登录阶段就会遇到）。
+const apiAttempts = 4
+
 // apiCall 通用 File Station API 调用。
+// 网络层错误重试；sid 失效（119）重新登录后重试，但有次数上限，
+// 避免 sid 反复失效时无限递归。
 func (c *Client) apiCall(api, method string, params url.Values) (json.RawMessage, error) {
-	if err := c.ensureLogin(); err != nil {
-		return nil, err
-	}
-	params.Set("api", api)
-	params.Set("method", method)
-	params.Set("_sid", c.sid)
-	u := fmt.Sprintf("%s/webapi/entry.cgi?%s", c.BaseURL, params.Encode())
-
-	resp, err := c.HTTP.Get(u)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	var r struct {
-		Success bool            `json:"success"`
-		Data    json.RawMessage `json:"data"`
-		Error   struct {
-			Code int `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("nas api %s/%s 响应解析失败: %w", api, method, err)
-	}
-	if !r.Success {
-		// 119 = sid 失效，重新登录重试一次
-		if r.Error.Code == 119 {
-			c.sid = ""
-			if err := c.ensureLogin(); err != nil {
-				return nil, err
-			}
-			return c.apiCall(api, method, params)
+	var lastErr error
+	relogin := 0
+	for attempt := 0; attempt < apiAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
+		if err := c.ensureLogin(); err != nil {
+			lastErr = err
+			continue
+		}
+		params.Set("api", api)
+		params.Set("method", method)
+		params.Set("_sid", c.sid)
+		u := fmt.Sprintf("%s/webapi/entry.cgi?%s", c.BaseURL, params.Encode())
+
+		resp, err := c.HTTP.Get(u)
+		if err != nil {
+			lastErr = err // 网络层，重试
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var r struct {
+			Success bool            `json:"success"`
+			Data    json.RawMessage `json:"data"`
+			Error   struct {
+				Code int `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(body, &r); err != nil {
+			lastErr = fmt.Errorf("nas api %s/%s 响应解析失败: %w", api, method, err)
+			continue // 半截响应多为网络问题，重试
+		}
+		if r.Success {
+			return r.Data, nil
+		}
+		// 119 = sid 失效：清掉后重新登录再试，最多两次
+		if r.Error.Code == 119 && relogin < 2 {
+			relogin++
+			c.sid = ""
+			lastErr = fmt.Errorf("nas api %s/%s sid 失效", api, method)
+			continue
+		}
+		// 业务错误（如 408 已存在）重试无益，直接返回
 		return nil, fmt.Errorf("nas api %s/%s 失败, error code=%d", api, method, r.Error.Code)
 	}
-	return r.Data, nil
+	return nil, fmt.Errorf("nas api %s/%s 重试耗尽: %w", api, method, lastErr)
 }
 
 // FileEntry NAS 上的一个文件/目录项。
@@ -255,12 +310,34 @@ func (c *Client) UploadFile(localPath, destDir string) error {
 }
 
 // UploadBytes 直接把字节内容以 filename 命名上传到 NAS 的 destDir 目录。
+// 上传是数据落地的最后一环，失败即永久丢失（企微附件只留 3 天），因此做多层重试。
 func (c *Client) UploadBytes(filename, destDir string, data []byte) error {
-	if err := c.ensureLogin(); err != nil {
-		return err
-	}
-	// 确保目标目录存在
 	if err := c.MkdirAll(destDir); err != nil {
+		return fmt.Errorf("准备目录 %s: %w", destDir, err)
+	}
+	var lastErr error
+	for attempt := 0; attempt < uploadAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+			log.Printf("[nas] 上传重试 %d/%d: %s（上次: %v）",
+				attempt+1, uploadAttempts, filename, lastErr)
+		}
+		err := c.uploadOnce(filename, destDir, data)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		// sid 失效先重登，下一轮会拿到新 sid
+		if strings.Contains(err.Error(), "code=119") {
+			c.sid = ""
+		}
+	}
+	return fmt.Errorf("上传 %s 失败（已重试 %d 次）: %w", filename, uploadAttempts, lastErr)
+}
+
+// uploadOnce 单次上传（不含目录创建与重试）。
+func (c *Client) uploadOnce(filename, destDir string, data []byte) error {
+	if err := c.ensureLogin(); err != nil {
 		return err
 	}
 

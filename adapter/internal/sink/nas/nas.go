@@ -161,11 +161,17 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 
 	var firstErr error
 	for _, uid := range users {
+		if ctx.Err() != nil {
+			return ctx.Err() // 停止信号：剩余用户目录由下轮（消息去重保证幂等）补齐
+		}
 		person := sanitize(nameOf(uid))
 		if person == "" {
 			person = "unknown"
 		}
 		if err := s.writeForPerson(ctx, r, m, parseErr == nil, person, uid, platform, cachedRead, users, nameOf); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Printf("[nas] 写入失败 person=%s id=%s: %v", person, r.ID, err)
 			if firstErr == nil {
 				firstErr = err
@@ -203,9 +209,15 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 
 	// 3) 附件：分类归档 + meta 侧边车（幂等覆盖）
 	for i := range r.Attachments {
+		if ctx.Err() != nil {
+			return ctx.Err() // 停止信号：附件下载是耗时大头，必须能中断
+		}
 		a := &r.Attachments[i]
 		rc, err := read(ctx, a)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Printf("[nas] 附件拉取失败 %s（%s）: %v", a.Name, a.FileID, err)
 			continue
 		}
