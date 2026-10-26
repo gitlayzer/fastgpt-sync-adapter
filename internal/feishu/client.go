@@ -229,9 +229,18 @@ func (c *Client) TenantAccessToken() (string, error) {
 // contact:user.employee_id:readonly  user_id_type=user_id 时取 owner_id 需要
 // search:docs:read            云文档搜索
 // auth:user.id:read           识别授权人身份
+// mail:user_mailbox.message:readonly  读取邮箱邮件列表
+// mail:user_mailbox.message.body:read 获取邮件正文及附件下载链接
+// minutes:minutes             妙记文件基础权限
+// minutes:minutes.search:read 妙记全量检索列表
+// minutes:minutes.transcript:export   导出妙记转写文字/逐字稿
+// vc:note:read                获取视频会议智能纪要
 const RequiredScopes = "offline_access drive:drive drive:export:readonly wiki:wiki:readonly " +
 	"docx:document:readonly space:document:retrieve contact:user.employee_id:readonly " +
-	"search:docs:read auth:user.id:read"
+	"search:docs:read auth:user.id:read " +
+	"mail:user_mailbox.message:readonly mail:user_mailbox.message.body:read " +
+	"minutes:minutes minutes:minutes.search:read minutes:minutes.transcript:export " +
+	"vc:note:read"
 
 // AuthorizeURL 拼 OAuth 授权链接（用户浏览器打开并确认）。
 // scope 必须显式带上 offline_access，否则飞书不返回 refresh_token。
