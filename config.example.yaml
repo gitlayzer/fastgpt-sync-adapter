@@ -34,6 +34,13 @@ auth:
   external_url: ""                 # 本机测试留空（按请求推断 127.0.0.1:8089）；挂隧道时填公网地址
   refresh_interval: 1h             # user_access_token 刷新巡检间隔
 
+# ===== FastGPT API 文件库 HTTP 服务（serve 模式；随主服务常驻启动）=====
+server:
+  enabled: true                    # 是否随 daemon 同步启动 API 文件库服务
+  addr: ":8080"                    # FastGPT 接口监听地址
+  token: "dev-token"               # FastGPT Bearer 鉴权 token（请求需带 Authorization: Bearer <token>）
+  external_url: ""                 # 对外暴露地址（隧道/反代时必填，留空则根据请求 Host 自动推断）
+
 # ===== 连接器（数据源）=====
 connectors:
   # 企业微信会话内容存档

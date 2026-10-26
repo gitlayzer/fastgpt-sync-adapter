@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -22,11 +23,13 @@ import (
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/fastgpt"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/feishu"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/identity"
-		fastgmtsink "github.com/gitlayzer/fastgpt-sync-adapter/internal/sink/fastgpt"
-		nassink "github.com/gitlayzer/fastgpt-sync-adapter/internal/sink/nas"
-		"github.com/gitlayzer/fastgpt-sync-adapter/internal/storage"
-		"github.com/gitlayzer/fastgpt-sync-adapter/internal/version"
-	)
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/nasstore"
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/server"
+	fastgmtsink "github.com/gitlayzer/fastgpt-sync-adapter/internal/sink/fastgpt"
+	nassink "github.com/gitlayzer/fastgpt-sync-adapter/internal/sink/nas"
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/storage"
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/version"
+)
 
 func main() {
 	if len(os.Args) > 1 {
@@ -58,7 +61,9 @@ func main() {
 	log.Printf("==============================================")
 	log.Printf(" %s", version.Info())
 	log.Printf(" 企微连接器 : enabled=%v", cfg.Connectors.WeCom.Enabled)
+	log.Printf(" 飞书连接器 : enabled=%v", cfg.Connectors.Feishu.Enabled)
 	log.Printf(" NAS Sink   : enabled=%v（归档：消息+附件原样落盘）", cfg.Sinks.NAS.Enabled)
+	log.Printf(" API 文件库 : enabled=%v（监听 %s，token=%s）", cfg.Server.Enabled, cfg.Server.Addr, cfg.Server.Token)
 	log.Printf(" 分类器     : enabled=%v（默认标签 %s）", cfg.Classifier.Enabled, cfg.Classifier.DefaultLabel)
 	log.Printf("==============================================")
 
@@ -188,6 +193,27 @@ func main() {
 		log.Printf("[提示] 未启用任何连接器，引擎空转（仅 Sink/授权 就绪）")
 	}
 
+	// ===== FastGPT API 文件库 HTTP 服务（serve 模式，随 daemon 同步启动） =====
+	var apiServer *http.Server
+	if cfg.Server.Enabled && cfg.Sinks.NAS.Enabled {
+		backend := nasstore.New(nas.Client(), cfg.Sinks.NAS.RootPath)
+		srv := server.New(server.Options{
+			Addr:        cfg.Server.Addr,
+			Token:       cfg.Server.Token,
+			ExternalURL: cfg.Server.ExternalURL,
+		}, backend)
+		apiServer = &http.Server{
+			Addr:    cfg.Server.Addr,
+			Handler: srv.Handler(),
+		}
+		go func() {
+			log.Printf("[OK] FastGPT API 文件库服务已启动（%s，token=%s）", cfg.Server.Addr, cfg.Server.Token)
+			if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[server] API 文件库退出: %v", err)
+			}
+		}()
+	}
+
 	// 优雅退出
 	ctx, cancel := context.WithCancel(context.Background())
 	stop := make(chan os.Signal, 1)
@@ -210,7 +236,13 @@ func main() {
 		}
 	}()
 
-	if err := eng.Run(ctx); err != nil {
+	err = eng.Run(ctx)
+	if apiServer != nil {
+		shutdownCtx, sCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer sCancel()
+		_ = apiServer.Shutdown(shutdownCtx)
+	}
+	if err != nil {
 		log.Fatalf("引擎运行失败: %v", err)
 	}
 }

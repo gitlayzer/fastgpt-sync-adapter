@@ -206,12 +206,14 @@ do_run() {
     log "已清空容器内代理变量（NAS 为内网地址）"
   fi
 
-  log "Webhook: http://127.0.0.1:8089/oauth/feishu/start"
+  log "Webhook:     http://127.0.0.1:8089/oauth/feishu/start"
+  log "API 文件库:  http://127.0.0.1:8080/v1/file/list (Bearer dev-token)"
   echo
 
   docker run --rm -it --name "${NAME}" \
     -v "${PWD}:/src" -w /src \
     -p 8089:8089 \
+    -p 8080:8080 \
     "${envs[@]}" \
     "${IMAGE}" \
     ./bin/adapter-linux-arm64 -config "${CONFIG}"

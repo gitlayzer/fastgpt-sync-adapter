@@ -154,13 +154,18 @@ make docker-build
 ./bin/adapter --config config.yaml
 ```
 
-- 启动飞书 OAuth 授权服务：
+- **统一双模启动**：一条命令自动同时拉起**后台数据同步引擎**与 **FastGPT API 文件库服务**；
+- **FastGPT API 文件库接口（端口 8080）**：
+  - 目录树列表：`POST http://127.0.0.1:8080/v1/file/list`（Header 携带 `Authorization: Bearer <token>`）
+  - 获取直链/文件流：`GET http://127.0.0.1:8080/v1/file/content?id=<path>`
+  - 文件下载：`GET http://127.0.0.1:8080/v1/file/download?id=<path>&token=<token>`
+- **飞书 OAuth 授权服务（端口 8089）**：
   - 发起授权：`http://127.0.0.1:8089/oauth/feishu/start`
   - 状态查看：`http://127.0.0.1:8089/oauth/status`
   - 刷新凭据：`http://127.0.0.1:8089/oauth/feishu/refresh`
 - 周期调度连接器拉取数据落盘 NAS，并增量同步至 FastGPT 对应人员的知识库。
 
-### 2. FastGPT API 文件库模式 (Serve)
+### 2. FastGPT API 文件库独立模式 (Serve)
 
 ```bash
 # 读群晖 NAS 暴露文件

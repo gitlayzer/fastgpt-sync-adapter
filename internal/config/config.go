@@ -62,6 +62,9 @@ type Config struct {
 	// Identity 身份解析（企微 userid → 飞书用户 → 姓名；多维表格未到位前用本地映射）
 	Identity IdentityConfig `yaml:"identity"`
 
+	// Server FastGPT API 文件库服务（通过 HTTP 暴露 /v1/file/* 供 FastGPT 读 NAS 目录树与文件）
+	Server ServerConfig `yaml:"server"`
+
 	Sinks struct {
 		NAS     NASSinkConfig     `yaml:"nas"`
 		FastGPT FastGPTSinkConfig `yaml:"fastgpt"`
@@ -160,6 +163,14 @@ type NASSinkConfig struct {
 	nassink.Config `yaml:",inline"`
 }
 
+// ServerConfig FastGPT API 文件库 HTTP 服务配置（集成在 daemon 进程中）。
+type ServerConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Addr        string `yaml:"addr"`         // 监听地址，默认 :8080
+	Token       string `yaml:"token"`        // FastGPT Bearer 鉴权 token，默认 dev-token
+	ExternalURL string `yaml:"external_url"` // 对外可访问地址（经反代/隧道时必填）
+}
+
 // Load 从 YAML 配置文件加载并校验。
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -206,6 +217,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Storage.DBFile == "" {
 		c.Storage.DBFile = "./adapter.db"
+	}
+	if c.Server.Addr == "" {
+		c.Server.Addr = ":8080"
+	}
+	if c.Server.Token == "" {
+		c.Server.Token = "dev-token"
 	}
 
 	// 企微连接器
