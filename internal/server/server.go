@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -143,10 +144,10 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 
 	var nodes []*store.Node
 	var err error
+	pid := ""
 	if strings.TrimSpace(body.SearchKey) != "" {
 		nodes, err = s.backend.Search(body.SearchKey)
 	} else {
-		pid := ""
 		if body.ParentID != nil {
 			pid = *body.ParentID
 		}
@@ -159,6 +160,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	if nodes == nil {
 		nodes = []*store.Node{}
 	}
+	log.Printf("[server] POST /v1/file/list parentId=%q searchKey=%q -> 返回 %d 项 (来自 %s)", pid, body.SearchKey, len(nodes), r.RemoteAddr)
 	writeOK(w, nodes)
 }
 
@@ -180,6 +182,7 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "node is not a file")
 		return
 	}
+	log.Printf("[server] GET /v1/file/content id=%q (%s) -> 生成 previewUrl (来自 %s)", id, node.Name, r.RemoteAddr)
 	writeOK(w, map[string]string{
 		"title":      node.Name,
 		"previewUrl": s.fileURL(r, id),
@@ -238,16 +241,19 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// 中文文件名按 RFC 5987 编码，保证 FastGPT/浏览器正确解析文件名。
 	encoded := url.PathEscape(node.Name)
 	w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+encoded)
+	log.Printf("[server] ⬇️ GET /v1/file/download 开始下载: %q (%s, 来自 %s)", node.Name, id, r.RemoteAddr)
 	rc, err := s.backend.Open(node)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "open file: "+err.Error())
 		return
 	}
 	defer rc.Close()
-	if _, err := io.Copy(w, rc); err != nil {
-		// 响应头可能已写出，只能记日志
-		_ = err
+	n, err := io.Copy(w, rc)
+	if err != nil {
+		log.Printf("[server] ⚠️ GET /v1/file/download 传输中断: %q: %v", node.Name, err)
+		return
 	}
+	log.Printf("[server] ✅ GET /v1/file/download 下载完成: %q (已传输 %.1f KB)", node.Name, float64(n)/1024)
 }
 
 func writeOK(w http.ResponseWriter, data any) {
