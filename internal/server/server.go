@@ -61,6 +61,7 @@ func (s *Server) routes() {
 	// download 允许 query token（FastGPT 拉 previewUrl 时不带 Authorization 头）
 	s.mux.HandleFunc("/v1/file/download", s.withAuthOrQueryToken(s.handleDownload))
 	s.mux.HandleFunc("/healthz", s.handleHealth)
+	s.mux.HandleFunc("/", s.handleIndex)
 }
 
 func (s *Server) Handler() http.Handler { return s.mux }
@@ -259,3 +260,233 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(resp{Success: false, Message: msg, Data: nil})
 }
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	html := strings.ReplaceAll(indexHTMLTemplate, "DEFAULT_TOKEN", s.opts.Token)
+	w.Write([]byte(html))
+}
+
+const indexHTMLTemplate = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FastGPT Sync Adapter - NAS 文件库浏览器</title>
+<style>
+  :root {
+    --primary: #2563eb;
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --border: #e2e8f0;
+    --text: #0f172a;
+    --text-muted: #64748b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); padding: 24px; line-height: 1.5; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 12px; }
+  .title-group h1 { font-size: 22px; font-weight: 700; color: #1e293b; }
+  .title-group p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+  .links { display: flex; gap: 8px; }
+  .badge-link { font-size: 12px; padding: 6px 12px; background: #e0f2fe; color: #0369a1; border-radius: 6px; text-decoration: none; font-weight: 500; }
+  .badge-link:hover { background: #bae6fd; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); overflow: hidden; }
+  .toolbar { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: #f1f5f9; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .breadcrumb { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 14px; }
+  .breadcrumb-item { cursor: pointer; color: var(--primary); text-decoration: none; }
+  .breadcrumb-item:hover { text-decoration: underline; }
+  .breadcrumb-item.active { color: var(--text); font-weight: 600; cursor: default; }
+  .breadcrumb-sep { color: var(--text-muted); }
+  .token-bar { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); }
+  .token-bar input { padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 12px; width: 140px; }
+  .file-list { list-style: none; }
+  .file-item { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
+  .file-item:last-child { border-bottom: none; }
+  .file-item:hover { background: #f8fafc; }
+  .file-info { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+  .file-icon { font-size: 18px; width: 24px; text-align: center; }
+  .file-name { font-size: 14px; font-weight: 500; color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-meta { font-size: 12px; color: var(--text-muted); margin-left: 16px; white-space: nowrap; }
+  .preview-panel { margin-top: 24px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; display: none; }
+  .preview-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+  .preview-title { font-size: 16px; font-weight: 600; }
+  .preview-content { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; line-height: 1.6; background: #f8fafc; padding: 16px; border-radius: 6px; max-height: 500px; overflow-y: auto; border: 1px solid var(--border); }
+  .loading { text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px; }
+  .empty { text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="title-group">
+      <h1>FastGPT Sync Adapter</h1>
+      <p>群晖 NAS 归档与 FastGPT API 文件库在线浏览</p>
+    </div>
+    <div class="links">
+      <a class="badge-link" href="/healthz" target="_blank">健康状态</a>
+      <a class="badge-link" href="http://127.0.0.1:8089/oauth/status" target="_blank">飞书 Token 状态</a>
+      <a class="badge-link" href="http://127.0.0.1:8089/oauth/feishu/start" target="_blank">发起飞书授权</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="toolbar">
+      <div class="breadcrumb" id="breadcrumb"></div>
+      <div class="token-bar">
+        <span>Token:</span>
+        <input type="text" id="tokenInput" value="DEFAULT_TOKEN">
+        <button style="padding: 4px 8px; border: 1px solid var(--border); background: white; border-radius: 4px; cursor: pointer;" onclick="loadCurrent()">刷新</button>
+      </div>
+    </div>
+    <div id="listContainer"></div>
+  </div>
+
+  <div class="preview-panel" id="previewPanel">
+    <div class="preview-header">
+      <div class="preview-title" id="previewTitle">文件预览</div>
+      <a id="downloadBtn" href="#" target="_blank" style="font-size: 13px; color: var(--primary); text-decoration: none; font-weight: 500;">下载原文件 ↗</a>
+    </div>
+    <div class="preview-content" id="previewContent"></div>
+  </div>
+</div>
+
+<script>
+let token = document.getElementById('tokenInput').value;
+let historyStack = [{ id: '', name: '根目录' }];
+
+document.getElementById('tokenInput').addEventListener('change', (e) => {
+  token = e.target.value;
+  loadCurrent();
+});
+
+function renderBreadcrumb() {
+  const bc = document.getElementById('breadcrumb');
+  bc.innerHTML = '';
+  historyStack.forEach((item, index) => {
+    if (index > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'breadcrumb-sep';
+      sep.innerText = '/';
+      bc.appendChild(sep);
+    }
+    const span = document.createElement('span');
+    span.className = index === historyStack.length - 1 ? 'breadcrumb-item active' : 'breadcrumb-item';
+    span.innerText = item.name;
+    if (index < historyStack.length - 1) {
+      span.onclick = () => {
+        historyStack = historyStack.slice(0, index + 1);
+        loadCurrent();
+      };
+    }
+    bc.appendChild(span);
+  });
+}
+
+async function loadCurrent() {
+  renderBreadcrumb();
+  const current = historyStack[historyStack.length - 1];
+  const container = document.getElementById('listContainer');
+  container.innerHTML = '<div class="loading">正在加载 NAS 目录...</div>';
+
+  try {
+    const res = await fetch('/v1/file/list', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify({ parentId: current.id })
+    });
+    const data = await res.json();
+    if (!data.success) {
+      container.innerHTML = '<div class="empty" style="color: #ef4444;">加载失败: ' + (data.message || '未知错误') + '</div>';
+      return;
+    }
+    const items = data.data || [];
+    if (items.length === 0) {
+      container.innerHTML = '<div class="empty">此目录为空</div>';
+      return;
+    }
+
+    items.sort((a, b) => {
+      if (a.type === b.type) return a.name.localeCompare(b.name);
+      return a.type === 'folder' ? -1 : 1;
+    });
+
+    let html = '<ul class="file-list">';
+    items.forEach(item => {
+      const isFolder = item.type === 'folder';
+      const icon = isFolder ? '📁' : (item.name.endsWith('.md') ? '📝' : (item.name.endsWith('.pdf') ? '📕' : '📄'));
+      html += '<li class="file-item" onclick="handleItemClick(\'' + item.id + '\', \'' + escapeHtml(item.name) + '\', \'' + item.type + '\')">' +
+        '<div class="file-info">' +
+          '<span class="file-icon">' + icon + '</span>' +
+          '<span class="file-name">' + escapeHtml(item.name) + '</span>' +
+        '</div>' +
+        '<div class="file-meta">' +
+          (item.updateTime ? new Date(item.updateTime).toLocaleString('zh-CN') : '') +
+        '</div>' +
+      '</li>';
+    });
+    html += '</ul>';
+    container.innerHTML = html;
+  } catch (err) {
+    container.innerHTML = '<div class="empty" style="color: #ef4444;">请求出错: ' + err.message + '</div>';
+  }
+}
+
+async function handleItemClick(id, name, type) {
+  if (type === 'folder') {
+    historyStack.push({ id, name });
+    loadCurrent();
+    return;
+  }
+
+  const panel = document.getElementById('previewPanel');
+  const title = document.getElementById('previewTitle');
+  const content = document.getElementById('previewContent');
+  const dl = document.getElementById('downloadBtn');
+
+  panel.style.display = 'block';
+  title.innerText = '正在载入: ' + name;
+  content.innerText = '正在读取文件字节流...';
+  dl.href = '#';
+
+  try {
+    const res = await fetch('/v1/file/content?id=' + encodeURIComponent(id), {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    const data = await res.json();
+    if (!data.success) {
+      content.innerText = '获取预览失败: ' + data.message;
+      return;
+    }
+    const previewUrl = data.data.previewUrl;
+    title.innerText = name;
+    dl.href = previewUrl;
+
+    if (name.endsWith('.md') || name.endsWith('.txt') || name.endsWith('.json')) {
+      const fileRes = await fetch(previewUrl);
+      const text = await fileRes.text();
+      content.innerText = text;
+    } else {
+      content.innerText = '该文件为二进制文档 (' + name.split('.').pop() + ')，无法在文本框直接渲染。\n请点击右上角「下载原文件」按钮直接打开查阅。';
+    }
+  } catch (err) {
+    content.innerText = '读取失败: ' + err.message;
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+loadCurrent();
+</script>
+</body>
+</html>
+`
