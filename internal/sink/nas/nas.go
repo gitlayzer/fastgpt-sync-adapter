@@ -249,12 +249,11 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 				}
 				base := path.Join(s.cfg.RootPath, person, platform)
 				for _, a := range r.Attachments {
-					targetFile := path.Join(base, sanitize(a.Name))
-					if err := s.fs.Delete(targetFile); err != nil {
-						log.Printf("[nas] 删除 NAS 文件失败 %s: %v", targetFile, err)
-					} else {
-						log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s", targetFile)
+					for _, sub := range []string{"云文档", "邮件", ""} {
+						targetFile := path.Join(base, sub, sanitize(a.Name))
+						_ = s.fs.Delete(targetFile)
 					}
+					log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s/%s", base, sanitize(a.Name))
 				}
 			}
 			return nil
@@ -593,11 +592,9 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 			}
 			continue
 		}
-			// 归档目标目录：智能纪要存入 base/智能纪要/，邮件附件存入 base/邮件/，普通文档平铺在 base/
-			destDir := base
-			if r.Kind == "minutes" {
-				destDir = path.Join(base, "智能纪要")
-			} else if r.Kind == "mail" {
+			// 飞书统一两大归档目录：所有云文档/表格/知识库/纪要全部归于 云文档/，邮件附件归于 邮件/
+			destDir := path.Join(base, "云文档")
+			if r.Kind == "mail" {
 				destDir = path.Join(base, "邮件")
 			}
 			if err := s.fs.UploadBytes(sanitize(a.Name), destDir, data); err != nil {
