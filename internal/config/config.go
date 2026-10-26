@@ -79,10 +79,11 @@ type EngineConfig struct {
 
 // WeComConnectorConfig 企微连接器配置节。
 type WeComConnectorConfig struct {
-	Enabled    bool         `yaml:"enabled"`
-	Interval   Duration     `yaml:"interval"`    // 拉取间隔（需远小于媒体附件 3 天保留期，建议分钟级）
-	BatchLimit int          `yaml:"batch_limit"` // 单批条数，默认 100（SDK 上限 1000）
-	WeCom      wecom.Config `yaml:",inline"`     // corp_id/secret/rsa_private_key(_file)/sdk_lib_path
+	Enabled    bool              `yaml:"enabled"`
+	Interval   Duration          `yaml:"interval"`    // 拉取间隔（需远小于媒体附件 3 天保留期，建议分钟级）
+	BatchLimit int               `yaml:"batch_limit"` // 单批条数，默认 100（SDK 上限 1000）
+	GroupNames map[string]string `yaml:"group_names"` // 群聊 ID 映射为可读中文群名，如 "wro...": "制造中心三期对接群"
+	WeCom      wecom.Config      `yaml:",inline"`     // corp_id/secret/rsa_private_key(_file)/sdk_lib_path
 }
 
 // FeishuConnectorConfig 飞书连接器配置节。

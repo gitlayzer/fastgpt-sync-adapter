@@ -98,72 +98,73 @@ func TestSingleChatFanOut(t *testing.T) {
 		if _, ok := fs.files["/FastGPT-test/"+p+"/企微/messages/m1.json"]; ok {
 			t.Fatalf("%s 不应再写 messages/m1.json（已改为只存正文与附件）", p)
 		}
-		if _, ok := fs.files["/FastGPT-test/"+p+"/企微/conversations/与"+map[string]string{"张三": "李四", "李四": "张三"}[p]+"的单聊.md"]; !ok {
-			t.Fatalf("%s 缺会话 md", p)
+			if _, ok := fs.files["/FastGPT-test/"+p+"/企微/群聊记录/与"+map[string]string{"张三": "李四", "李四": "张三"}[p]+"的单聊.md"]; !ok {
+				t.Fatalf("%s 缺会话 md", p)
+			}
+		}
+		md1 := string(fs.files["/FastGPT-test/张三/企微/群聊记录/与李四的单聊.md"])
+		md2 := string(fs.files["/FastGPT-test/李四/企微/群聊记录/与张三的单聊.md"])
+		if !strings.Contains(md1, "合同看一下") || !strings.Contains(md1, "张三") {
+			t.Fatalf("张三 md 内容不对:\n%s", md1)
+		}
+		if !strings.Contains(md2, "合同看一下") {
+			t.Fatalf("李四 md 内容不对:\n%s", md2)
+		}
+		md1 = strings.TrimPrefix(md1, "\xef\xbb\xbf")
+		if !strings.HasPrefix(md1, "# 与李四的单聊") {
+			t.Fatalf("md 缺标题:\n%s", md1)
 		}
 	}
-	md1 := string(fs.files["/FastGPT-test/张三/企微/conversations/与李四的单聊.md"])
-	md2 := string(fs.files["/FastGPT-test/李四/企微/conversations/与张三的单聊.md"])
-	if !strings.Contains(md1, "合同看一下") || !strings.Contains(md1, "张三") {
-		t.Fatalf("张三 md 内容不对:\n%s", md1)
-	}
-	if !strings.Contains(md2, "合同看一下") {
-		t.Fatalf("李四 md 内容不对:\n%s", md2)
-	}
-	md1 = strings.TrimPrefix(md1, "\xef\xbb\xbf")
-	if !strings.HasPrefix(md1, "# 与李四的单聊") {
-		t.Fatalf("md 缺标题:\n%s", md1)
-	}
-}
 
-func TestMarkdownRollingAppendAndDedup(t *testing.T) {
-	s, fs, _ := newTestSink(t)
-	r1 := dmRecord("m1", "u1", "u2", "第一条")
-	r2 := dmRecord("m2", "u2", "u1", "第二条")
-	s.WriteRecord(context.Background(), r1, nil)
-	s.WriteRecord(context.Background(), r2, nil)
-	// 重复投递 m1（模拟崩溃重拉）：不应重复追加
-	s.WriteRecord(context.Background(), r1, nil)
+	func TestMarkdownRollingAppendAndDedup(t *testing.T) {
+		s, fs, _ := newTestSink(t)
+		r1 := dmRecord("m1", "u1", "u2", "第一条")
+		r2 := dmRecord("m2", "u2", "u1", "第二条")
+		s.WriteRecord(context.Background(), r1, nil)
+		s.WriteRecord(context.Background(), r2, nil)
+		// 重复投递 m1（模拟崩溃重拉）：不应重复追加
+		s.WriteRecord(context.Background(), r1, nil)
 
-	md := string(fs.files["/FastGPT-test/张三/企微/conversations/与李四的单聊.md"])
-	if c := strings.Count(md, "第一条"); c != 1 {
-		t.Fatalf("去重失败, 第一条出现 %d 次:\n%s", c, md)
+		md := string(fs.files["/FastGPT-test/张三/企微/群聊记录/与李四的单聊.md"])
+		if c := strings.Count(md, "第一条"); c != 1 {
+			t.Fatalf("去重失败, 第一条出现 %d 次:\n%s", c, md)
+		}
+		if !strings.Contains(md, "第二条") {
+			t.Fatalf("滚动追加失败:\n%s", md)
+		}
+		// 顺序：第一条在第二条前
+		if strings.Index(md, "第一条") > strings.Index(md, "第二条") {
+			t.Fatalf("顺序不对:\n%s", md)
+		}
 	}
-	if !strings.Contains(md, "第二条") {
-		t.Fatalf("滚动追加失败:\n%s", md)
-	}
-	// 顺序：第一条在第二条前
-	if strings.Index(md, "第一条") > strings.Index(md, "第二条") {
-		t.Fatalf("顺序不对:\n%s", md)
-	}
-}
 
-func TestGroupChatLearnsMembers(t *testing.T) {
-	s, fs, _ := newTestSink(t)
-	room := `{"msgid":"%s","action":"send","from":"%s","roomid":"roomA","msgtime":1760000000000,"msgtype":"text","text":{"content":"%s"}}`
-	// u1 先发言：此时已知成员只有 u1，只有 u1 目录有
-	s.WriteRecord(context.Background(), model.Record{
-		Source: "wecom", Kind: "text", ID: "g1", Timestamp: 1760000000000, SenderID: "u1",
-		OwnerIDs: []string{"u1"}, Body: []byte(fmt.Sprintf(room, "g1", "u1", "群消息1")),
-	}, nil)
-	// u2 发言：学到 u2，u2 目录开始有这个群的记录
-	s.WriteRecord(context.Background(), model.Record{
-		Source: "wecom", Kind: "text", ID: "g2", Timestamp: 1760000001000, SenderID: "u2",
-		OwnerIDs: []string{"u2"}, Body: []byte(fmt.Sprintf(room, "g2", "u2", "群消息2")),
-	}, nil)
+	func TestGroupChatLearnsMembers(t *testing.T) {
+		s, fs, _ := newTestSink(t)
+		s.cfg.GroupNames = map[string]string{"roomA": "项目组"}
+		room := `{"msgid":"%s","action":"send","from":"%s","roomid":"roomA","msgtime":1760000000000,"msgtype":"text","text":{"content":"%s"}}`
+		// u1 先发言：此时已知成员只有 u1，只有 u1 目录有
+		s.WriteRecord(context.Background(), model.Record{
+			Source: "wecom", Kind: "text", ID: "g1", Timestamp: 1760000000000, SenderID: "u1",
+			OwnerIDs: []string{"u1"}, Body: []byte(fmt.Sprintf(room, "g1", "u1", "群消息1")),
+		}, nil)
+		// u2 发言：学到 u2，u2 目录开始有这个群的记录
+		s.WriteRecord(context.Background(), model.Record{
+			Source: "wecom", Kind: "text", ID: "g2", Timestamp: 1760000001000, SenderID: "u2",
+			OwnerIDs: []string{"u2"}, Body: []byte(fmt.Sprintf(room, "g2", "u2", "群消息2")),
+		}, nil)
 
-	md1 := string(fs.files["/FastGPT-test/张三/企微/conversations/群聊_roomA.md"])
-	md2 := string(fs.files["/FastGPT-test/李四/企微/conversations/群聊_roomA.md"])
-	if !strings.Contains(md1, "群消息1") || !strings.Contains(md1, "群消息2") {
-		t.Fatalf("张三应有两条群消息:\n%s", md1)
-	}
-	// u2 目录只有 g2（g1 时群成员未知 u2）
-	if !strings.Contains(md2, "群消息2") || strings.Contains(md2, "群消息1") {
-		t.Fatalf("李四应只有群消息2:\n%s", md2)
-	}
-}
+		md1 := string(fs.files["/FastGPT-test/张三/企微/群聊记录/群聊_项目组.md"])
+		md2 := string(fs.files["/FastGPT-test/李四/企微/群聊记录/群聊_项目组.md"])
+		if !strings.Contains(md1, "群消息1") || !strings.Contains(md1, "群消息2") {
+			t.Fatalf("张三应有两条群消息:\n%s", md1)
+		}
+			// u2 目录只有 g2（g1 时群成员未知 u2）
+			if !strings.Contains(md2, "群消息2") || strings.Contains(md2, "群消息1") {
+				t.Fatalf("李四应只有群消息2:\n%s", md2)
+			}
+		}
 
-func TestAttachmentArchive(t *testing.T) {
+	func TestAttachmentArchive(t *testing.T) {
 	s, fs, _ := newTestSink(t)
 	rec := dmRecord("m9", "u1", "u2", "看这个文件")
 	rec.Kind = "file"
@@ -190,7 +191,7 @@ func TestAttachmentArchive(t *testing.T) {
 
 func TestAppendFileCleansLegacyHTML(t *testing.T) {
 	s, fs, _ := newTestSink(t)
-	key := "/FastGPT-test/张三/企微/conversations/群聊_roomX.md"
+	key := "/FastGPT-test/张三/企微/群聊记录/群聊_roomX.md"
 	legacyHTML := `<!DOCTYPE html><html><body><p>Sorry, the page you are looking for is not found.</p></body></html>`
 	fs.files[key] = []byte(legacyHTML)
 
@@ -218,7 +219,7 @@ func TestStripSynologyHTMLPreservesMarkdownTail(t *testing.T) {
 func TestAppendFileDoesNotOverwriteOnNASReadError(t *testing.T) {
 	s, fs, _ := newTestSink(t)
 	s.fs = &errorFS{fakeFS: fs, err: fmt.Errorf("NAS connection reset")}
-	if err := s.appendFile("/FastGPT-test/张三/企微/conversations", "群聊_roomY.md", "新行\n"); err == nil {
+	if err := s.appendFile("/FastGPT-test/张三/企微/群聊记录", "群聊_roomY.md", "新行\n"); err == nil {
 		t.Fatal("NAS 读取失败时应停止，不能误当作新文件覆盖")
 	}
 	if len(fs.files) != 0 {
@@ -229,10 +230,10 @@ func TestAppendFileDoesNotOverwriteOnNASReadError(t *testing.T) {
 func TestAppendFileTreatsOnlyNotFoundAsNew(t *testing.T) {
 	s, fs, _ := newTestSink(t)
 	s.fs = &errorFS{fakeFS: fs, err: synology.ErrFileNotFound}
-	if err := s.appendFile("/FastGPT-test/张三/企微/conversations", "群聊_roomZ.md", "新行\n"); err != nil {
+	if err := s.appendFile("/FastGPT-test/张三/企微/群聊记录", "群聊_roomZ.md", "新行\n"); err != nil {
 		t.Fatalf("not found 应作为新文件: %v", err)
 	}
-	got := string(fs.files["/FastGPT-test/张三/企微/conversations/群聊_roomZ.md"])
+	got := string(fs.files["/FastGPT-test/张三/企微/群聊记录/群聊_roomZ.md"])
 	if !strings.Contains(got, "# 群聊_roomZ") || !strings.Contains(got, "新行") {
 		t.Fatalf("新文件内容不正确: %q", got)
 	}
@@ -285,19 +286,19 @@ func TestBatchModeCoalescesUploadsAndDownloads(t *testing.T) {
 		t.Fatalf("批次刷写后应只发生 2 次上传（双方各 1 次），实际发生 %d 次", cfs.uploadCount)
 	}
 
-		// 验证内容完整性：所有 5 条消息均被合并写入
-		md1 := string(fs.files["/FastGPT-test/张三/企微/conversations/与李四的单聊.md"])
-		for i := 1; i <= 5; i++ {
-			expected := fmt.Sprintf("这是第%d条消息", i)
-			if !strings.Contains(md1, expected) {
-				t.Fatalf("会话内容丢失: %s 未在产出中找到:\n%s", expected, md1)
-			}
+	// 验证内容完整性：所有 5 条消息均被合并写入
+	md1 := string(fs.files["/FastGPT-test/张三/企微/群聊记录/与李四的单聊.md"])
+	for i := 1; i <= 5; i++ {
+		expected := fmt.Sprintf("这是第%d条消息", i)
+		if !strings.Contains(md1, expected) {
+			t.Fatalf("会话内容丢失: %s 未在产出中找到:\n%s", expected, md1)
 		}
 	}
+}
 
 func TestDailyChunkingHeaders(t *testing.T) {
 	s, fs, _ := newTestSink(t)
-	dir := "/FastGPT-test/张三/企微/conversations"
+	dir := "/FastGPT-test/张三/企微/群聊记录"
 	filename := "与李四的单聊.md"
 
 	// 第一天消息 1

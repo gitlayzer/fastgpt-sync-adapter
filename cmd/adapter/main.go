@@ -107,8 +107,9 @@ func main() {
 	// ===== Sink：NAS 归档 =====
 	clf := classifier.New(cfg.Classifier)
 	// NAS_URL 可覆盖 config.yaml（Docker 中通过 host.docker.internal 访问宿主机中继）。
-	nasCfg := cfg.Sinks.NAS.Config
-	if v := os.Getenv("NAS_URL"); v != "" {
+		nasCfg := cfg.Sinks.NAS.Config
+		nasCfg.GroupNames = cfg.Connectors.WeCom.GroupNames
+		if v := os.Getenv("NAS_URL"); v != "" {
 		nasCfg.URL = v
 		log.Printf("[NAS] 使用环境变量 NAS_URL=%s", v)
 	}

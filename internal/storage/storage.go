@@ -117,6 +117,11 @@ CREATE TABLE IF NOT EXISTS room_members (
   updated_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (room_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS room_names (
+  room_id    TEXT PRIMARY KEY,
+  name       TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS feishu_doc_state (
   token      TEXT PRIMARY KEY,
   edit_time  INTEGER NOT NULL DEFAULT 0,
@@ -325,6 +330,22 @@ func (s *Store) ListRoomParticipants(roomID string) ([]string, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// GetRoomName 获取群聊名称，未配置返回空。
+func (s *Store) GetRoomName(roomID string) string {
+	var name string
+	_ = s.db.QueryRow(`SELECT name FROM room_names WHERE room_id=?`, roomID).Scan(&name)
+	return name
+}
+
+// SetRoomName 记录群聊名称。
+func (s *Store) SetRoomName(roomID, name string) error {
+	_, err := s.db.Exec(`
+INSERT INTO room_names (room_id, name, updated_at) VALUES (?, ?, ?)
+ON CONFLICT(room_id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at`,
+		roomID, name, time.Now().Unix())
+	return err
 }
 
 // DocState 飞书文档状态记录。

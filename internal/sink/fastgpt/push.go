@@ -125,10 +125,10 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 			}
 			continue
 		}
-		if e.Name == "conversations" {
+		if e.Name == "群聊记录" || e.Name == "conversations" {
 			// 会话 markdown：分类记为 会话
 			if err := t.pushDir(ctx, person, source, "会话", e.Path, datasetID); err != nil {
-				log.Printf("[fastgpt] %s/%s/conversations 出错: %v", person, platLabel, err)
+				log.Printf("[fastgpt] %s/%s/%s 出错: %v", person, platLabel, e.Name, err)
 			}
 			continue
 		}

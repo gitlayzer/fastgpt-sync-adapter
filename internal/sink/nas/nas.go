@@ -37,10 +37,11 @@ import (
 )
 
 type Config struct {
-	URL      string `yaml:"url"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	RootPath string `yaml:"root_path"` // 落盘根路径，如 /FastGPT-test
+	URL        string            `yaml:"url"`
+	Username   string            `yaml:"username"`
+	Password   string            `yaml:"password"`
+	RootPath   string            `yaml:"root_path"`   // 落盘根路径，如 /FastGPT-test
+	GroupNames map[string]string `yaml:"group_names"` // 显式配置的群聊 ID -> 群名称映射
 }
 
 // 平台显示名（目录第二层）。
@@ -305,8 +306,8 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 		if msgOK && r.Source == "wecom" {
 			if logged, err := s.store.IsMessageLogged(r.ID, person); err == nil && !logged {
 				if line, skip := render.RenderLine(m, nameOf); !skip {
-					convFile := m.ConvFileName(uid, nameOf)
-					if err := s.appendFileWithMeta(path.Join(base, "conversations"), convFile, line, r.ID, person, r.Timestamp); err != nil {
+					convFile := s.convFileName(m, uid, nameOf)
+					if err := s.appendFileWithMeta(path.Join(base, "群聊记录"), convFile, line, r.ID, person, r.Timestamp); err != nil {
 						return fmt.Errorf("追加会话 markdown: %w", err)
 					}
 				} else {
@@ -354,6 +355,82 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 			log.Printf("[nas] 已归档 %s/%s（%.1f KB）", targetDir, cleanName, float64(len(data))/1024)
 		}
 		return nil
+}
+
+// convFileName 计算查看者视角的会话文件名。
+// 单聊：以对方姓名命名（与李四的单聊.md）；
+// 群聊：优先使用配置或数据库中的群名；若无则智能提取群内实名员工姓名（如 群聊_罗静怡、王永国等人的群聊.md）；未解析出员工时兜底使用 roomid。
+func (s *Sink) convFileName(m *render.Msg, forUser string, nameOf func(string) string) string {
+	if m.RoomID == "" {
+		counterpart := ""
+		for _, u := range m.Participants() {
+			if u != forUser {
+				counterpart = u
+				break
+			}
+		}
+		if counterpart == "" {
+			counterpart = m.From
+		}
+		name := counterpart
+		if nameOf != nil {
+			name = nameOf(counterpart)
+		}
+		return fmt.Sprintf("与%s的单聊.md", sanitize(name))
+	}
+
+	// 1. 先查配置里的群名映射
+	if len(s.cfg.GroupNames) > 0 {
+		if gn, ok := s.cfg.GroupNames[m.RoomID]; ok && gn != "" {
+			return fmt.Sprintf("群聊_%s.md", sanitize(gn))
+		}
+	}
+
+	// 2. 查数据库记录的群名
+	if s.store != nil {
+		if gn := s.store.GetRoomName(m.RoomID); gn != "" {
+			return fmt.Sprintf("群聊_%s.md", sanitize(gn))
+		}
+	}
+
+	// 3. 智能推断：根据已知群成员姓名生成自然语言群名（如 "群聊_罗静怡、王永国、张建丰等人的群聊.md"）
+	if s.store != nil {
+		members, err := s.store.ListRoomParticipants(m.RoomID)
+		if err == nil && len(members) > 0 {
+			var memberNames []string
+			seenNames := map[string]bool{}
+			for _, uid := range members {
+				if strings.HasPrefix(uid, "wm") || strings.HasPrefix(uid, "wo") {
+					continue
+				}
+				name := uid
+				if nameOf != nil {
+					name = nameOf(uid)
+				}
+				if strings.HasPrefix(name, "wm") || strings.HasPrefix(name, "wo") || name == "" {
+					continue
+				}
+				if !seenNames[name] {
+					seenNames[name] = true
+					memberNames = append(memberNames, name)
+				}
+			}
+			if len(memberNames) > 0 {
+				limit := 3
+				if len(memberNames) < limit {
+					limit = len(memberNames)
+				}
+				joined := strings.Join(memberNames[:limit], "、")
+				if len(memberNames) > limit {
+					return fmt.Sprintf("群聊_%s等人的群聊.md", sanitize(joined))
+				}
+				return fmt.Sprintf("群聊_%s的群聊.md", sanitize(joined))
+			}
+		}
+	}
+
+	// 4. 最终兜底使用 roomid
+	return fmt.Sprintf("群聊_%s.md", sanitize(m.RoomID))
 }
 
 // appendFile 滚动追加（保持旧签名兼容测试）。
