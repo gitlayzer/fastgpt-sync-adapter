@@ -107,17 +107,22 @@ func (t *Task) pushPerson(ctx context.Context, person string) error {
 	return nil
 }
 
-// pushPlatform 处理 <root>/<人名>/<平台> 下的 conversations 与各分类目录。
+// pushPlatform 处理 <root>/<人名>/<平台> 下的 conversations 与各日期/分类目录及平铺文件。
 func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, platPath, datasetID string) error {
 	entries, err := t.nas.List(platPath)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		if !e.IsDir {
+		if skipDirs[e.Name] {
 			continue
 		}
-		if skipDirs[e.Name] {
+		if !e.IsDir {
+			// 平铺在平台根目录下的文件（如飞书导出的文档）：按文件名自动归类并推送
+			category := classifyFilename(e.Name)
+			if err := t.pushFile(ctx, person, source, category, e, datasetID); err != nil {
+				log.Printf("[fastgpt] 推送失败 %s: %v", e.Path, err)
+			}
 			continue
 		}
 		if e.Name == "conversations" {
@@ -127,8 +132,13 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 			}
 			continue
 		}
-		// 其余目录即分类目录（合同/方案/手册/其他…）
-		if err := t.pushDir(ctx, person, source, e.Name, e.Path, datasetID); err != nil {
+		// 日期子目录（YYYY-MM-DD，方案 A）或传统分类目录（合同/方案等）
+		isDateDir := len(e.Name) == 10 && e.Name[4] == '-' && e.Name[7] == '-'
+		category := e.Name
+		if isDateDir {
+			category = "" // 由各文件按文件名关键词自动归类
+		}
+		if err := t.pushDir(ctx, person, source, category, e.Path, datasetID); err != nil {
 			log.Printf("[fastgpt] %s/%s/%s 出错: %v", person, platLabel, e.Name, err)
 		}
 	}
@@ -136,7 +146,8 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 }
 
 // pushDir 推送一个目录下的文件（跳过 .meta.json）。
-func (t *Task) pushDir(ctx context.Context, person, source, category, dir, datasetID string) error {
+// 当 defaultCategory 为空时，根据每个文件的名称关键词自动归类。
+func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir, datasetID string) error {
 	files, err := t.nas.List(dir)
 	if err != nil {
 		return err
@@ -145,11 +156,34 @@ func (t *Task) pushDir(ctx context.Context, person, source, category, dir, datas
 		if f.IsDir || strings.HasSuffix(f.Name, ".meta.json") {
 			continue
 		}
+		category := defaultCategory
+		if category == "" {
+			category = classifyFilename(f.Name)
+		}
 		if err := t.pushFile(ctx, person, source, category, f, datasetID); err != nil {
 			log.Printf("[fastgpt] 推送失败 %s: %v", f.Path, err)
 		}
 	}
 	return nil
+}
+
+// classifyFilename 根据文件名关键词识别分类。
+func classifyFilename(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.Contains(lower, "合同") || strings.Contains(lower, "协议") || strings.Contains(lower, "contract"):
+		return "合同"
+	case strings.Contains(lower, "方案") || strings.Contains(lower, "规划") || strings.Contains(lower, "proposal"):
+		return "方案"
+	case strings.Contains(lower, "手册") || strings.Contains(lower, "说明书") || strings.Contains(lower, "指南"):
+		return "手册"
+	case strings.Contains(lower, "报告") || strings.Contains(lower, "总结") || strings.Contains(lower, "report"):
+		return "报告"
+	case strings.Contains(lower, "报表") || strings.Contains(lower, "数据") || strings.HasSuffix(lower, ".xlsx") || strings.HasSuffix(lower, ".csv"):
+		return "数据表"
+	default:
+		return "其他"
+	}
 }
 
 // pushFile 推送单个文件（带幂等判断）。
@@ -190,13 +224,17 @@ func (t *Task) pushFile(ctx context.Context, person, source, category string, f 
 		return fmt.Errorf("读取: %w", err)
 	}
 
-	// 展示名：附件去掉 <msgid>_ 前缀；会话 md 直接用文件名
-	display := f.Name
-	if source == "wecom" || source == "feishu" {
-		if i := strings.Index(f.Name, "_"); i > 0 && category != "会话" {
-			display = f.Name[i+1:]
+		// 展示名：默认使用真实文件名；若为历史遗留带 <msgid>_ 机器前缀的文件，则剥离前缀以还原真实文件名
+		display := f.Name
+		if category != "会话" {
+			if idx := strings.LastIndex(f.Name, "_"); idx > 0 {
+				prefix := f.Name[:idx]
+				// 包含数字且长度超过 10 判定为机器 msgid 前缀
+				if strings.ContainsAny(prefix, "0123456789") && len(prefix) > 10 {
+					display = f.Name[idx+1:]
+				}
+			}
 		}
-	}
 
 	// 标签：分类 + 来源平台（前缀字符串形式）。
 	// 注：FastGPT 对象式 {tag,value} 标签要求库内预先创建标签定义（仅 Pro UI 可建，无公开 API，

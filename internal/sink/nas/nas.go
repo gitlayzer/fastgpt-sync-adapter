@@ -25,6 +25,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/classifier"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/identity"
@@ -72,6 +73,13 @@ type pendingConv struct {
 	dir      string
 	filename string
 	content  []byte
+	logged   []msgLoggedRecord
+}
+
+type msgLoggedRecord struct {
+	msgID   string
+	person  string
+	msgTime int64
 }
 
 func New(cfg Config, clf *classifier.Classifier, ids identity.Resolver, store *storage.Store) *Sink {
@@ -110,6 +118,12 @@ func (s *Sink) Flush(ctx context.Context) error {
 		}
 		if err := s.fs.UploadBytes(p.filename, p.dir, p.content); err != nil {
 			return fmt.Errorf("刷写会话文件 %s: %w", full, err)
+		}
+		// 上传成功后才打标 SQLite，保证数据落地才记状态
+		if s.store != nil {
+			for _, m := range p.logged {
+				_ = s.store.LogMessage(m.msgID, m.person, m.msgTime)
+			}
 		}
 	}
 
@@ -182,16 +196,22 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 		}
 	}
 
-	// 参与者集合：OwnerIDs（可见人集合：企微=from+tolist / 飞书=owner+可见授权用户）
-	// + 消息解析出的参与者 + 已知群成员
-	var users []string
-	seen := map[string]bool{}
-	add := func(u string) {
-		if u != "" && !seen[u] {
+		// 参与者集合：OwnerIDs（可见人集合：企微=from+tolist / 飞书=owner+可见授权用户）
+		// + 消息解析出的参与者 + 已知群成员
+		var users []string
+		seen := map[string]bool{}
+		add := func(u string) {
+			if u == "" || seen[u] {
+				return
+			}
+			// 企微外部联系人/客户（以 wm/wo 开头）不建独立的员工归档根目录，
+			// 避免在 NAS 产生海量客户空目录与冗余附件上传，但内部员工目录内依然完整保留与客户的对话
+			if r.Source == "wecom" && (strings.HasPrefix(u, "wm") || strings.HasPrefix(u, "wo")) {
+				return
+			}
 			seen[u] = true
 			users = append(users, u)
 		}
-	}
 	for _, u := range r.OwnerIDs {
 		add(u)
 	}
@@ -260,55 +280,68 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 	// 对下游（NAS 归档 / FastGPT 检索）没有价值，反而占空间、干扰阅读。
 	// 只保留：会话正文 Markdown（滚动追加）+ 附件原件。
 
-	// 1) 会话正文 Markdown 滚动追加（按 消息×人 去重）
-	if msgOK && r.Source == "wecom" {
-		if logged, err := s.store.IsMessageLogged(r.ID, person); err == nil && !logged {
-			if line, skip := render.RenderLine(m, nameOf); !skip {
-				convFile := m.ConvFileName(uid, nameOf)
-				if err := s.appendFile(path.Join(base, "conversations"), convFile, line); err != nil {
-					return fmt.Errorf("追加会话 markdown: %w", err)
+		// 1) 会话正文 Markdown 滚动追加（按 消息×人 去重）
+		if msgOK && r.Source == "wecom" {
+			if logged, err := s.store.IsMessageLogged(r.ID, person); err == nil && !logged {
+				if line, skip := render.RenderLine(m, nameOf); !skip {
+					convFile := m.ConvFileName(uid, nameOf)
+					if err := s.appendFileWithMeta(path.Join(base, "conversations"), convFile, line, r.ID, person, r.Timestamp); err != nil {
+						return fmt.Errorf("追加会话 markdown: %w", err)
+					}
+				} else {
+					_ = s.store.LogMessage(r.ID, person, r.Timestamp)
 				}
 			}
-			if err := s.store.LogMessage(r.ID, person, r.Timestamp); err != nil {
-				log.Printf("[nas] 消息去重记录失败 %s/%s: %v", r.ID, person, err)
-			}
 		}
-	}
 
-	// 2) 附件：平铺到 <人名>/<平台>/ 下，与飞书保持一致。
-	// 文件名 <msgid>_<原始文件名>，前缀保证同名人不同消息的附件不互相覆盖。
-	for i := range r.Attachments {
-		if ctx.Err() != nil {
-			return ctx.Err() // 停止信号：附件下载是耗时大头，必须能中断
+		// 2) 附件：按发送日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A）。
+		// 文件名保持原始真实名称，完全不加丑陋的 msgid 机器前缀；以日期子目录自然隔离同名文件。
+		dateFolder := time.UnixMilli(r.Timestamp).Format("2006-01-02")
+		if dateFolder == "" || r.Timestamp <= 0 {
+			dateFolder = time.Now().Format("2006-01-02")
 		}
-		a := &r.Attachments[i]
-		rc, err := read(ctx, a)
-		if err != nil {
+		targetDir := path.Join(base, dateFolder)
+
+		for i := range r.Attachments {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return ctx.Err() // 停止信号：附件下载是耗时大头，必须能中断
 			}
-			log.Printf("[nas] 附件拉取失败 %s（%s）: %v", a.Name, a.FileID, err)
-			continue
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			log.Printf("[nas] 附件读取失败 %s: %v", a.Name, err)
-			continue
-		}
+			a := &r.Attachments[i]
+			rc, err := read(ctx, a)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				log.Printf("[nas] 附件拉取失败 %s（%s）: %v", a.Name, a.FileID, err)
+				continue
+			}
+			data, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				log.Printf("[nas] 附件读取失败 %s: %v", a.Name, err)
+				continue
+			}
 
-		fname := fmt.Sprintf("%s_%s", r.ID, sanitize(a.Name))
-		if err := s.fs.UploadBytes(fname, base, data); err != nil {
-			log.Printf("[nas] 附件上传失败 %s: %v", a.Name, err)
-			continue
+			cleanName := sanitize(a.Name)
+			if cleanName == "" {
+				cleanName = a.FileID
+			}
+			if err := s.fs.UploadBytes(cleanName, targetDir, data); err != nil {
+				log.Printf("[nas] 附件上传失败 %s: %v", a.Name, err)
+				continue
+			}
+			log.Printf("[nas] 已归档 %s/%s（%.1f KB）", targetDir, cleanName, float64(len(data))/1024)
 		}
-		log.Printf("[nas] 已归档 %s/%s（%.1f KB）", base, fname, float64(len(data))/1024)
-	}
-	return nil
+		return nil
 }
 
-// appendFile 滚动追加：读旧内容（优先读内存缓存，避免频繁下载）→ 拼新行 → 写入（批次模式下入队统一刷写）。
+// appendFile 滚动追加（保持旧签名兼容测试）。
 func (s *Sink) appendFile(dir, filename, line string) error {
+	return s.appendFileWithMeta(dir, filename, line, "", "", 0)
+}
+
+// appendFileWithMeta 滚动追加：读旧内容（优先读内存缓存，避免频繁下载）→ 拼新行 → 写入（批次模式下入队统一刷写）。
+func (s *Sink) appendFileWithMeta(dir, filename, line, msgID, person string, msgTime int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -344,12 +377,33 @@ func (s *Sink) appendFile(dir, filename, line string) error {
 		}
 	}
 
+	// RAG 优化：会话按日分块（若该日期在当前文件中尚未出现，则插入二级标题）
+	if date := extractDateFromLine(line); date != "" {
+		dateHeader := "## " + date
+		if !strings.Contains(string(existing), dateHeader) {
+			if !strings.HasSuffix(string(existing), "\n\n") {
+				if strings.HasSuffix(string(existing), "\n") {
+					existing = append(existing, '\n')
+				} else {
+					existing = append(existing, "\n\n"...)
+				}
+			}
+			existing = append(existing, []byte(dateHeader+"\n\n")...)
+		}
+	}
+
 	existing = append(existing, []byte(line)...)
 	s.convCache[full] = existing
 
 	if !s.batchMode {
 		// 非批次模式：直接单条上传覆盖
-		return s.fs.UploadBytes(filename, dir, existing)
+		if err := s.fs.UploadBytes(filename, dir, existing); err != nil {
+			return err
+		}
+		if s.store != nil && msgID != "" {
+			_ = s.store.LogMessage(msgID, person, msgTime)
+		}
+		return nil
 	}
 
 	// 批次模式：加入待刷写队列
@@ -362,7 +416,27 @@ func (s *Sink) appendFile(dir, filename, line string) error {
 		s.pendingConvs[full] = p
 	}
 	p.content = existing
+	if msgID != "" {
+		p.logged = append(p.logged, msgLoggedRecord{msgID: msgID, person: person, msgTime: msgTime})
+	}
 	return nil
+}
+
+// extractDateFromLine 从会话行中提取 YYYY-MM-DD 日期。
+func extractDateFromLine(line string) string {
+	idx := strings.Index(line, "[")
+	if idx == -1 {
+		return ""
+	}
+	sub := line[idx+1:]
+	spaceIdx := strings.Index(sub, " ")
+	if spaceIdx == 10 && len(sub) >= 10 {
+		date := sub[:10]
+		if date[4] == '-' && date[7] == '-' {
+			return date
+		}
+	}
+	return ""
 }
 
 // stripSynologyHTMLPrefix 清理旧版追加逻辑误存进 .md 的群晖 HTML 页面。
@@ -377,7 +451,7 @@ func stripSynologyHTMLPrefix(data []byte) []byte {
 	offset := 0
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "- **[") || strings.HasPrefix(trimmed, "- *[") {
+		if strings.HasPrefix(trimmed, "## ") || strings.HasPrefix(trimmed, "- **[") || strings.HasPrefix(trimmed, "- *[") {
 			return []byte(text[offset:])
 		}
 		offset += len(line)

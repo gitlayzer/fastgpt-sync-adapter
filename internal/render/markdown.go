@@ -52,22 +52,31 @@ type Msg struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 	} `json:"weapp"`
-	Card *struct {
-		CorpName string `json:"corpname"`
-		UserID   string `json:"userid"`
-	} `json:"card"`
-	Todo *struct{ Title string `json:"title"` } `json:"todo"`
-	Vote *struct{ Title string `json:"title"` } `json:"vote"`
-	ChatRecord *struct {
-		Title string `json:"title"`
-	} `json:"chatrecord"`
-	Mixed *struct {
-		Item []struct {
-			Type    string `json:"type"`
-			Content string `json:"content"`
-		} `json:"item"`
-	} `json:"mixed"`
-}
+		Card *struct {
+			CorpName string `json:"corpname"`
+			UserID   string `json:"userid"`
+		} `json:"card"`
+		Todo *struct{ Title string `json:"title"` } `json:"todo"`
+		Vote *struct{ Title string `json:"title"` } `json:"vote"`
+		ChatRecord *struct {
+			Title string           `json:"title"`
+			Item  []ChatRecordItem `json:"item"`
+		} `json:"chatrecord"`
+		Mixed *struct {
+			Item []struct {
+				Type    string `json:"type"`
+				Content string `json:"content"`
+			} `json:"item"`
+		} `json:"mixed"`
+	}
+
+	// ChatRecordItem 企微合并转发消息中的子项。
+	type ChatRecordItem struct {
+		Type         string `json:"type"`
+		MsgTime      int64  `json:"msgtime"`
+		Content      string `json:"content"`
+		FromChatroom bool   `json:"from_chatroom"`
+	}
 
 // Parse 解析消息原始 JSON。
 func Parse(raw json.RawMessage) (*Msg, error) {
@@ -189,7 +198,24 @@ func (m *Msg) contentText() string {
 	case m.Vote != nil:
 		return fmt.Sprintf("[投票：%s]", m.Vote.Title)
 	case m.ChatRecord != nil:
-		return fmt.Sprintf("[聊天记录：%s]", m.ChatRecord.Title)
+		title := m.ChatRecord.Title
+		if title == "" {
+			title = "聊天记录"
+		}
+		if len(m.ChatRecord.Item) == 0 {
+			return fmt.Sprintf("[聊天记录：%s]", title)
+		}
+		var itemTexts []string
+		for _, it := range m.ChatRecord.Item {
+			text := parseChatRecordItemContent(it.Type, it.Content)
+			if text != "" {
+				itemTexts = append(itemTexts, text)
+			}
+		}
+		if len(itemTexts) == 0 {
+			return fmt.Sprintf("[聊天记录：%s]", title)
+		}
+		return fmt.Sprintf("[聊天记录：%s]（共 %d 条）：%s", title, len(itemTexts), strings.Join(itemTexts, " ｜ "))
 	case m.Mixed != nil:
 		var parts []string
 		for _, it := range m.Mixed.Item {
@@ -202,6 +228,79 @@ func (m *Msg) contentText() string {
 		return strings.Join(parts, " ")
 	}
 	return ""
+}
+
+// parseChatRecordItemContent 格式化合并转发（chatrecord）中的各个子项内容。
+func parseChatRecordItemContent(itemType, rawContent string) string {
+	rawContent = strings.TrimSpace(rawContent)
+	if rawContent == "" {
+		return "[" + itemType + "]"
+	}
+
+	switch itemType {
+	case "ChatRecordText":
+		var body struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(rawContent), &body); err == nil && body.Content != "" {
+			return sanitizeMarkdown(body.Content)
+		}
+		return sanitizeMarkdown(rawContent)
+
+	case "ChatRecordFile":
+		var body struct {
+			FileName string `json:"filename"`
+		}
+		if err := json.Unmarshal([]byte(rawContent), &body); err == nil && body.FileName != "" {
+			return fmt.Sprintf("[文件：%s]", body.FileName)
+		}
+		return "[文件]"
+
+	case "ChatRecordImage":
+		return "[图片]"
+
+	case "ChatRecordVoice":
+		return "[语音]"
+
+	case "ChatRecordVideo":
+		return "[视频]"
+
+	case "ChatRecordLink":
+		var body struct {
+			Title   string `json:"title"`
+			LinkURL string `json:"link_url"`
+		}
+		if err := json.Unmarshal([]byte(rawContent), &body); err == nil {
+			if body.LinkURL != "" && body.Title != "" {
+				return fmt.Sprintf("[链接：%s](%s)", body.Title, body.LinkURL)
+			} else if body.Title != "" {
+				return fmt.Sprintf("[链接：%s]", body.Title)
+			}
+		}
+		return "[链接]"
+
+	case "ChatRecordLocation":
+		var body struct {
+			Title   string `json:"title"`
+			Address string `json:"address"`
+		}
+		if err := json.Unmarshal([]byte(rawContent), &body); err == nil {
+			return fmt.Sprintf("[位置：%s %s]", body.Title, body.Address)
+		}
+		return "[位置]"
+
+	default:
+		var fallback map[string]any
+		if err := json.Unmarshal([]byte(rawContent), &fallback); err == nil {
+			if title, ok := fallback["title"].(string); ok && title != "" {
+				return fmt.Sprintf("[%s：%s]", itemType, title)
+			}
+			if c, ok := fallback["content"].(string); ok && c != "" {
+				return sanitizeMarkdown(c)
+			}
+		}
+		return "[" + itemType + "]"
+	}
 }
 
 // sanitizeMarkdown 把企微 markdown 消息的内容转成适合写进会话文件的单行文本。

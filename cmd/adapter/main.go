@@ -155,17 +155,19 @@ func main() {
 		log.Printf("[OK] 飞书连接器已注册（mode=%s，共享文件夹 %d 个，间隔 %s）", fc.Mode, len(fc.Folders), fc.Interval.D())
 	}
 	if cfg.Auth.Enabled && feishuClient != nil {
-		authSvc := auth.New(auth.Config{
-			Addr:            cfg.Auth.Addr,
-			ExternalURL:     cfg.Auth.ExternalURL,
-			RefreshInterval: cfg.Auth.RefreshInterval.D(),
-		}, feishuClient, st)
-		// HTTP 服务单独 goroutine
-		go func() {
-			if err := authSvc.Start(); err != nil {
-				log.Printf("[auth] webhook 退出: %v", err)
-			}
-		}()
+			authSvc := auth.New(auth.Config{
+				Addr:            cfg.Auth.Addr,
+				ExternalURL:     cfg.Auth.ExternalURL,
+				RefreshInterval: cfg.Auth.RefreshInterval.D(),
+			}, feishuClient, st)
+			// 启动前先同步刷新一次快过期的授权，避免首轮飞书扫描遇到已过期 token 竞争
+			_ = authSvc.Run(context.Background())
+			// HTTP 服务单独 goroutine
+			go func() {
+				if err := authSvc.Start(); err != nil {
+					log.Printf("[auth] webhook 退出: %v", err)
+				}
+			}()
 		// token 刷新注册为引擎周期任务
 		eng.AddTask(authSvc)
 		log.Printf("[OK] 飞书授权 webhook 已启动（%s），token 刷新间隔 %s", cfg.Auth.Addr, cfg.Auth.RefreshInterval.D())

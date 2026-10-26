@@ -1,12 +1,16 @@
 package fastgpt
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path"
 	"strings"
 	"sync"
@@ -88,16 +92,28 @@ func newFakeFastGPT(t *testing.T) (*fakeFastGPT, string) {
 			id := fmt.Sprintf("ds%d", fg.nextID)
 			fg.datasets[req.Name] = id
 			json.NewEncoder(w).Encode(map[string]any{"code": 200, "data": id})
-		case r.URL.Path == "/api/core/dataset/collection/create/localFile":
-			// multipart：取 file 字段文件名
-			_, params, _ := parseMultipart(r)
-			fg.nextID++
-			cid := fmt.Sprintf("col%d", fg.nextID)
-			fg.uploads = append(fg.uploads, params["filename"])
-			fg.collections[cid] = params["filename"]
-			json.NewEncoder(w).Encode(map[string]any{"code": 200, "data": map[string]string{"collectionId": cid}})
-		case r.URL.Path == "/api/core/dataset/collection/update":
-			json.NewEncoder(w).Encode(map[string]any{"code": 200})
+			case r.URL.Path == "/api/core/dataset/collection/create/localFile":
+				// multipart：取 file 字段文件名
+				_, params, _ := parseMultipart(r, body)
+				fg.nextID++
+				cid := fmt.Sprintf("col%d", fg.nextID)
+				name := params["display_name"]
+				if name == "" {
+					name = params["filename"]
+				}
+				fg.uploads = append(fg.uploads, name)
+				fg.collections[cid] = name
+				json.NewEncoder(w).Encode(map[string]any{"code": 200, "data": map[string]string{"collectionId": cid}})
+			case r.URL.Path == "/api/core/dataset/collection/update":
+				var req struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				}
+				json.Unmarshal(body, &req)
+				if req.Name != "" && req.ID != "" {
+					fg.collections[req.ID] = req.Name
+				}
+				json.NewEncoder(w).Encode(map[string]any{"code": 200})
 		case r.URL.Path == "/api/core/dataset/collection/delete":
 			var req struct{ CollectionIds []string `json:"collectionIds"` }
 			json.Unmarshal(body, &req)
@@ -114,19 +130,47 @@ func newFakeFastGPT(t *testing.T) (*fakeFastGPT, string) {
 	return fg, srv.URL
 }
 
-func parseMultipart(r *http.Request) (string, map[string]string, error) {
+func parseMultipart(r *http.Request, body []byte) (string, map[string]string, error) {
 	params := map[string]string{}
-	mr, err := r.MultipartReader()
+	ct := r.Header.Get("Content-Type")
+	_, mediaParams, err := mime.ParseMediaType(ct)
 	if err != nil {
 		return "", params, err
 	}
+	boundary, ok := mediaParams["boundary"]
+	if !ok {
+		return "", params, fmt.Errorf("no boundary")
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
 	for {
 		part, err := mr.NextPart()
 		if err != nil {
 			break
 		}
 		if part.FormName() == "file" {
-			params["filename"] = part.FileName()
+			cd := part.Header.Get("Content-Disposition")
+			if idx := strings.Index(cd, "filename*=UTF-8''"); idx != -1 {
+				raw := cd[idx+len("filename*=UTF-8''"):]
+				if end := strings.Index(raw, ";"); end != -1 {
+					raw = raw[:end]
+				}
+				if unescaped, err := url.PathUnescape(strings.Trim(raw, `"`)); err == nil && unescaped != "" {
+					params["filename"] = unescaped
+				}
+			}
+			if params["filename"] == "" {
+				params["filename"] = part.FileName()
+			}
+		}
+		if part.FormName() == "data" {
+			var d struct {
+				Name string `json:"name"`
+			}
+			b, _ := io.ReadAll(part)
+			_ = json.Unmarshal(b, &d)
+			if d.Name != "" {
+				params["display_name"] = d.Name
+			}
 		}
 		io.Copy(io.Discard, part)
 	}
@@ -296,10 +340,56 @@ func TestPushFileUpdateDeletesOldCollection(t *testing.T) {
 		t.Fatalf("旧集合 %s 未被删除，存在重复数据堆积", oldCid)
 	}
 
-	// 台账应该指向新集合
-	fi, err := st.GetFileIndex("张三", "wecom", convPath)
-	if err != nil || fi.CollectionID == oldCid {
-		t.Fatalf("台账未更新为新集合: %v %+v", err, fi)
+		// 台账应该指向新集合
+		fi, err := st.GetFileIndex("张三", "wecom", convPath)
+		if err != nil || fi.CollectionID == oldCid {
+			t.Fatalf("台账未更新为新集合: %v %+v", err, fi)
+		}
+	}
+
+func TestPushDateSubdirectoryOptionA(t *testing.T) {
+	fs := newFakeNAS()
+	root := "/FastGPT-test"
+	fs.dirs[root] = nil
+	fs.addDir(root, "王五")
+	fs.addDir(root+"/王五", "企微")
+	fs.addDir(root+"/王五/企微", "conversations")
+	fs.addDir(root+"/王五/企微", "2026-10-26") // 方案 A：按日期子目录归档
+	fs.addFile(root+"/王五/企微/conversations", "与赵六的单聊.md", []byte("# 会话\n- 你好"))
+	fs.addFile(root+"/王五/企微/2026-10-26", "产品采购合同.pdf", []byte("合同数据"))
+
+	fg, baseURL := newFakeFastGPT(t)
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	task := newPushTask(t, baseURL, fs, st)
+	if err := task.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// 验证上传列表包含纯净原始文件名
+	if len(fg.uploads) != 2 {
+		t.Fatalf("应推送 2 个文件, 实际: %d (%v)", len(fg.uploads), fg.uploads)
+	}
+
+	foundContract := false
+	for _, up := range fg.uploads {
+		if up == "产品采购合同.pdf" {
+			foundContract = true
+		}
+	}
+	if !foundContract {
+		t.Fatalf("未找到纯净名称的产品采购合同.pdf: %v", fg.uploads)
+	}
+
+	// 验证台账中的分类被正确识别为「合同」
+	fi, err := st.GetFileIndex("王五", "wecom", root+"/王五/企微/2026-10-26/产品采购合同.pdf")
+	if err != nil || fi.CollectionID == "" {
+		t.Fatalf("台账记录失败: %v", err)
+	}
+	if fi.Category != "合同" {
+		t.Fatalf("日期子目录下的文件应根据文件名自动识别为 合同, 实际: %s", fi.Category)
 	}
 }
+
 

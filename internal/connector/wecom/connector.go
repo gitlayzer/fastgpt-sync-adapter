@@ -158,43 +158,87 @@ func messageToRecord(m *Message) model.Record {
 // 混合消息、聊天记录等嵌套类型暂不处理（TODO）。
 
 // extractAttachments 从原始消息 JSON 提取附件引用（sdkfileid 等）。
+// 支持 file 直接文件与 chatrecord 合并转发中的嵌套文件。
 func extractAttachments(m *Message) []model.Attachment {
-	// 只处理 file 类型。图片、语音、视频、表情一律不下载：
+	// 图片、语音、视频、表情一律不下载：
 	//   - 业务上只需要办公文档，媒体文件对检索没价值
 	//   - 压缩包在企微侧取的时候经常连续 10001 失败，重试只白耗时间
 	// 消息本身仍会写进会话 Markdown（如「[文件：xxx.rar]」「[图片]」），
 	// 保留“谁在什么时候发了什么”的事实，只是不落文件本体。
-	if m.MsgType != "file" {
-		return nil
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(m.Raw, &raw); err != nil {
-		return nil
-	}
-	content, ok := raw[m.MsgType]
-	if !ok {
-		return nil
-	}
-	var body struct {
-		SDKFileID string `json:"sdkfileid"`
-		FileName  string `json:"filename"`
-		FileSize  int64  `json:"filesize"`
-		MD5Sum    string `json:"md5sum"`
-	}
-	if err := json.Unmarshal(content, &body); err != nil || body.SDKFileID == "" {
-		return nil
-	}
-	if body.FileName == "" || !isWantedDoc(body.FileName) {
-		log.Printf("[wecom] 跳过非文档附件 %q（类型不在白名单）", body.FileName)
+	if m.MsgType != "file" && m.MsgType != "chatrecord" {
 		return nil
 	}
 
-	return []model.Attachment{{
-		Name:   body.FileName,
-		FileID: body.SDKFileID,
-		Size:   body.FileSize,
-		MD5:    body.MD5Sum,
-	}}
+	if m.MsgType == "file" {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(m.Raw, &raw); err != nil {
+			return nil
+		}
+		content, ok := raw[m.MsgType]
+		if !ok {
+			return nil
+		}
+		var body struct {
+			SDKFileID string `json:"sdkfileid"`
+			FileName  string `json:"filename"`
+			FileSize  int64  `json:"filesize"`
+			MD5Sum    string `json:"md5sum"`
+		}
+		if err := json.Unmarshal(content, &body); err != nil || body.SDKFileID == "" {
+			return nil
+		}
+		if body.FileName == "" || !isWantedDoc(body.FileName) {
+			log.Printf("[wecom] 跳过非文档附件 %q（类型不在白名单）", body.FileName)
+			return nil
+		}
+
+		return []model.Attachment{{
+			Name:   body.FileName,
+			FileID: body.SDKFileID,
+			Size:   body.FileSize,
+			MD5:    body.MD5Sum,
+		}}
+	}
+
+	if m.MsgType == "chatrecord" {
+		var raw struct {
+			ChatRecord struct {
+				Item []struct {
+					Type    string `json:"type"`
+					Content string `json:"content"`
+				} `json:"item"`
+			} `json:"chatrecord"`
+		}
+		if err := json.Unmarshal(m.Raw, &raw); err != nil {
+			return nil
+		}
+		var atts []model.Attachment
+		for _, it := range raw.ChatRecord.Item {
+			if it.Type == "ChatRecordFile" {
+				var body struct {
+					SDKFileID string `json:"sdkfileid"`
+					FileName  string `json:"filename"`
+					FileSize  int64  `json:"filesize"`
+					MD5Sum    string `json:"md5sum"`
+				}
+				if err := json.Unmarshal([]byte(it.Content), &body); err == nil && body.SDKFileID != "" {
+					if body.FileName != "" && isWantedDoc(body.FileName) {
+						atts = append(atts, model.Attachment{
+							Name:   body.FileName,
+							FileID: body.SDKFileID,
+							Size:   body.FileSize,
+							MD5:    body.MD5Sum,
+						})
+					} else {
+						log.Printf("[wecom] 跳过合并转发非文档附件 %q", body.FileName)
+					}
+				}
+			}
+		}
+		return atts
+	}
+
+	return nil
 }
 
 // docExts 需要归档的文档扩展名白名单。

@@ -221,11 +221,16 @@ func (c *Connector) scan(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().Unix()
-		for _, g := range grants {
-			if g.Status != "authorized" || g.AccessToken == "" || g.ExpireAt <= now {
-				log.Printf("[feishu] 用户 %s 授权无效（status=%s），跳过", g.ExternalUserID, g.Status)
-				continue
-			}
+			for _, g := range grants {
+				if g.Status != "authorized" || g.AccessToken == "" {
+					log.Printf("[feishu] 用户 %s 未处于已授权状态（status=%s），跳过", g.ExternalUserID, g.Status)
+					continue
+				}
+				if g.ExpireAt <= now {
+					log.Printf("[feishu] 用户 %s 授权已过期（已于 %s 到期），跳过待刷新",
+						g.ExternalUserID, time.Unix(g.ExpireAt, 0).Format("2006-01-02 15:04:05"))
+					continue
+				}
 			// a) 云空间（drive）：老式文件夹结构。
 			// 注意：新版飞书把「归我所有/与我共享」也归到这里，但要求 token 带
 			// space:document:retrieve；只有 drive:drive 时接口 code=0 却返回空列表，

@@ -294,11 +294,16 @@ func (c *Client) Download(filePath string) (io.ReadCloser, error) {
 }
 
 // CreateFolder 在 parentPath 下创建名为 name 的文件夹（已存在则忽略错误）。
+// FileStation v2 规范要求 folder_path 与 name 必须序列化为 JSON 字符串数组。
 func (c *Client) CreateFolder(parentPath, name string) error {
+	folderPathJSON, _ := json.Marshal([]string{parentPath})
+	nameJSON, _ := json.Marshal([]string{name})
+
 	params := url.Values{}
 	params.Set("version", "2")
-	params.Set("folder_path", parentPath)
-	params.Set("name", name)
+	params.Set("folder_path", string(folderPathJSON))
+	params.Set("name", string(nameJSON))
+	params.Set("force_parent", "true")
 	_, err := c.apiCall("SYNO.FileStation.CreateFolder", "create", params)
 	if err != nil {
 		// 408 = 文件/文件夹已存在，视为成功
@@ -310,35 +315,23 @@ func (c *Client) CreateFolder(parentPath, name string) error {
 	return nil
 }
 
-// MkdirAll 递归创建路径（逐层创建，已存在则跳过）。
+// MkdirAll 递归创建路径（支持 force_parent 一次性级联创建，已存在则跳过）。
 func (c *Client) MkdirAll(fullPath string) error {
 	fullPath = path.Clean(fullPath)
-	parts := strings.Split(strings.Trim(fullPath, "/"), "/")
-	cur := ""
-	for _, p := range parts {
-		if p == "" {
-			continue
+	parent := path.Dir(fullPath)
+	name := path.Base(fullPath)
+	if parent == "/" || parent == "." || name == "/" || name == "." {
+		return nil
+	}
+	if err := c.CreateFolder(parent, name); err != nil {
+		if strings.Contains(err.Error(), "code=408") {
+			return nil
 		}
-		parent := "/" + cur
-		if cur == "" {
-			parent = "/"
+		// 若 CreateFolder 失败（例如共享文件夹根 1100 错误），探测一次 List
+		if _, lerr := c.List(fullPath); lerr == nil {
+			return nil
 		}
-		target := "/" + p
-		if cur != "" {
-			target = "/" + cur + "/" + p
-		}
-		if err := c.CreateFolder(parent, p); err != nil {
-			// 共享文件夹根等场景 CreateFolder 会报 1100（无权限创建），
-			// 但目录可能已存在——用 List 探测，能列出来就当存在继续
-			if _, lerr := c.List(target); lerr != nil {
-				return fmt.Errorf("创建目录 %s 失败: %w", target, err)
-			}
-		}
-		if cur == "" {
-			cur = p
-		} else {
-			cur = cur + "/" + p
-		}
+		return fmt.Errorf("创建目录 %s 失败: %w", fullPath, err)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -172,7 +173,30 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if abs, err := filepath.Abs(path); err == nil {
+		cfg.NormalizePaths(filepath.Dir(abs))
+	}
 	return &cfg, nil
+}
+
+// NormalizePaths 把配置中所有相对路径按 baseDir 解析为绝对路径，避免进程 CWD 变化引发路径错乱。
+func (c *Config) NormalizePaths(baseDir string) {
+	toAbs := func(p *string) {
+		if p == nil || *p == "" {
+			return
+		}
+		if !filepath.IsAbs(*p) {
+			*p = filepath.Clean(filepath.Join(baseDir, *p))
+		}
+	}
+
+	toAbs(&c.Engine.StateFile)
+	toAbs(&c.Storage.DBFile)
+	toAbs(&c.Identity.LocalFile)
+	if c.Connectors.WeCom.Enabled {
+		toAbs(&c.Connectors.WeCom.WeCom.RSAPrivateKeyFile)
+		toAbs(&c.Connectors.WeCom.WeCom.SDKLibPath)
+	}
 }
 
 // Validate 校验必填项（仅校验 enabled 的模块）并填默认值。

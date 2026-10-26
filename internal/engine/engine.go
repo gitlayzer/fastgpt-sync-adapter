@@ -174,9 +174,15 @@ func (e *Engine) runConnector(ctx context.Context, j ConnectorJob) {
 			}
 
 			// 整批分发后，统一刷写所有 Sink 的批次缓冲到存储后端
+			flushCtx := ctx
+			if interrupted {
+				var cancel context.CancelFunc
+				flushCtx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+			}
 			for _, s := range e.sinks {
 				if f, ok := s.(sink.Flusher); ok {
-					if err := f.Flush(ctx); err != nil {
+					if err := f.Flush(flushCtx); err != nil {
 						log.Printf("[%s] 刷写 Sink %s 出错: %v", name, s.Name(), err)
 					}
 				}

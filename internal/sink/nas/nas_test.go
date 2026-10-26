@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/classifier"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/model"
@@ -169,16 +170,17 @@ func TestAttachmentArchive(t *testing.T) {
 	if err := s.WriteRecord(context.Background(), rec, read); err != nil {
 		t.Fatalf("WriteRecord: %v", err)
 	}
-	// 附件平铺在 <人名>/企微/ 下，不再按分类建子目录、也不写 .meta.json
-	for _, p := range []string{"张三", "李四"} {
-		att := "/FastGPT-test/" + p + "/企微/m9_采购合同V1.docx"
-		if string(fs.files[att]) != "PDF" {
-			t.Fatalf("%s 附件内容不对（路径应为平铺）", p)
+		// 附件按日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A），保持原始文件名无 msgid 前缀
+		dateFolder := time.UnixMilli(rec.Timestamp).Format("2006-01-02")
+		for _, p := range []string{"张三", "李四"} {
+			att := fmt.Sprintf("/FastGPT-test/%s/企微/%s/采购合同V1.docx", p, dateFolder)
+			if string(fs.files[att]) != "PDF" {
+				t.Fatalf("%s 附件内容不对（路径应为: %s）", p, att)
+			}
+			if _, ok := fs.files[att+".meta.json"]; ok {
+				t.Fatalf("%s 不应再写 .meta.json 侧边车", p)
+			}
 		}
-		if _, ok := fs.files[att+".meta.json"]; ok {
-			t.Fatalf("%s 不应再写 .meta.json 侧边车", p)
-		}
-	}
 }
 
 func TestAppendFileCleansLegacyHTML(t *testing.T) {
@@ -278,13 +280,56 @@ func TestBatchModeCoalescesUploadsAndDownloads(t *testing.T) {
 		t.Fatalf("批次刷写后应只发生 2 次上传（双方各 1 次），实际发生 %d 次", cfs.uploadCount)
 	}
 
-	// 验证内容完整性：所有 5 条消息均被合并写入
-	md1 := string(fs.files["/FastGPT-test/张三/企微/conversations/与李四的单聊.md"])
-	for i := 1; i <= 5; i++ {
-		expected := fmt.Sprintf("这是第%d条消息", i)
-		if !strings.Contains(md1, expected) {
-			t.Fatalf("会话内容丢失: %s 未在产出中找到:\n%s", expected, md1)
+		// 验证内容完整性：所有 5 条消息均被合并写入
+		md1 := string(fs.files["/FastGPT-test/张三/企微/conversations/与李四的单聊.md"])
+		for i := 1; i <= 5; i++ {
+			expected := fmt.Sprintf("这是第%d条消息", i)
+			if !strings.Contains(md1, expected) {
+				t.Fatalf("会话内容丢失: %s 未在产出中找到:\n%s", expected, md1)
+			}
 		}
 	}
+
+func TestDailyChunkingHeaders(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	dir := "/FastGPT-test/张三/企微/conversations"
+	filename := "与李四的单聊.md"
+
+	// 第一天消息 1
+	if err := s.appendFile(dir, filename, "- **[2026-10-25 10:00:00] 张三**：消息1\n"); err != nil {
+		t.Fatalf("append 1: %v", err)
+	}
+	// 第一天消息 2（同天，不应重复产生日期标题）
+	if err := s.appendFile(dir, filename, "- **[2026-10-25 11:00:00] 李四**：消息2\n"); err != nil {
+		t.Fatalf("append 2: %v", err)
+	}
+	// 第二天消息 3（跨天，应自动产生 ## 2026-10-26 二级标题）
+	if err := s.appendFile(dir, filename, "- **[2026-10-26 09:00:00] 张三**：消息3\n"); err != nil {
+		t.Fatalf("append 3: %v", err)
+	}
+
+	content := string(fs.files[path.Join(dir, filename)])
+
+	if !strings.HasPrefix(content, "# 与李四的单聊") {
+		t.Fatalf("标题缺失或格式错误: %s", content)
+	}
+	if c := strings.Count(content, "## 2026-10-25"); c != 1 {
+		t.Fatalf("第一天日期标题应且仅出现 1 次, 实际出现 %d 次:\n%s", c, content)
+	}
+	if c := strings.Count(content, "## 2026-10-26"); c != 1 {
+		t.Fatalf("第二天日期标题应且仅出现 1 次, 实际出现 %d 次:\n%s", c, content)
+	}
+
+	// 验证时间顺序
+	idxDay1 := strings.Index(content, "## 2026-10-25")
+	idxMsg1 := strings.Index(content, "消息1")
+	idxMsg2 := strings.Index(content, "消息2")
+	idxDay2 := strings.Index(content, "## 2026-10-26")
+	idxMsg3 := strings.Index(content, "消息3")
+
+	if !(idxDay1 < idxMsg1 && idxMsg1 < idxMsg2 && idxMsg2 < idxDay2 && idxDay2 < idxMsg3) {
+		t.Fatalf("跨天分段顺序不正确:\n%s", content)
+	}
 }
+
 
