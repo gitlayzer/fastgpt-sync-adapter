@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fastgpt-sync-adapter:latest
+    container_name: fastgpt-sync-adapter
+    restart: unless-stopped
+    ports:
+      - "8089:8089" # 飞书 OAuth 授权与 Webhook 入口
+      - "8080:8080" # FastGPT API 文件库模式接口 (serve)
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./identity_map.json:/app/identity_map.json:ro
+      - ./private.pem:/app/private.pem:ro
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      # 可选：覆盖 NAS 访问地址（例如容器直连宿主机反代或本地测试网关）
+      # - NAS_URL=https://host.docker.internal:5001
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
