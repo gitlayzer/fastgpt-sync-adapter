@@ -100,6 +100,30 @@ func (m *mockAPI) DownloadExport(tok, fileToken string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader(m.docxData[token])), nil
 }
 
+func (m *mockAPI) SearchDocs(userToken, searchKey string, offset, count int) ([]feishuapi.SearchDocEntity, error) {
+	return nil, nil
+}
+
+func (m *mockAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error) {
+	return nil, nil
+}
+
+func (m *mockAPI) DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("逐字稿发言内容")), nil
+}
+
+func (m *mockAPI) ListMailboxMessages(userToken string, pageSize int) ([]feishuapi.MailMessage, error) {
+	return nil, nil
+}
+
+func (m *mockAPI) ListMailAttachments(userToken, messageID string) ([]feishuapi.MailAttachment, error) {
+	return nil, nil
+}
+
+func (m *mockAPI) DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("邮件附件流")), nil
+}
+
 func TestTenantScanAndChangeDetection(t *testing.T) {
 	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer st.Close()
@@ -258,17 +282,76 @@ func TestUserModeWikiOnly(t *testing.T) {
 		t.Fatalf("file 归档名应保持原样，实际 %q", got)
 	}
 
-	// 第二轮应无新增（Ack 之后 doc_state 才记录）
-	for _, r := range recs {
+		// 第二轮应无新增（Ack 之后 doc_state 才记录）
+		for _, r := range recs {
+			if err := c.Ack(r.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		recs2, _, err := c.Fetch(context.Background(), "", 10)
+		if err != nil || len(recs2) != 0 {
+			t.Fatalf("第二轮应无新数据: n=%d err=%v", len(recs2), err)
+		}
+	}
+
+func TestFeishuCloudDeleteEmitsDeleteRecord(t *testing.T) {
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_u", AccessToken: "ut1", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+
+	api := newMockAPI()
+	api.roots["ut1"] = "rootU"
+	api.folders["rootU"] = []feishuapi.DriveFile{
+		{Token: "doc1", Name: "即将被删除的文档.docx", Type: "docx", ModifiedTime: "1700000100", OwnerID: "ou_u"},
+		{Token: "doc2", Name: "正常保留的文档.docx", Type: "docx", ModifiedTime: "1700000100", OwnerID: "ou_u"},
+	}
+
+	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第一轮：产出 2 篇并全部 Ack
+	recs1, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil || len(recs1) != 2 {
+		t.Fatalf("首轮应产出 2 篇, 实际: %d", len(recs1))
+	}
+	for _, r := range recs1 {
 		if err := c.Ack(r.ID); err != nil {
 			t.Fatal(err)
 		}
 	}
+
+	// 模拟飞书云端将 doc1 彻底删除或移出，rootU 中只剩下 doc2
+	api.folders["rootU"] = []feishuapi.DriveFile{
+		{Token: "doc2", Name: "正常保留的文档.docx", Type: "docx", ModifiedTime: "1700000100", OwnerID: "ou_u"},
+	}
+
+	// 第二轮：差集比对，应产出 1 条 Kind="delete" 的删除记录
 	recs2, _, err := c.Fetch(context.Background(), "", 10)
-	if err != nil || len(recs2) != 0 {
-		t.Fatalf("第二轮应无新数据: n=%d err=%v", len(recs2), err)
+	if err != nil {
+		t.Fatalf("Fetch 2: %v", err)
+	}
+	if len(recs2) != 1 {
+		t.Fatalf("次轮应检测到 1 篇云端删除，实际产出 %d 篇: %+v", len(recs2), recs2)
+	}
+	if recs2[0].Kind != "delete" || recs2[0].ID != "doc1" {
+		t.Fatalf("删除记录属性不符合预期: %+v", recs2[0])
+	}
+
+	// Ack 删除后，feishu_doc_state 中的对应记录应被清理
+	if err := c.Ack(recs2[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if st.GetDocEditTime("doc1") != 0 {
+		t.Fatalf("Ack 删除后，doc1 的状态应被彻底清理")
 	}
 }
+
 
 // TestNotAckedMeansRetry 验证幂等性的关键语义：
 // 没有 Ack 的记录（模拟写入 Sink 失败）下一轮必须重新产出，
@@ -310,12 +393,205 @@ func TestNotAckedMeansRetry(t *testing.T) {
 		t.Fatalf("未 Ack 的记录应重新产出, 实际 n=%d", len(recs2))
 	}
 
-	// Ack 之后不再产出
-	if err := c.Ack("doc1"); err != nil {
+		// Ack 之后不再产出
+		if err := c.Ack("doc1"); err != nil {
+			t.Fatal(err)
+		}
+		recs3, _, err := c.Fetch(context.Background(), "", 10)
+		if err != nil || len(recs3) != 0 {
+			t.Fatalf("Ack 后应无产出, 实际 n=%d err=%v", len(recs3), err)
+		}
+	}
+
+type mockSearchAPI struct {
+	*mockAPI
+	sharedDocs []feishuapi.SearchDocEntity
+}
+
+func (m *mockSearchAPI) SearchDocs(userToken, searchKey string, offset, count int) ([]feishuapi.SearchDocEntity, error) {
+	return m.sharedDocs, nil
+}
+
+func TestSharedWithMeSearchAndOwnerViewerStored(t *testing.T) {
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_viewer", AccessToken: "ut_viewer", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+
+	baseAPI := newMockAPI()
+	baseAPI.roots["ut_viewer"] = "root_viewer"
+	baseAPI.docxData["doc_shared"] = "共享文档内容"
+
+	api := &mockSearchAPI{
+		mockAPI: baseAPI,
+		sharedDocs: []feishuapi.SearchDocEntity{
+			{Token: "doc_shared", Title: "IT运维部任务管理.docx", Type: "docx", OwnerID: "ou_luke"},
+		},
+	}
+
+	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	if err := c.Init(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	recs3, _, err := c.Fetch(context.Background(), "", 10)
-	if err != nil || len(recs3) != 0 {
-		t.Fatalf("Ack 后应无产出, 实际 n=%d err=%v", len(recs3), err)
+
+	recs, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("应抓取到 1 篇与我共享文档, 实际: %d", len(recs))
+	}
+
+	r := recs[0]
+	if r.SenderID != "ou_luke" {
+		t.Fatalf("归属人(Owner)应为 ou_luke, 实际: %s", r.SenderID)
+	}
+	// OwnerIDs 必须同时包含所有者 ou_luke 和查看人 ou_viewer
+	hasOwner := false
+	hasViewer := false
+	for _, oid := range r.OwnerIDs {
+		if oid == "ou_luke" {
+			hasOwner = true
+		}
+		if oid == "ou_viewer" {
+			hasViewer = true
+		}
+	}
+	if !hasOwner || !hasViewer {
+		t.Fatalf("OwnerIDs 必须同时包含 Owner(ou_luke) 与 Viewer(ou_viewer), 实际: %v", r.OwnerIDs)
 	}
 }
+
+type mockMinutesAndMailAPI struct {
+	*mockAPI
+	minutes  []feishuapi.MinuteItem
+	mails    []feishuapi.MailMessage
+	mailAtts []feishuapi.MailAttachment
+}
+
+func (m *mockMinutesAndMailAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error) {
+	return m.minutes, nil
+}
+
+func (m *mockMinutesAndMailAPI) DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("宋文帅：今天讨论项目方案\n张建丰：收到")), nil
+}
+
+func (m *mockMinutesAndMailAPI) ListMailboxMessages(userToken string, pageSize int) ([]feishuapi.MailMessage, error) {
+	return m.mails, nil
+}
+
+func (m *mockMinutesAndMailAPI) ListMailAttachments(userToken, messageID string) ([]feishuapi.MailAttachment, error) {
+	return m.mailAtts, nil
+}
+
+func (m *mockMinutesAndMailAPI) DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("邮件合同PDF字节")), nil
+}
+
+func TestMinutesSyncAndTranscriptExport(t *testing.T) {
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_u", AccessToken: "ut_min", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+
+	baseAPI := newMockAPI()
+	baseAPI.roots["ut_min"] = "root_min"
+
+	api := &mockMinutesAndMailAPI{
+		mockAPI: baseAPI,
+		minutes: []feishuapi.MinuteItem{
+			{MinuteToken: "min123", Title: "制造中心项目讨论", OwnerID: "ou_u", CreateTime: 1700000000000, Duration: 1800},
+		},
+	}
+
+	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("应抓取到 1 篇妙记, 实际: %d", len(recs))
+	}
+	r := recs[0]
+	if r.Kind != "minutes" || r.ID != "min123" {
+		t.Fatalf("妙记记录属性错误: %+v", r)
+	}
+	if len(r.Attachments) != 1 || r.Attachments[0].Name != "制造中心项目讨论.md" {
+		t.Fatalf("妙记附件名错误: %+v", r.Attachments)
+	}
+
+	// 验证 FetchAttachment 导出的 Markdown 结构
+	rc, err := c.FetchAttachment(context.Background(), &r.Attachments[0])
+	if err != nil {
+		t.Fatalf("FetchAttachment 失败: %v", err)
+	}
+	data, _ := io.ReadAll(rc)
+	rc.Close()
+	text := string(data)
+	if !strings.Contains(text, "制造中心项目讨论") || !strings.Contains(text, "逐字稿与发言记录") {
+		t.Fatalf("妙记 Markdown 结构不完整: %s", text)
+	}
+}
+
+func TestMailAttachmentsSync(t *testing.T) {
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_u", AccessToken: "ut_mail", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+
+	baseAPI := newMockAPI()
+	baseAPI.roots["ut_mail"] = "root_mail"
+
+	api := &mockMinutesAndMailAPI{
+		mockAPI: baseAPI,
+		mails: []feishuapi.MailMessage{
+			{MessageID: "msg_m1", Subject: "采购合同确认", HasAttachments: true, CreatedTime: 1700000000000},
+		},
+		mailAtts: []feishuapi.MailAttachment{
+			{ID: "att_1", Name: "采购合同.pdf", Size: 1024},
+		},
+	}
+
+	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("应抓取到 1 封含附件邮件, 实际: %d", len(recs))
+	}
+	r := recs[0]
+	if r.Kind != "mail" || len(r.Attachments) != 1 || r.Attachments[0].Name != "采购合同.pdf" {
+		t.Fatalf("邮件记录附件属性错误: %+v", r)
+	}
+
+	rc, err := c.FetchAttachment(context.Background(), &r.Attachments[0])
+	if err != nil {
+		t.Fatalf("FetchAttachment 失败: %v", err)
+	}
+	data, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(data) != "邮件合同PDF字节" {
+		t.Fatalf("下载内容不符合预期: %s", string(data))
+	}
+}
+
+

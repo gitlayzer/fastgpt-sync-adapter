@@ -53,6 +53,7 @@ var sourceLabel = map[string]string{
 type FS interface {
 	UploadBytes(filename, destDir string, data []byte) error
 	Download(filePath string) (io.ReadCloser, error)
+	Delete(filePath string) error
 }
 
 type Sink struct {
@@ -231,14 +232,34 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 		add(r.SenderID) // 解析失败兜底：至少写发送者目录
 	}
 
-	nameOf := func(uid string) string {
-		if s.ids == nil {
-			return uid
+		nameOf := func(uid string) string {
+			if s.ids == nil {
+				return uid
+			}
+			return s.ids.PersonName(r.Source, uid)
 		}
-		return s.ids.PersonName(r.Source, uid)
-	}
 
-	var firstErr error
+		// 飞书云端删除事件：同步清理 NAS 物理文件
+		if r.Kind == "delete" {
+			for _, uid := range users {
+				person := sanitize(nameOf(uid))
+				if person == "" {
+					continue
+				}
+				base := path.Join(s.cfg.RootPath, person, platform)
+				for _, a := range r.Attachments {
+					targetFile := path.Join(base, sanitize(a.Name))
+					if err := s.fs.Delete(targetFile); err != nil {
+						log.Printf("[nas] 删除 NAS 文件失败 %s: %v", targetFile, err)
+					} else {
+						log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s", targetFile)
+					}
+				}
+			}
+			return nil
+		}
+
+		var firstErr error
 	for _, uid := range users {
 		if ctx.Err() != nil {
 			return ctx.Err() // 停止信号：剩余用户目录由下轮（消息去重保证幂等）补齐
@@ -495,15 +516,21 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 			}
 			continue
 		}
-		// 同名文件直接覆盖（飞书侧改名会留下旧文件，属预期外情况，这里不做清理）
-		if err := s.fs.UploadBytes(sanitize(a.Name), base, data); err != nil {
-			log.Printf("[nas] 飞书文件上传失败 %s: %v", a.Name, err)
-			if firstErr == nil {
-				firstErr = err
+			// 归档目标目录：智能纪要存入 base/智能纪要/，邮件附件存入 base/邮件/，普通文档平铺在 base/
+			destDir := base
+			if r.Kind == "minutes" {
+				destDir = path.Join(base, "智能纪要")
+			} else if r.Kind == "mail" {
+				destDir = path.Join(base, "邮件")
 			}
-			continue
-		}
-		log.Printf("[nas] 已归档 %s/%s（%.1f KB）", base, a.Name, float64(len(data))/1024)
+			if err := s.fs.UploadBytes(sanitize(a.Name), destDir, data); err != nil {
+				log.Printf("[nas] 飞书文件上传失败 %s: %v", a.Name, err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			log.Printf("[nas] 已归档 %s/%s（%.1f KB）", destDir, a.Name, float64(len(data))/1024)
 	}
 	return firstErr
 }

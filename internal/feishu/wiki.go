@@ -30,12 +30,14 @@ type WikiNode struct {
 	HasChild   bool   `json:"has_child"`
 	NodeType   string `json:"node_type"` // origin / shortcut
 
-	// NodeCreateTime / NodeEditTime 是节点自身的创建/编辑时间（秒级字符串）。
-	// 没有文档级的「内容修改时间」，用节点编辑时间做变更判断已经够用：
-	// 文档正文改动会刷新节点 edit_time。
-	NodeCreateTime string `json:"node_create_time"`
-	NodeEditTime   string `json:"node_edit_time"`
-}
+		// NodeCreateTime / NodeEditTime 是节点自身的创建/编辑时间（秒级字符串）。
+		// 没有文档级的「内容修改时间」，用节点编辑时间做变更判断已经够用：
+		// 文档正文改动会刷新节点 edit_time。
+		NodeCreateTime string `json:"node_create_time"`
+		NodeEditTime   string `json:"node_edit_time"`
+		Creator        string `json:"creator"` // 节点创建人（open_id）
+		Owner          string `json:"owner"`   // 节点归属人（open_id）
+	}
 
 // ListWikiSpaces 列出调用者可访问的知识库空间（自动翻页）。
 func (c *Client) ListWikiSpaces(token string) ([]WikiSpace, error) {

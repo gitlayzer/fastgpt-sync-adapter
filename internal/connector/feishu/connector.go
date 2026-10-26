@@ -47,6 +47,18 @@ type API interface {
 	// raw_content 只有纯文本会丢图片与样式，导出才能拿到完整源文件。
 	ExportFile(tok, token, docType string) (string, error)
 	DownloadExport(tok, fileToken string) (io.ReadCloser, error)
+
+	// 搜索全库文档（包含他人“与我共享”的散落文档）
+	SearchDocs(userToken, searchKey string, offset, count int) ([]feishuapi.SearchDocEntity, error)
+
+	// 妙记/智能纪要接口
+	SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error)
+	DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error)
+
+	// 邮箱邮件与附件接口
+	ListMailboxMessages(userToken string, pageSize int) ([]feishuapi.MailMessage, error)
+	ListMailAttachments(userToken, messageID string) ([]feishuapi.MailAttachment, error)
+	DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error)
 }
 
 // 限流：drive 下载约 5 QPS，FetchAttachment 前统一减速。
@@ -294,12 +306,138 @@ func (c *Connector) scan(ctx context.Context) error {
 					log.Printf("[feishu] 知识库 %s：%d 篇", sid, n)
 				}
 			}
-			log.Printf("[feishu] %s 知识库：%d 个空间，%d 篇文档", g.ExternalUserID, len(seenSpace), total)
+				log.Printf("[feishu] %s 知识库：%d 个空间，%d 篇文档", g.ExternalUserID, len(seenSpace), total)
+
+				// c) 搜索与我共享及散落文档（覆盖他人所有但共享给当前 Viewer 的文档）
+				searchKeys := []string{"1", "2", "a", "e", "文档", "合同", "方案", "表"}
+				searchCount := 0
+				for _, key := range searchKeys {
+					entities, err := c.api.SearchDocs(g.AccessToken, key, 0, 50)
+					if err != nil {
+						continue
+					}
+					for _, d := range entities {
+						if d.Token == "" {
+							continue
+						}
+						f := feishuapi.DriveFile{
+							Token:   d.Token,
+							Name:    d.Title,
+							Type:    d.Type,
+							OwnerID: d.OwnerID,
+						}
+						// docToRecord 自动将 [OwnerID, ViewerID] 全写入 OwnerIDs
+						c.collect(docToRecord(f, g.ExternalUserID), seen)
+						searchCount++
+					}
+				}
+				if searchCount > 0 {
+					log.Printf("[feishu] %s 与我共享及搜索扫描命中 %d 篇条目", g.ExternalUserID, searchCount)
+				}
+
+				// d) 智能纪要/妙记扫描
+				minutesList, err := c.api.SearchMinutes(g.AccessToken)
+				if err == nil && len(minutesList) > 0 {
+					for _, m := range minutesList {
+						if m.MinuteToken == "" {
+							continue
+						}
+						title := m.Title
+						if title == "" {
+							title = "未命名智能纪要"
+						}
+						rec := model.Record{
+							Source:    "feishu",
+							Kind:      "minutes",
+							ID:        m.MinuteToken,
+							Timestamp: m.CreateTime,
+							OwnerIDs:  []string{m.OwnerID, g.ExternalUserID},
+							SenderID:  m.OwnerID,
+							Attachments: []model.Attachment{{
+								Name:   title + ".md",
+								FileID: "minutes:" + m.MinuteToken,
+							}},
+						}
+						c.collect(rec, seen)
+					}
+					log.Printf("[feishu] %s 扫描到 %d 篇智能纪要/妙记", g.ExternalUserID, len(minutesList))
+				}
+
+				// e) 邮箱邮件附件扫描
+				mailMsgs, err := c.api.ListMailboxMessages(g.AccessToken, 50)
+				if err == nil && len(mailMsgs) > 0 {
+					mailCount := 0
+					for _, msg := range mailMsgs {
+						if !msg.HasAttachments || msg.MessageID == "" {
+							continue
+						}
+						atts, err := c.api.ListMailAttachments(g.AccessToken, msg.MessageID)
+						if err != nil || len(atts) == 0 {
+							continue
+						}
+						var recordAtts []model.Attachment
+						for _, ma := range atts {
+							if ma.ID == "" || ma.Name == "" {
+								continue
+							}
+							recordAtts = append(recordAtts, model.Attachment{
+								Name:   ma.Name,
+								FileID: "mail:" + msg.MessageID + ":" + ma.ID,
+								Size:   ma.Size,
+							})
+						}
+						if len(recordAtts) > 0 {
+							rec := model.Record{
+								Source:      "feishu",
+								Kind:        "mail",
+								ID:          "mail_" + msg.MessageID,
+								Timestamp:   msg.CreatedTime,
+								OwnerIDs:    []string{g.ExternalUserID},
+								SenderID:    g.ExternalUserID,
+								Attachments: recordAtts,
+							}
+							c.collect(rec, seen)
+							mailCount++
+						}
+					}
+					if mailCount > 0 {
+						log.Printf("[feishu] %s 扫描到 %d 封含附件邮件", g.ExternalUserID, mailCount)
+					}
+				}
+			}
 		}
+
+		// 差集检测：在全量扫描结束后，检查历史已同步但在本轮消失的文档（飞书端已删除或权限收回）
+		if c.store != nil && len(seen) > 0 {
+			historyDocs, err := c.store.ListDocStates()
+			if err == nil {
+				for _, d := range historyDocs {
+					if !seen[d.Token] {
+						log.Printf("[feishu] 检测到云端文档已删除/移出: %s (%s)", d.Title, d.Token)
+						delRec := model.Record{
+							Source:   "feishu",
+							Kind:     "delete",
+							ID:       d.Token,
+							SenderID: d.OwnerID,
+							OwnerIDs: []string{d.OwnerID},
+							Attachments: []model.Attachment{{
+								Name: d.Title,
+							}},
+						}
+						c.pending = append(c.pending, delRec)
+						c.pendingMeta[d.Token] = pendingDoc{
+							title:    d.Title,
+							ownerID:  d.OwnerID,
+							isDelete: true,
+						}
+					}
+				}
+			}
+		}
+
+		log.Printf("[feishu] 扫描完成，待产出 %d 篇", len(c.pending))
+		return nil
 	}
-	log.Printf("[feishu] 扫描完成，待产出 %d 篇", len(c.pending))
-	return nil
-}
 
 // wikiNodeToRecord wiki 节点 → Record。
 //
@@ -330,12 +468,16 @@ func wikiNodeToRecord(n feishuapi.WikiNode, viewerID string) (model.Record, bool
 	if f.ModifiedTime == "" {
 		f.ModifiedTime = n.NodeCreateTime
 	}
-	// wiki 节点不返回文档 owner，用授权人自己作为归属人：
-	// 这批文档是通过他的授权才可见的，归到他名下符合业务预期。
-	if viewerID != "" {
-		f.OwnerID = viewerID
-	}
-	return docToRecord(f, viewerID), true
+		// wiki 节点优先取 owner，次选 creator；仍为空时以当前授权查看人兜底
+		ownerID := n.Owner
+		if ownerID == "" {
+			ownerID = n.Creator
+		}
+		if ownerID == "" {
+			ownerID = viewerID
+		}
+		f.OwnerID = ownerID
+		return docToRecord(f, viewerID), true
 }
 
 // collect 变更检测 + 入队（同 token 只入一次）。
@@ -367,6 +509,7 @@ type pendingDoc struct {
 	title    string
 	ownerID  string
 	editTime int64
+	isDelete bool
 }
 
 // Ack 实现 connector.AckConnector：Sink 写入成功后记录变更检测状态。
@@ -376,6 +519,9 @@ func (c *Connector) Ack(recordID string) error {
 		return nil // 非本连接器产出的记录，忽略
 	}
 	delete(c.pendingMeta, recordID)
+	if meta.isDelete {
+		return c.store.DeleteDocState(recordID)
+	}
 	return c.store.UpsertDocState(recordID, meta.title, meta.ownerID, meta.editTime)
 }
 
@@ -429,6 +575,29 @@ func (c *Connector) FetchAttachment(ctx context.Context, a *model.Attachment) (i
 		case r := <-ch:
 			return r.rc, r.err
 		}
+	case "minutes":
+		rc, err := c.api.DownloadMinutesTranscript(tok, token)
+		if err != nil {
+			return nil, err
+		}
+		raw, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		var buf strings.Builder
+		buf.WriteString("# " + strings.TrimSuffix(a.Name, ".md") + "\n\n")
+		buf.WriteString("> 来源：飞书智能会议纪要 / 妙记\n\n")
+		buf.WriteString("## 逐字稿与发言记录\n\n")
+		buf.Write(raw)
+		return io.NopCloser(strings.NewReader(buf.String())), nil
+	case "mail":
+		// fileID 格式为 mail:<messageID>:<attachmentID>
+		parts := strings.Split(token, ":")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("非法邮件附件标识: %s", token)
+		}
+		return c.api.DownloadMailAttachment(tok, parts[0], parts[1])
 	}
 	return nil, fmt.Errorf("暂不支持的文档类型: %s", scheme)
 }

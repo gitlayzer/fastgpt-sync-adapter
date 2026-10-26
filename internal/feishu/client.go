@@ -22,7 +22,7 @@ type Client struct {
 }
 
 func New(appID, appSecret string) *Client {
-	return &Client{AppID: appID, AppSecret: appSecret, HTTP: &http.Client{Timeout: 20 * time.Second}}
+	return &Client{AppID: appID, AppSecret: appSecret, HTTP: &http.Client{Timeout: 180 * time.Second}}
 }
 
 // apiResp 飞书通用响应。

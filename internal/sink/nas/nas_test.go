@@ -36,6 +36,11 @@ func (f *fakeFS) Download(p string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader(string(data))), nil
 }
 
+func (f *fakeFS) Delete(p string) error {
+	delete(f.files, p)
+	return nil
+}
+
 type fakeResolver struct{ names map[string]string }
 
 func (r fakeResolver) PersonName(source, id string) string {
@@ -331,5 +336,31 @@ func TestDailyChunkingHeaders(t *testing.T) {
 		t.Fatalf("跨天分段顺序不正确:\n%s", content)
 	}
 }
+
+func TestNASDeletesFileOnCloudDelete(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	// 模拟已存在的文件
+	path1 := "/FastGPT-test/张三/飞书/旧文档.docx"
+	fs.files[path1] = []byte("内容")
+
+	delRec := model.Record{
+		Source:   "feishu",
+		Kind:     "delete",
+		ID:       "doc_del",
+		OwnerIDs: []string{"u1"}, // 张三
+		Attachments: []model.Attachment{{
+			Name: "旧文档.docx",
+		}},
+	}
+
+	if err := s.WriteRecord(context.Background(), delRec, nil); err != nil {
+		t.Fatalf("WriteRecord delete: %v", err)
+	}
+
+	if _, exists := fs.files[path1]; exists {
+		t.Fatalf("云端删除后，NAS 对应文件应被清理删除")
+	}
+}
+
 
 

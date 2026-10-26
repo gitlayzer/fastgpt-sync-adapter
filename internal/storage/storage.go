@@ -327,6 +327,39 @@ func (s *Store) ListRoomParticipants(roomID string) ([]string, error) {
 	return out, rows.Err()
 }
 
+// DocState 飞书文档状态记录。
+type DocState struct {
+	Token    string
+	EditTime int64
+	Title    string
+	OwnerID  string
+}
+
+// ListDocStates 列出所有历史已同步的飞书文档记录。
+func (s *Store) ListDocStates() ([]DocState, error) {
+	rows, err := s.db.Query(`SELECT token, edit_time, title, owner_id FROM feishu_doc_state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []DocState
+	for rows.Next() {
+		var d DocState
+		if err := rows.Scan(&d.Token, &d.EditTime, &d.Title, &d.OwnerID); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeleteDocState 删除某篇文档的同步状态记录。
+func (s *Store) DeleteDocState(token string) error {
+	_, err := s.db.Exec(`DELETE FROM feishu_doc_state WHERE token=?`, token)
+	return err
+}
+
 // GetDocEditTime 返回已记录的文档修改时间（秒）；未见过返回 0。
 func (s *Store) GetDocEditTime(token string) int64 {
 	var v int64

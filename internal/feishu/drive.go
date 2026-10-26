@@ -198,3 +198,32 @@ func UnixSeconds(s string) int64 {
 
 // NowUnix 当前秒级时间戳。
 func NowUnix() int64 { return time.Now().Unix() }
+
+// SearchDocEntity 搜索返回的云文档条目。
+type SearchDocEntity struct {
+	Token     string `json:"docs_token"`
+	Type      string `json:"docs_type"`
+	Title     string `json:"title"`
+	OwnerID   string `json:"owner_id"`
+	OwnerName string `json:"owner_name"`
+}
+
+// SearchDocs 搜索用户有权访问的云文档（包含“与我共享”的散落文件）。
+func (c *Client) SearchDocs(userToken, searchKey string, offset, count int) ([]SearchDocEntity, error) {
+	body := map[string]any{
+		"search_key": searchKey,
+		"offset":     offset,
+		"count":      count,
+	}
+	var out struct {
+		apiResp
+		Data struct {
+			DocsEntities []SearchDocEntity `json:"docs_entities"`
+			Total        int               `json:"total"`
+		} `json:"data"`
+	}
+	if err := c.postJSON(baseURL+"/suite/docs-api/search/object", body, userToken, &out); err != nil {
+		return nil, err
+	}
+	return out.Data.DocsEntities, nil
+}

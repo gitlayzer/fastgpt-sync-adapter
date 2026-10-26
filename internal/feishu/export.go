@@ -22,7 +22,7 @@ import (
 const (
 	exportStatusDone  = 0
 	exportStatusFail  = 3
-	exportPollTimes   = 30                      // 最多轮询次数
+	exportPollTimes   = 60                      // 最多轮询次数（120秒，适应大表格导出）
 	exportPollEvery   = 2 * time.Second         // 轮询间隔
 )
 

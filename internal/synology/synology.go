@@ -336,6 +336,26 @@ func (c *Client) MkdirAll(fullPath string) error {
 	return nil
 }
 
+// Delete 删除 NAS 上的文件或目录（调用 SYNO.FileStation.Delete）。
+// targetPath 必须为 NAS 上的绝对路径。文件不存在时视为成功（幂等）。
+func (c *Client) Delete(targetPath string) error {
+	pathJSON, _ := json.Marshal([]string{targetPath})
+
+	params := url.Values{}
+	params.Set("version", "2")
+	params.Set("path", string(pathJSON))
+	_, err := c.apiCall("SYNO.FileStation.Delete", "start", params)
+	if err != nil {
+		errStr := err.Error()
+		// code 408 / 900 / 1002 等表示文件已不存在，视为成功
+		if strings.Contains(errStr, "code=408") || strings.Contains(errStr, "code=900") || strings.Contains(errStr, "code=1002") {
+			return nil
+		}
+		return fmt.Errorf("删除 NAS 文件 %s: %w", targetPath, err)
+	}
+	return nil
+}
+
 // UploadFile 上传本地文件到 NAS 的 destDir 目录。
 func (c *Client) UploadFile(localPath, destDir string) error {
 	data, err := os.ReadFile(localPath)
