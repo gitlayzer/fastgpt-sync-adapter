@@ -93,10 +93,14 @@ func (b *Backend) findByID(dir, id string, depth int) (*store.Node, error) {
 	return nil, nil
 }
 
-// Children 列直接子节点（隐藏 .meta.json 与被冻结的文件）。
+// Children 列子节点。
+// 如果是根目录（parentID == "" 或 rootID），返回员工目录列表（folder）。
+// 如果是员工目录（或员工下的子目录），在 API 层做虚拟平铺展开：递归收集该员工名下的所有真实文件并直接返回（file），
+// 彻底解决 FastGPT 无法联级勾选下载子目录文件的限制，而在 NAS 物理层依然完整保持规范的日期与会话目录结构。
 func (b *Backend) Children(parentID string) ([]*store.Node, error) {
 	dir := b.root
-	if parentID != "" && parentID != b.rootID() {
+	isRoot := parentID == "" || parentID == b.rootID()
+	if !isRoot {
 		parent, err := b.Get(parentID)
 		if err != nil {
 			return nil, err
@@ -105,6 +109,46 @@ func (b *Backend) Children(parentID string) ([]*store.Node, error) {
 			return nil, fmt.Errorf("parent is not a folder: %s", parentID)
 		}
 		dir = parent.AbsPath()
+	}
+
+	// 根目录：只返回第一层（员工目录 + 共享文件夹）
+	if isRoot {
+		entries, err := b.client.List(dir)
+		if err != nil {
+			return nil, err
+		}
+		frozen := b.frozenSet(entries)
+		var out []*store.Node
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name, ".meta.json") || frozen[e.Name] {
+				continue
+			}
+			out = append(out, b.nodeFrom(e))
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Type != out[j].Type {
+				return out[i].Type == "folder"
+			}
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		})
+		return out, nil
+	}
+
+	// 员工目录或更深层：API 层虚拟递归平铺，把深层的所有真实文件直接展现给 FastGPT，支持一键全选导入
+	out, err := b.collectFilesRecursively(dir, parentID, "", 6)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
+	return out, nil
+}
+
+// collectFilesRecursively 递归收集 dir 下的所有具体文件（隐藏 .meta.json 与被冻结文件）。
+func (b *Backend) collectFilesRecursively(dir string, parentID string, basePrefix string, depth int) ([]*store.Node, error) {
+	if depth <= 0 {
+		return nil, nil
 	}
 	entries, err := b.client.List(dir)
 	if err != nil {
@@ -116,14 +160,27 @@ func (b *Backend) Children(parentID string) ([]*store.Node, error) {
 		if strings.HasSuffix(e.Name, ".meta.json") || frozen[e.Name] {
 			continue
 		}
-		out = append(out, b.nodeFrom(e))
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Type != out[j].Type {
-			return out[i].Type == "folder"
+		if e.IsDir {
+			subPrefix := e.Name
+			if basePrefix != "" {
+				subPrefix = basePrefix + "/" + e.Name
+			}
+			children, err := b.collectFilesRecursively(e.Path, parentID, subPrefix, depth-1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, children...)
+		} else {
+			displayName := e.Name
+			if basePrefix != "" {
+				displayName = basePrefix + "/" + e.Name
+			}
+			rel := b.relOf(e.Path)
+			pid := parentID
+			node := store.NewExternalNode(store.HashID(rel), &pid, displayName, "file", e.MTime, e.Path)
+			out = append(out, node)
 		}
-		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
-	})
+	}
 	return out, nil
 }
 
