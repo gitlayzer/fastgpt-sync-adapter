@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
 	"strings"
 
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/store"
@@ -28,12 +30,15 @@ type Backend interface {
 	Search(key string) ([]*store.Node, error)
 	// Open 打开文件字节流（previewUrl 下载的最终数据源）。
 	Open(n *store.Node) (io.ReadCloser, error)
+	// OpenPath 按文件绝对路径直接打开字节流。
+	OpenPath(filePath string) (io.ReadCloser, error)
 }
 
 // LocalBackend 本地目录后端（包装 store.Store 补上 Open）。
 type LocalBackend struct{ *store.Store }
 
 func (l LocalBackend) Open(n *store.Node) (io.ReadCloser, error) { return l.Store.Open(n) }
+func (l LocalBackend) OpenPath(filePath string) (io.ReadCloser, error) { return os.Open(filePath) }
 
 // FastGPT 统一响应格式
 type resp struct {
@@ -182,79 +187,111 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "node is not a file")
 		return
 	}
-	log.Printf("[server] GET /v1/file/content id=%q (%s) -> 生成 previewUrl (来自 %s)", id, node.Name, r.RemoteAddr)
-	writeOK(w, map[string]string{
-		"title":      node.Name,
-		"previewUrl": s.fileURL(r, id),
-	})
-}
+		log.Printf("[server] GET /v1/file/content id=%q (%s) -> 生成 previewUrl (来自 %s)", id, node.Name, r.RemoteAddr)
+		writeOK(w, map[string]string{
+			"title":      node.Name,
+			"previewUrl": s.fileURL(r, id),
+			"dirPath":    path.Dir(node.AbsPath()),
+		})
+	}
 
-// GET /v1/file/read?id=xx  返回原文访问链接
-func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		writeErr(w, http.StatusBadRequest, "missing id")
-		return
+	// GET /v1/file/read?id=xx  返回原文访问链接
+	func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "missing id")
+			return
+		}
+		if _, err := s.backend.Get(id); err != nil {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeOK(w, map[string]string{
+			"url": s.fileURL(r, id),
+		})
 	}
-	if _, err := s.backend.Get(id); err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
-		return
-	}
-	writeOK(w, map[string]string{
-		"url": s.fileURL(r, id),
-	})
-}
 
-// GET /v1/file/detail?id=xx
-func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		writeErr(w, http.StatusBadRequest, "missing id")
-		return
+	// GET /v1/file/detail?id=xx
+	func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "missing id")
+			return
+		}
+		node, err := s.backend.Get(id)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeOK(w, node)
 	}
-	node, err := s.backend.Get(id)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
-		return
-	}
-	writeOK(w, node)
-}
 
-// GET /v1/file/download?id=xx&token=xx  原样返回文件字节流（供 previewUrl/read 使用）
-func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		writeErr(w, http.StatusBadRequest, "missing id")
-		return
+	// GET /v1/file/download?id=xx&token=xx 或 ?path=xx&token=xx  原样返回文件字节流（供 previewUrl/read/图片 使用）
+	func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		rawPath := r.URL.Query().Get("path")
+		var rc io.ReadCloser
+		var fileName string
+		var err error
+
+		if id != "" {
+			node, err := s.backend.Get(id)
+			if err != nil {
+				writeErr(w, http.StatusNotFound, err.Error())
+				return
+			}
+			if node.Type != "file" {
+				writeErr(w, http.StatusBadRequest, "node is not a file")
+				return
+			}
+			fileName = node.Name
+			log.Printf("[server] ⬇️ GET /v1/file/download 开始下载: %q (%s, 来自 %s)", node.Name, id, r.RemoteAddr)
+			rc, err = s.backend.Open(node)
+			if err != nil {
+				writeErr(w, http.StatusBadGateway, "open file: "+err.Error())
+				return
+			}
+		} else if rawPath != "" {
+			fileName = path.Base(rawPath)
+			log.Printf("[server] ⬇️ GET /v1/file/download 按路径下载: %q (来自 %s)", rawPath, r.RemoteAddr)
+			rc, err = s.backend.OpenPath(rawPath)
+			if err != nil {
+				writeErr(w, http.StatusNotFound, "open path: "+err.Error())
+				return
+			}
+		} else {
+			writeErr(w, http.StatusBadRequest, "missing id or path")
+			return
+		}
+		defer rc.Close()
+
+		ext := strings.ToLower(path.Ext(fileName))
+		switch ext {
+		case ".jpg", ".jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+		case ".png":
+			w.Header().Set("Content-Type", "image/png")
+		case ".gif":
+			w.Header().Set("Content-Type", "image/gif")
+		case ".webp":
+			w.Header().Set("Content-Type", "image/webp")
+		case ".pdf":
+			w.Header().Set("Content-Type", "application/pdf")
+		case ".md", ".txt":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		case ".json":
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		}
+
+		encoded := url.PathEscape(fileName)
+		w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+encoded)
+		n, err := io.Copy(w, rc)
+		if err != nil {
+			log.Printf("[server] ⚠️ GET /v1/file/download 传输中断: %q: %v", fileName, err)
+			return
+		}
+		log.Printf("[server] ✅ GET /v1/file/download 下载完成: %q (已传输 %.1f KB)", fileName, float64(n)/1024)
 	}
-	node, err := s.backend.Get(id)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
-		return
-	}
-	if node.Type != "file" {
-		writeErr(w, http.StatusBadRequest, "node is not a file")
-		return
-	}
-	// inline 而非 attachment：浏览器可直接预览 PDF/图片/文本等，
-	// 不支持预览的格式（如 docx）仍会自动下载；对 FastGPT 抓取无影响（它只读字节流）。
-	// 中文文件名按 RFC 5987 编码，保证 FastGPT/浏览器正确解析文件名。
-	encoded := url.PathEscape(node.Name)
-	w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+encoded)
-	log.Printf("[server] ⬇️ GET /v1/file/download 开始下载: %q (%s, 来自 %s)", node.Name, id, r.RemoteAddr)
-	rc, err := s.backend.Open(node)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "open file: "+err.Error())
-		return
-	}
-	defer rc.Close()
-	n, err := io.Copy(w, rc)
-	if err != nil {
-		log.Printf("[server] ⚠️ GET /v1/file/download 传输中断: %q: %v", node.Name, err)
-		return
-	}
-	log.Printf("[server] ✅ GET /v1/file/download 下载完成: %q (已传输 %.1f KB)", node.Name, float64(n)/1024)
-}
 
 func writeOK(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -476,7 +513,11 @@ async function handleItemClick(id, name, type) {
     dl.href = previewUrl;
 
     const lower = name.toLowerCase();
-    if (lower.endsWith('.md') || lower.endsWith('.txt') || lower.endsWith('.json')) {
+    if (lower.endsWith('.md')) {
+      const fileRes = await fetch(previewUrl);
+      const text = await fileRes.text();
+      content.innerHTML = renderMarkdown(text, data.data.dirPath);
+    } else if (lower.endsWith('.txt') || lower.endsWith('.json')) {
       const fileRes = await fetch(previewUrl);
       const text = await fileRes.text();
       content.innerText = text;
@@ -488,6 +529,45 @@ async function handleItemClick(id, name, type) {
   } catch (err) {
     content.innerText = '读取失败: ' + err.message;
   }
+}
+
+function renderMarkdown(md, dirPath) {
+  const lines = md.split('\n');
+  let html = '<div style="line-height:1.7;color:#1e293b;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;">';
+  for (let rawLine of lines) {
+    let line = rawLine.trim();
+    if (!line) {
+      html += '<div style="height:6px;"></div>';
+      continue;
+    }
+    if (line.startsWith('# ')) {
+      html += '<h2 style="font-size:18px;font-weight:700;margin:16px 0 8px;padding-bottom:6px;border-bottom:1px solid #e2e8f0;color:#0f172a;">' + escapeHtml(line.slice(2)) + '</h2>';
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      html += '<div style="display:inline-block;background:#e0f2fe;color:#0369a1;font-size:12px;font-weight:600;padding:2px 8px;border-radius:4px;margin:12px 0 6px;">' + escapeHtml(line.slice(3)) + '</div>';
+      continue;
+    }
+    let escaped = escapeHtml(line);
+    // 渲染相对路径图片 ![图片](images/...)
+    escaped = escaped.replace(/!\[图片\]\((images\/[^)]+)\)/g, function(_, imgRel) {
+      const fullImgPath = (dirPath ? dirPath + '/' : '') + imgRel;
+      const imgSrc = '/v1/file/download?path=' + encodeURIComponent(fullImgPath) + '&token=' + encodeURIComponent(token);
+      return '<div style="margin:8px 0;"><a href="' + imgSrc + '" target="_blank" title="点击查看大图"><img src="' + imgSrc + '" alt="图片" style="max-width:380px;max-height:300px;border-radius:6px;border:1px solid #cbd5e1;box-shadow:0 1px 3px rgba(0,0,0,0.08);cursor:zoom-in;display:block;" loading="lazy" onerror="this.onerror=null;this.parentNode.innerHTML=\'<span style=\\\'color:#ef4444;font-size:12px;\\\'>[图片已过期或未找到]</span>\';" /></a></div>';
+    });
+    // 渲染超链接 [链接：...](...)
+    escaped = escaped.replace(/\[链接：([^\]]+)\]\(([^)]*)\)/g, function(_, title, url) {
+      if (!url) return '<span style="color:#2563eb;font-weight:500;">[链接：' + title + ']</span>';
+      return '<a href="' + url + '" target="_blank" style="color:#2563eb;text-decoration:underline;font-weight:500;">[链接：' + title + '] ↗</a>';
+    });
+    // 渲染加粗 **...**
+    escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // 渲染斜体 *...*
+    escaped = escaped.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    html += '<div style="margin:4px 0;font-size:13px;">' + escaped + '</div>';
+  }
+  html += '</div>';
+  return html;
 }
 
 function escapeHtml(s) {

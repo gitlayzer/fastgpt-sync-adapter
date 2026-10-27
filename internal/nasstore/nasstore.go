@@ -247,3 +247,8 @@ func (b *Backend) frozenSet(entries []synology.FileEntry) map[string]bool {
 func (b *Backend) Open(n *store.Node) (io.ReadCloser, error) {
 	return b.client.Download(n.AbsPath())
 }
+
+// OpenPath 按 NAS 绝对路径直接下载文件字节流。
+func (b *Backend) OpenPath(filePath string) (io.ReadCloser, error) {
+	return b.client.Download(filePath)
+}
