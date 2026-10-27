@@ -89,7 +89,7 @@ func (c *Client) ListFolderChildren(token, folderToken string) ([]DriveFile, err
 			Data struct {
 				Files     []DriveFile `json:"files"`
 				HasMore   bool        `json:"has_more"`
-				PageToken string      `json:"page_token"`
+				PageToken string      `json:"next_page_token"` // 该接口的翻页字段是 next_page_token，不是 page_token
 			} `json:"data"`
 		}
 		if err := c.get("/drive/v1/files", token, q, &out); err != nil {
@@ -98,6 +98,10 @@ func (c *Client) ListFolderChildren(token, folderToken string) ([]DriveFile, err
 		all = append(all, out.Data.Files...)
 		if !out.Data.HasMore {
 			return all, nil
+		}
+		// 还有下一页却没给翻页标记：报错而不是返回半截列表，否则没列到的文档会被当成已删除
+		if out.Data.PageToken == "" {
+			return nil, fmt.Errorf("列文件夹 %s：has_more=true 但没有 next_page_token", folderToken)
 		}
 		pageToken = out.Data.PageToken
 	}
