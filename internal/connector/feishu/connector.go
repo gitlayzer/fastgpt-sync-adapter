@@ -186,9 +186,6 @@ func attachmentName(f feishuapi.DriveFile) string {
 	}
 	base := name
 	ext := path.Ext(base)
-	if ext != "" {
-		base = strings.TrimSuffix(base, ext)
-	}
 
 	targetExt := ext
 	switch f.Type {
@@ -198,6 +195,15 @@ func attachmentName(f feishuapi.DriveFile) string {
 		targetExt = ".xlsx"
 	case "slides":
 		targetExt = ".pptx"
+	}
+
+	// 仅当用户在文档标题末尾显式输入了对应扩展名，或属于原始上传文件(file)时才剥离扩展名
+	if f.Type == "file" {
+		if ext != "" {
+			base = strings.TrimSuffix(base, ext)
+		}
+	} else if ext != "" && strings.EqualFold(ext, targetExt) {
+		base = strings.TrimSuffix(base, ext)
 	}
 
 	shortToken := f.Token
@@ -245,14 +251,15 @@ func (c *Connector) scan(ctx context.Context) error {
 
 	// tenant 模式：遍历配置的共享文件夹
 	if (mode == "tenant" || mode == "both") && c.tenantToken != "" {
-		for _, folder := range c.cfg.Folders {
-			err := c.api.WalkFolder(c.tenantToken, folder, 10, func(f feishuapi.DriveFile) {
-				c.collect(st, docToRecord(f, ""), "")
-			})
-			if err != nil {
-				log.Printf("[feishu] 遍历共享文件夹 %s 失败: %v", folder, err)
+			for _, folder := range c.cfg.Folders {
+				err := c.api.WalkFolder(c.tenantToken, folder, 10, func(f feishuapi.DriveFile) {
+					c.collect(st, docToRecord(f, ""), "")
+					st.globalSeen[f.Token] = true
+				})
+				if err != nil {
+					log.Printf("[feishu] 遍历共享文件夹 %s 失败: %v", folder, err)
+				}
 			}
-		}
 	}
 
 	// user 模式：每个已授权用户
@@ -716,9 +723,18 @@ func (c *Connector) emitWrites(st *scanState) {
 				rec.Attachments[i].UserID = w.reader
 			}
 		}
-		if prev != "" && rec.Kind != "mail" && len(rec.Attachments) > 0 {
-			rec.Attachments[0].PrevName = prev
-		}
+			if prev != "" && rec.Kind != "mail" && len(rec.Attachments) > 0 {
+				allHadPrev := true
+				for _, p := range need {
+					if cp, ok := have[p]; !ok || cp.FileName == "" {
+						allHadPrev = false
+						break
+					}
+				}
+				if allHadPrev {
+					rec.Attachments[0].PrevName = prev
+				}
+			}
 		c.pending = append(c.pending, rec)
 
 		// 这里只入队，不写状态：Sink 全部写入成功后由 Ack 逐人记录副本，

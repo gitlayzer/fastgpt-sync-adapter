@@ -248,7 +248,14 @@ func (b *Backend) Open(n *store.Node) (io.ReadCloser, error) {
 	return b.client.Download(n.AbsPath())
 }
 
-// OpenPath 按 NAS 绝对路径直接下载文件字节流。
+// OpenPath 按 NAS 绝对路径直接下载文件字节流（增加防跨目录校验）。
 func (b *Backend) OpenPath(filePath string) (io.ReadCloser, error) {
-	return b.client.Download(filePath)
+	clean := path.Clean("/" + strings.TrimPrefix(filePath, "/"))
+	if !strings.HasPrefix(clean, b.root) {
+		clean = path.Join(b.root, clean)
+	}
+	if !strings.HasPrefix(clean, b.root) {
+		return nil, fmt.Errorf("非法访问路径: %s", filePath)
+	}
+	return b.client.Download(clean)
 }

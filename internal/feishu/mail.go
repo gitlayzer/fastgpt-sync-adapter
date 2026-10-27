@@ -1,6 +1,7 @@
 package feishu
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,9 +36,9 @@ func (c *Client) ListMailboxMessages(userToken string, pageSize int) ([]string, 
 	var out struct {
 		apiResp
 		Data struct {
-			HasMore   bool     `json:"has_more"`
-			PageToken string   `json:"page_token"`
-			Items     []string `json:"items"`
+			HasMore   bool            `json:"has_more"`
+			PageToken string          `json:"page_token"`
+			Items     json.RawMessage `json:"items"`
 		} `json:"data"`
 	}
 	if err := c.getWithToken(u, userToken, &out); err != nil {
@@ -48,7 +49,28 @@ func (c *Client) ListMailboxMessages(userToken string, pageSize int) ([]string, 
 		}
 		return nil, err
 	}
-	return out.Data.Items, nil
+	if len(out.Data.Items) == 0 {
+		return nil, nil
+	}
+	// 兼容支持 []string 数组格式
+	var strIDs []string
+	if err := json.Unmarshal(out.Data.Items, &strIDs); err == nil {
+		return strIDs, nil
+	}
+	// 兼容支持 []struct{ ID string `json:"id"` } 对象数组格式
+	var objIDs []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(out.Data.Items, &objIDs); err == nil {
+		var ids []string
+		for _, o := range objIDs {
+			if o.ID != "" {
+				ids = append(ids, o.ID)
+			}
+		}
+		return ids, nil
+	}
+	return nil, fmt.Errorf("解析邮件列表失败: 无法识别 items 格式")
 }
 
 // GetMailMessage 获取某封邮件的详情与附件清单。

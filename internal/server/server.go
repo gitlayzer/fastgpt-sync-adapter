@@ -2,12 +2,14 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/store"
@@ -38,7 +40,17 @@ type Backend interface {
 type LocalBackend struct{ *store.Store }
 
 func (l LocalBackend) Open(n *store.Node) (io.ReadCloser, error) { return l.Store.Open(n) }
-func (l LocalBackend) OpenPath(filePath string) (io.ReadCloser, error) { return os.Open(filePath) }
+func (l LocalBackend) OpenPath(filePath string) (io.ReadCloser, error) {
+	root := l.Store.Root()
+	clean := filepath.Clean(filePath)
+	if !strings.HasPrefix(clean, root) {
+		clean = filepath.Clean(filepath.Join(root, clean))
+	}
+	if !strings.HasPrefix(clean, root) {
+		return nil, fmt.Errorf("非法访问路径: %s", filePath)
+	}
+	return os.Open(clean)
+}
 
 // FastGPT 统一响应格式
 type resp struct {
@@ -555,10 +567,13 @@ function renderMarkdown(md, dirPath) {
       const imgSrc = '/v1/file/download?path=' + encodeURIComponent(fullImgPath) + '&token=' + encodeURIComponent(token);
       return '<div style="margin:8px 0;"><a href="' + imgSrc + '" target="_blank" title="点击查看大图"><img src="' + imgSrc + '" alt="图片" style="max-width:380px;max-height:300px;border-radius:6px;border:1px solid #cbd5e1;box-shadow:0 1px 3px rgba(0,0,0,0.08);cursor:zoom-in;display:block;" loading="lazy" onerror="this.onerror=null;this.parentNode.innerHTML=\'<span style=\\\'color:#ef4444;font-size:12px;\\\'>[图片已过期或未找到]</span>\';" /></a></div>';
     });
-    // 渲染超链接 [链接：...](...)
+    // 渲染超链接 [链接：...](...)（严格限制为 http/https 协议，防止 javascript: XSS）
     escaped = escaped.replace(/\[链接：([^\]]+)\]\(([^)]*)\)/g, function(_, title, url) {
-      if (!url) return '<span style="color:#2563eb;font-weight:500;">[链接：' + title + ']</span>';
-      return '<a href="' + url + '" target="_blank" style="color:#2563eb;text-decoration:underline;font-weight:500;">[链接：' + title + '] ↗</a>';
+      const trimmed = url.trim();
+      if (!/^https?:\/\//i.test(trimmed)) {
+        return '<span style="color:#2563eb;font-weight:500;">[链接：' + title + ']</span>';
+      }
+      return '<a href="' + encodeURI(trimmed) + '" target="_blank" rel="noopener noreferrer" style="color:#2563eb;text-decoration:underline;font-weight:500;">[链接：' + title + '] ↗</a>';
     });
     // 渲染加粗 **...**
     escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');

@@ -159,11 +159,12 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 			for _, entry := range indexedFiles {
 				if !activePaths[entry.NasPath] && entry.CollectionID != "" {
 					log.Printf("[fastgpt] 检测到 NAS 文件已删除，同步清理 FastGPT 知识库集合: %s (collection: %s)", entry.NasPath, entry.CollectionID)
-					c := t.manager.ClientFor(datasetID)
-					if err := c.DeleteCollection(entry.CollectionID); err != nil {
-						log.Printf("[fastgpt] 删除 FastGPT 集合失败 %s: %v", entry.CollectionID, err)
-					}
-					_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
+						c := t.manager.ClientFor(datasetID)
+						if err := c.DeleteCollection(entry.CollectionID); err != nil {
+							log.Printf("[fastgpt] 删除 FastGPT 集合失败 %s: %v", entry.CollectionID, err)
+						} else {
+							_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
+						}
 				}
 			}
 		}
@@ -271,15 +272,19 @@ func (t *Task) pushFile(ctx context.Context, person, source, category string, f 
 		if category != "会话" {
 			ext := path.Ext(f.Name)
 			base := strings.TrimSuffix(f.Name, ext)
+			// 1) 历史遗留带 <msgid>_ 机器前缀的文件（包含大量数字且长度 > 10）：剥离前缀
+			if idx := strings.Index(base, "_"); idx > 0 {
+				prefix := base[:idx]
+				if strings.ContainsAny(prefix, "0123456789") && len(prefix) > 10 {
+					base = base[idx+1:]
+					display = base + ext
+				}
+			}
+			// 2) 若带有 _<8位Token短码> 后缀（纯字母数字且长度在 6~12 之间）：剥离后缀以展示纯净标题
 			if idx := strings.LastIndex(base, "_"); idx > 0 {
 				suffix := base[idx+1:]
-				if len(suffix) >= 6 && len(suffix) <= 12 {
+				if isAlphanumericToken(suffix) && len(suffix) >= 6 && len(suffix) <= 12 {
 					display = base[:idx] + ext
-				}
-			} else if idx := strings.LastIndex(f.Name, "_"); idx > 0 {
-				prefix := f.Name[:idx]
-				if strings.ContainsAny(prefix, "0123456789") && len(prefix) > 10 {
-					display = f.Name[idx+1:]
 				}
 			}
 		}
@@ -339,12 +344,24 @@ func (t *Task) isFrozen(nasPath string) bool {
 	return m.Frozen
 }
 
-func platformLabel(source string) string {
-	switch source {
-	case "wecom":
-		return "企微"
-	case "feishu":
-		return "飞书"
+	func platformLabel(source string) string {
+		switch source {
+		case "wecom":
+			return "企微"
+		case "feishu":
+			return "飞书"
+		}
+		return source
 	}
-	return source
-}
+
+	func isAlphanumericToken(s string) bool {
+		if s == "" {
+			return false
+		}
+		for _, c := range s {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+				return false
+			}
+		}
+		return true
+	}

@@ -26,6 +26,21 @@ func TestListMailboxMessages(t *testing.T) {
 	}
 }
 
+func TestListMailboxMessagesObjectArray(t *testing.T) {
+	c := New("cli_test", "secret")
+	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {
+		return `{"code":0,"data":{"has_more":false,"items":[{"id":"obj_m1"},{"id":"obj_m2"}]}}`
+	})}
+
+	items, err := c.ListMailboxMessages("ut", 20)
+	if err != nil {
+		t.Fatalf("ListMailboxMessages: %v", err)
+	}
+	if len(items) != 2 || items[0] != "obj_m1" || items[1] != "obj_m2" {
+		t.Fatalf("解析对象数组 items 失败: %v", items)
+	}
+}
+
 func TestListMailboxMessagesUnactivated(t *testing.T) {
 	c := New("cli_test", "secret")
 	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {

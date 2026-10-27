@@ -44,6 +44,11 @@ func (s *Store) RootID() string {
 	return s.idFor(".")
 }
 
+// Root 返回根目录绝对路径。
+func (s *Store) Root() string {
+	return s.root
+}
+
 // idFor 用相对路径生成稳定 id（同一路径恒定）。
 func (s *Store) idFor(rel string) string {
 	h := sha1.Sum([]byte(rel))

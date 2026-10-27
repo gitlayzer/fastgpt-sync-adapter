@@ -247,11 +247,11 @@ func (c *Client) ListPermissionMembers(userToken, token, docType string) ([]Perm
 	var out struct {
 		apiResp
 		Data struct {
-			Items []PermissionMember `json:"items"`
+			Members []PermissionMember `json:"members"`
 		} `json:"data"`
 	}
 	if err := c.get("/drive/v1/permissions/"+token+"/members", userToken, q, &out); err != nil {
 		return nil, err
 	}
-	return out.Data.Items, nil
+	return out.Data.Members, nil
 }
