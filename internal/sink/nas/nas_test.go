@@ -213,10 +213,61 @@ func TestImageAttachmentArchive(t *testing.T) {
 		// 会话 markdown 应包含相对路径出图语法
 		convPath := fmt.Sprintf("/FastGPT-test/%s/企微/群聊记录/与%s的单聊.md", p, map[string]string{"张三": "李四", "李四": "张三"}[p])
 		md := string(fs.files[convPath])
-		expectedImgSyntax := fmt.Sprintf("![图片](images/%s/image_img101.jpg)", dateFolder)
-		if !strings.Contains(md, expectedImgSyntax) {
-			t.Fatalf("%s 会话记录中应包含相对图片链接 %q, 实际: %s", p, expectedImgSyntax, md)
+			expectedImgSyntax := fmt.Sprintf("![图片](images/%s/image_img101.jpg)", dateFolder)
+			if !strings.Contains(md, expectedImgSyntax) {
+				t.Fatalf("%s 会话记录中应包含相对图片链接 %q, 实际: %s", p, expectedImgSyntax, md)
+			}
 		}
+}
+
+func TestOversizedAttachmentSkipped(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	// 设置测试上限为 1MB
+	s.cfg.MaxFileSizeMB = 1
+
+	// 1. 已知 Size 超出上限：不拉取、不落盘
+	rec := dmRecord("m_big", "u1", "u2", "超大文件")
+	rec.Kind = "file"
+	rec.Attachments = []model.Attachment{
+		{Name: "大视频.mp4", FileID: "fid_big", Size: 500 * 1024 * 1024}, // 500MB
+	}
+	readCalled := false
+	read := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
+		readCalled = true
+		return io.NopCloser(strings.NewReader("BIG")), nil
+	}
+	if err := s.WriteRecord(context.Background(), rec, read); err != nil {
+		t.Fatalf("WriteRecord 不应阻断错误: %v", err)
+	}
+	if readCalled {
+		t.Fatalf("超过 1MB 阈值的文件在已知 Size 时不应触发 read")
+	}
+
+	dateFolder := time.UnixMilli(rec.Timestamp).Format("2006-01-02")
+	attPath := fmt.Sprintf("/FastGPT-test/张三/企微/%s/大视频.mp4", dateFolder)
+	if _, ok := fs.files[attPath]; ok {
+		t.Fatalf("超大文件不应上传到 NAS")
+	}
+
+	// 2. 飞书超大文件流式截断防护
+	feishuRec := model.Record{
+		Source: "feishu", Kind: "docx", ID: "doc_huge",
+		OwnerIDs: []string{"u1"}, SenderID: "u1",
+		Attachments: []model.Attachment{
+			{Name: "超大导出版.docx", FileID: "docx:doc_huge", Size: 0}, // 未知 Size
+		},
+	}
+	// 返回 2MB 字节流，超过 1MB 限制
+	hugeData := strings.Repeat("A", 2*1024*1024)
+	readHuge := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(hugeData)), nil
+	}
+	if err := s.WriteRecord(context.Background(), feishuRec, readHuge); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	feishuPath := "/FastGPT-test/张三/飞书/云文档/超大导出版.docx"
+	if _, ok := fs.files[feishuPath]; ok {
+		t.Fatalf("超出流式上限的飞书文件不应落盘 NAS")
 	}
 }
 

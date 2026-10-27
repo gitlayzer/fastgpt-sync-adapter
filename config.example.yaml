@@ -101,6 +101,7 @@ sinks:
     username: ""
     password: ""
     root_path: "/FastGPT-test"             # 必须是 NAS 上已存在的共享文件夹开头
+    max_file_size_mb: 200                  # 单附件上限（MB，默认 200），超出跳过下载以保护内存防 OOM
     # 按 FastGPT 用户列表在 NAS 自动建目录（人工上传区；需账号级 api_key）
     user_dirs:
       enabled: false

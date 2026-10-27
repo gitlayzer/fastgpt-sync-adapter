@@ -37,11 +37,24 @@ import (
 )
 
 type Config struct {
-	URL        string            `yaml:"url"`
-	Username   string            `yaml:"username"`
-	Password   string            `yaml:"password"`
-	RootPath   string            `yaml:"root_path"`   // 落盘根路径，如 /FastGPT-test
-	GroupNames map[string]string `yaml:"group_names"` // 显式配置的群聊 ID -> 群名称映射
+	URL           string            `yaml:"url"`
+	Username      string            `yaml:"username"`
+	Password      string            `yaml:"password"`
+	RootPath      string            `yaml:"root_path"`         // 落盘根路径，如 /FastGPT-test
+	GroupNames    map[string]string `yaml:"group_names"`       // 显式配置的群聊 ID -> 群名称映射
+	MaxFileSizeMB int64             `yaml:"max_file_size_mb"`  // 单附件上限（MB），默认 200MB，防大文件打爆内存 OOM
+}
+
+const defaultMaxFileSizeMB = 200
+
+// ErrOversized 表示文件大小超出上限，跳过以保护内存防 OOM。
+var ErrOversized = errors.New("文件大小超出上限，跳过下载以保护内存")
+
+func (s *Sink) maxFileSize() int64 {
+	if s.cfg.MaxFileSizeMB > 0 {
+		return s.cfg.MaxFileSizeMB * 1024 * 1024
+	}
+	return defaultMaxFileSizeMB * 1024 * 1024
 }
 
 // 平台显示名（目录第二层）。
@@ -173,23 +186,35 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 	m, parseErr := render.Parse(r.Body)
 
 	// 附件字节缓存：一条记录 fan-out 到多人时，同一附件只拉一次（飞书文档 owner+可见人场景省一半下载）
-	attCache := map[string][]byte{}
-	cachedRead := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
-		if data, ok := attCache[a.FileID]; ok {
+		attCache := map[string][]byte{}
+		cachedRead := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
+			if data, ok := attCache[a.FileID]; ok {
+				return io.NopCloser(bytes.NewReader(data)), nil
+			}
+			maxSize := s.maxFileSize()
+			if a.Size > maxSize {
+				log.Printf("[nas] 附件 %s 大小超出限制（%.1f MB > %d MB），跳过读取以保护内存",
+					a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
+				return nil, ErrOversized
+			}
+			rc, err := read(ctx, a)
+			if err != nil {
+				return nil, err
+			}
+			lr := io.LimitReader(rc, maxSize+1)
+			data, err := io.ReadAll(lr)
+			rc.Close()
+			if err != nil {
+				return nil, err
+			}
+			if int64(len(data)) > maxSize {
+				log.Printf("[nas] 附件 %s 实际内容超出限制（> %d MB），已跳过归档以保护内存",
+					a.Name, maxSize/(1024*1024))
+				return nil, ErrOversized
+			}
+			attCache[a.FileID] = data
 			return io.NopCloser(bytes.NewReader(data)), nil
 		}
-		rc, err := read(ctx, a)
-		if err != nil {
-			return nil, err
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return nil, err
-		}
-		attCache[a.FileID] = data
-		return io.NopCloser(bytes.NewReader(data)), nil
-	}
 
 	// 群成员学习：企微群聊 tolist 为空，靠发言记录逐步积累成员
 	if parseErr == nil && m.RoomID != "" {
@@ -329,27 +354,42 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 			targetDir = path.Join(base, "群聊记录", "images", dateFolder)
 		}
 
-		for i := range r.Attachments {
-			if ctx.Err() != nil {
-				return ctx.Err() // 停止信号：附件下载是耗时大头，必须能中断
-			}
-			a := &r.Attachments[i]
-			rc, err := read(ctx, a)
-			if err != nil {
+			for i := range r.Attachments {
 				if ctx.Err() != nil {
-					return ctx.Err()
+					return ctx.Err() // 停止信号：附件下载是耗时大头，必须能中断
 				}
-				log.Printf("[nas] 附件拉取失败 %s（%s）: %v", a.Name, a.FileID, err)
-				continue
-			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				log.Printf("[nas] 附件读取失败 %s: %v", a.Name, err)
-				continue
-			}
+				a := &r.Attachments[i]
+				maxSize := s.maxFileSize()
+				if a.Size > maxSize {
+					log.Printf("[nas] 附件 %s 超出大小限制（%.1f MB > %d MB），跳过归档以保护内存",
+						a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
+					continue
+				}
+					rc, err := read(ctx, a)
+					if err != nil {
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						if errors.Is(err, ErrOversized) {
+							continue
+						}
+						log.Printf("[nas] 附件拉取失败 %s（%s）: %v", a.Name, a.FileID, err)
+						continue
+					}
+				lr := io.LimitReader(rc, maxSize+1)
+				data, err := io.ReadAll(lr)
+				rc.Close()
+				if err != nil {
+					log.Printf("[nas] 附件读取失败 %s: %v", a.Name, err)
+					continue
+				}
+				if int64(len(data)) > maxSize {
+					log.Printf("[nas] 附件 %s 实际内容超出大小限制（> %d MB），已跳过归档以保护内存",
+						a.Name, maxSize/(1024*1024))
+					continue
+				}
 
-			cleanName := sanitize(a.Name)
+				cleanName := sanitize(a.Name)
 			if cleanName == "" {
 				cleanName = a.FileID
 			}
@@ -578,18 +618,28 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 			return ctx.Err()
 		}
 		a := &r.Attachments[i]
-		rc, err := read(ctx, a)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			log.Printf("[nas] 飞书文件拉取失败 %s: %v", a.Name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
+		maxSize := s.maxFileSize()
+		if a.Size > maxSize {
+			log.Printf("[nas] 飞书文件 %s 超出大小限制（%.1f MB > %d MB），跳过归档以保护内存",
+				a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
 			continue
 		}
-		data, err := io.ReadAll(rc)
+			rc, err := read(ctx, a)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if errors.Is(err, ErrOversized) {
+					continue
+				}
+				log.Printf("[nas] 飞书文件拉取失败 %s: %v", a.Name, err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+		lr := io.LimitReader(rc, maxSize+1)
+		data, err := io.ReadAll(lr)
 		rc.Close()
 		if err != nil {
 			log.Printf("[nas] 飞书文件读取失败 %s: %v", a.Name, err)
@@ -598,7 +648,13 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 			}
 			continue
 		}
-			// 飞书统一两大归档目录：所有云文档/表格/知识库/纪要全部归于 云文档/，邮件附件归于 邮件/
+		if int64(len(data)) > maxSize {
+			log.Printf("[nas] 飞书文件 %s 实际内容超出大小限制（> %d MB），已跳过归档以保护内存",
+				a.Name, maxSize/(1024*1024))
+			continue
+		}
+
+		// 飞书统一两大归档目录：所有云文档/表格/知识库/纪要全部归于 云文档/，邮件附件归于 邮件/
 			destDir := path.Join(base, "云文档")
 			if r.Kind == "mail" {
 				destDir = path.Join(base, "邮件")
