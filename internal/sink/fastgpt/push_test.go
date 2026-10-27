@@ -24,8 +24,9 @@ import (
 
 // fakeNAS 内存版 NAS。
 type fakeNAS struct {
-	dirs  map[string][]synology.FileEntry
-	files map[string][]byte
+	dirs    map[string][]synology.FileEntry
+	files   map[string][]byte
+	listErr map[string]error // dir -> List 返回的错误（模拟 NAS 列目录失败）
 }
 
 func newFakeNAS() *fakeNAS {
@@ -47,6 +48,9 @@ func (f *fakeNAS) addFile(dir, name string, data []byte) {
 }
 
 func (f *fakeNAS) List(dir string) ([]synology.FileEntry, error) {
+	if err := f.listErr[dir]; err != nil {
+		return nil, err
+	}
 	return f.dirs[dir], nil
 }
 

@@ -1,6 +1,6 @@
 // 飞书云文档连接器：tenant（共享文件夹遍历）+ user（已授权用户云空间）双模式。
-// 变更检测：feishu_doc_state(token → edit_time)，只产出变化的文档。
-// 归属：文档 owner + 可见的已授权用户 都进 OwnerIDs，NAS sink fan-out 到各自目录（含"归属别人但我可见"副本）。
+// 变更检测：feishu_doc_copy(token × person)，某人还没有这一份、或文档/文件名变了才写给他。
+// 归属：所有者 + 扫描时能看到的授权员工 + 协作者列表里的人，各存一份；谁看不到了只删谁的那份。
 package feishu
 
 import (
@@ -25,10 +25,11 @@ type Config struct {
 	AppSecret string   `yaml:"app_secret"`
 	Mode      string   `yaml:"mode"`    // tenant / user / both
 	Folders   []string `yaml:"folders"` // tenant 模式遍历的共享文件夹 token 列表
-	// WikiSpaceIDs 额外遍历的知识库空间 ID（纯数字）。
-	// 个人“我的文档库”已通过 my_library 自动发现，此处仅作手动补充。
+	// WikiSpaceIDs 用户模式下不再使用：我的文档库用 my_library 自动发现，团队库由 ListWikiSpaces 返回。
 	WikiSpaceIDs []string `yaml:"wiki_space_ids"`
 	SearchKeys   []string `yaml:"search_keys"` // 显式指定的共享文档搜索关键词（留空则不触发搜索，避免抓入公共模板）
+	// CollabRefresh 协作者列表刷新周期（0 = 默认 6h）。加减协作者不改文档修改时间，只能定期查。
+	CollabRefresh time.Duration `yaml:"collab_refresh_interval"`
 }
 
 // API 抽象（便于测试替换；feishuapi.Client 适配实现）。
@@ -53,6 +54,9 @@ type API interface {
 
 	// 搜索全库文档（包含他人“与我共享”的散落文档）
 	SearchDocs(userToken, searchKey string, offset, count int) ([]feishuapi.SearchDocEntity, error)
+
+	// 文档协作者列表（所有者 token 可查）
+	ListPermissionMembers(userToken, token, docType string) ([]feishuapi.PermissionMember, error)
 
 	// 妙记/智能纪要接口
 	SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error)
@@ -233,16 +237,17 @@ func (c *Connector) Fetch(ctx context.Context, checkpoint string, limit int) ([]
 	return batch, next, nil
 }
 
-// scan 全量扫描（tenant 共享文件夹 + 各已授权用户云空间），筛出变化的文档进 pending。
+// scan 全量扫描（tenant 共享文件夹 + 各已授权用户云空间），汇总“每篇文档谁能看到”，
+// 全部用户扫完后统一按副本状态产出写入/删除记录。
 func (c *Connector) scan(ctx context.Context) error {
 	mode := c.mode()
-	seen := map[string]bool{}
+	st := newScanState()
 
 	// tenant 模式：遍历配置的共享文件夹
 	if (mode == "tenant" || mode == "both") && c.tenantToken != "" {
 		for _, folder := range c.cfg.Folders {
 			err := c.api.WalkFolder(c.tenantToken, folder, 10, func(f feishuapi.DriveFile) {
-				c.collect(docToRecord(f, ""), seen)
+				c.collect(st, docToRecord(f, ""), "")
 			})
 			if err != nil {
 				log.Printf("[feishu] 遍历共享文件夹 %s 失败: %v", folder, err)
@@ -265,11 +270,20 @@ func (c *Connector) scan(ctx context.Context) error {
 					if g.ExpireAt <= now {
 						log.Printf("[feishu] 用户 %s 授权已过期（已于 %s 到期），跳过待刷新",
 							g.ExternalUserID, time.Unix(g.ExpireAt, 0).Format("2006-01-02 15:04:05"))
+						st.failedUsers[g.ExternalUserID] = true // 没扫到：他持有副本的文档本轮不做整篇删除
 						continue
 					}
 
 				userSeen := map[string]bool{}
 				userScanFailed := false
+				owned := map[string]string{} // 本人是所有者的文档：token → 类型（查协作者列表用）
+				see := func(rec model.Record, typ string) {
+					userSeen[rec.ID] = true
+					c.collect(st, rec, g.ExternalUserID)
+					if rec.SenderID == g.ExternalUserID && typ != "" {
+						owned[rec.ID] = typ
+					}
+				}
 
 				// a) 云空间（drive）：老式文件夹结构。
 				root, err := c.api.RootFolderMeta(g.AccessToken)
@@ -280,8 +294,7 @@ func (c *Connector) scan(ctx context.Context) error {
 					driveN := 0
 					err = c.api.WalkFolder(g.AccessToken, root, 10, func(f feishuapi.DriveFile) {
 						driveN++
-						userSeen[f.Token] = true
-						c.collect(docToRecord(f, g.ExternalUserID), seen)
+						see(docToRecord(f, g.ExternalUserID), f.Type)
 					})
 					if err != nil {
 						log.Printf("[feishu] 遍历 %s 云空间失败: %v", g.ExternalUserID, err)
@@ -293,9 +306,15 @@ func (c *Connector) scan(ctx context.Context) error {
 					}
 				}
 
-				// b) 团队知识库空间 + 个人“我的文档库”自动发现
-				spaceIDs := append([]string{}, c.cfg.WikiSpaceIDs...)
-				if myLib, err := c.api.GetMyLibrarySpace(g.AccessToken); err == nil && myLib != nil && myLib.SpaceID != "" {
+				// b) 团队知识库空间 + 个人“我的文档库”自动发现。
+				// 用户模式不再使用 cfg.WikiSpaceIDs：别人的个人文档库会报无权限，
+				// 被算作扫描失败后会让这个人的删除同步永远不执行。
+				spaceIDs := []string{}
+				myLib, err := c.api.GetMyLibrarySpace(g.AccessToken)
+				if err != nil {
+					log.Printf("[feishu] 取 %s 的我的文档库失败: %v", g.ExternalUserID, err)
+					userScanFailed = true
+				} else if myLib != nil && myLib.SpaceID != "" {
 					spaceIDs = append(spaceIDs, myLib.SpaceID)
 				}
 				spaces, err := c.api.ListWikiSpaces(g.AccessToken)
@@ -319,8 +338,7 @@ func (c *Connector) scan(ctx context.Context) error {
 					err := c.api.WalkWikiSpace(g.AccessToken, sid, 10, func(_ feishuapi.WikiSpace, node feishuapi.WikiNode) {
 						if rec, ok := wikiNodeToRecord(node, g.ExternalUserID); ok {
 							n++
-							userSeen[node.ObjToken] = true
-							c.collect(rec, seen)
+							see(rec, node.ObjType)
 						}
 					})
 					if err != nil {
@@ -355,8 +373,7 @@ func (c *Connector) scan(ctx context.Context) error {
 								Type:    d.Type,
 								OwnerID: d.OwnerID,
 							}
-							userSeen[d.Token] = true
-							c.collect(docToRecord(f, g.ExternalUserID), seen)
+							see(docToRecord(f, g.ExternalUserID), d.Type)
 							searchCount++
 						}
 					}
@@ -365,7 +382,7 @@ func (c *Connector) scan(ctx context.Context) error {
 					}
 				}
 
-				// d) 智能纪要/妙记扫描
+				// d) 智能纪要/妙记扫描（SearchMinutes 会翻完所有页，列表完整，可参与删除判断）
 				minutesList, err := c.api.SearchMinutes(g.AccessToken)
 				if err == nil && len(minutesList) > 0 {
 					for _, m := range minutesList {
@@ -389,12 +406,12 @@ func (c *Connector) scan(ctx context.Context) error {
 								UserID: g.ExternalUserID,
 							}},
 						}
-						c.collect(rec, seen)
+						see(rec, "")
 					}
 					log.Printf("[feishu] %s 扫描到 %d 篇智能纪要/妙记", g.ExternalUserID, len(minutesList))
 				}
 
-				// e) 邮箱邮件附件扫描
+				// e) 邮箱邮件附件扫描（只取最近 50 封：列表不完整，不参与删除判断）
 				mailMsgs, err := c.api.ListMailboxMessages(g.AccessToken, 50)
 				if err == nil && len(mailMsgs) > 0 {
 					mailCount := 0
@@ -411,8 +428,14 @@ func (c *Connector) scan(ctx context.Context) error {
 							if ma.ID == "" || ma.Name == "" {
 								continue
 							}
+							// 附件名后加 messageID 短码，避免不同邮件的同名附件互相覆盖
+							shortID := msg.MessageID
+							if len(shortID) > 8 {
+								shortID = shortID[len(shortID)-8:]
+							}
+							ext := path.Ext(ma.Name)
 							recordAtts = append(recordAtts, model.Attachment{
-								Name:   ma.Name,
+								Name:   sanitizeFilename(strings.TrimSuffix(ma.Name, ext)) + "_" + shortID + ext,
 								FileID: "mail:" + msg.MessageID + ":" + ma.ID,
 								Size:   ma.Size,
 								UserID: g.ExternalUserID,
@@ -428,7 +451,7 @@ func (c *Connector) scan(ctx context.Context) error {
 								SenderID:    g.ExternalUserID,
 								Attachments: recordAtts,
 							}
-							c.collect(rec, seen)
+							c.collect(st, rec, g.ExternalUserID)
 							mailCount++
 						}
 					}
@@ -437,54 +460,24 @@ func (c *Connector) scan(ctx context.Context) error {
 					}
 				}
 
-				// 差集检测：单人作用域 + 严格失败熔断（杜绝跨用户误删与网络抖动批量抹除）
-				if c.store != nil {
-					if userScanFailed {
-						log.Printf("[feishu] 用户 %s 扫描过程存在接口错误，触发熔断保护，暂停该用户本轮删除同步", g.ExternalUserID)
-					} else if len(userSeen) > 0 {
-						userDocs, err := c.store.ListDocStatesByUser(g.ExternalUserID)
-						if err == nil && len(userDocs) > 0 {
-							missingCount := 0
-							for _, d := range userDocs {
-								if !userSeen[d.Token] {
-									missingCount++
-								}
-							}
-							// 熔断保护：单次扫描缺失比例超过 50%（且历史文档 > 5），防止接口异常大面积误删
-							if len(userDocs) > 5 && missingCount > len(userDocs)/2 {
-								log.Printf("[feishu] 警告：用户 %s 缺失文档比例过高 (%d/%d)，触发熔断防误删保护，跳过本轮删除",
-									g.ExternalUserID, missingCount, len(userDocs))
-							} else {
-								for _, d := range userDocs {
-									if !userSeen[d.Token] {
-										log.Printf("[feishu] 检测到用户 %s 云端文档已删除/移出: %s (%s)", g.ExternalUserID, d.Title, d.Token)
-										delRec := model.Record{
-											Source:   "feishu",
-											Kind:     "delete",
-											ID:       d.Token,
-											SenderID: d.OwnerID,
-											OwnerIDs: []string{d.OwnerID, g.ExternalUserID},
-											Attachments: []model.Attachment{{
-												Name:   d.Title,
-												FileID: d.Token,
-												UserID: g.ExternalUserID,
-											}},
-										}
-										c.pending = append(c.pending, delRec)
-										c.pendingMeta[d.Token] = pendingDoc{
-											title:    d.Title,
-											ownerID:  d.OwnerID,
-											isDelete: true,
-										}
-									}
-								}
-							}
-						}
+				// f) 本人是所有者的文档：按周期刷新协作者列表，把协作者加进“能看到的人”。
+				// 加减协作者不会改变文档修改时间（实测），所以不能只在文档变化时查。
+				c.refreshCollaborators(st, g.AccessToken, owned, now)
+
+				if userScanFailed {
+					st.failedUsers[g.ExternalUserID] = true
+					log.Printf("[feishu] 用户 %s 扫描过程存在接口错误，触发熔断保护，暂停该用户本轮删除同步", g.ExternalUserID)
+				} else {
+					st.scanned = append(st.scanned, scannedUser{id: g.ExternalUserID, seen: userSeen})
+					for t := range userSeen {
+						st.globalSeen[t] = true
 					}
 				}
 			}
 		}
 
+		c.emitWrites(st)
+		c.emitDeletes(st)
 		log.Printf("[feishu] 扫描完成，待产出 %d 篇", len(c.pending))
 		return nil
 	}
@@ -537,39 +530,299 @@ func wikiNodeToRecord(n feishuapi.WikiNode, viewerID string) (model.Record, bool
 	return docToRecord(f, viewerID), true
 }
 
-// collect 变更检测 + 入队（同 token 只入一次）。
-// 入参是已构造好的 Record，drive 与 wiki 两条来源共用同一套去重与台账逻辑。
-func (c *Connector) collect(rec model.Record, seen map[string]bool) {
-	if seen[rec.ID] {
+// 副本来源：所有者本人 / 授权员工扫描时能看到 / 协作者列表。
+const (
+	viaOwner  = "owner"
+	viaScan   = "scan"
+	viaCollab = "collab"
+)
+
+// collabRefreshDefault 协作者列表默认刷新周期（cfg.CollabRefresh 为 0 时使用）。
+const collabRefreshDefault = 6 * time.Hour
+
+// wantDoc 本轮扫描汇总出的一篇文档：哪些人应该在自己目录下有一份。
+type wantDoc struct {
+	rec     model.Record
+	editTs  int64
+	owner   string
+	persons []string          // 保持加入顺序：所有者在前
+	via     map[string]string // person → 来源
+	reader  string            // 下载用谁的 token：优先所有者本人，否则第一个能看到它的授权员工
+}
+
+func (w *wantDoc) addPerson(person, via string) {
+	if person == "" {
 		return
 	}
-	seen[rec.ID] = true
-	editTime := rec.Timestamp / 1000
-	if editTime > 0 && editTime <= c.store.GetDocEditTime(rec.ID) {
-		return // 未变化
+	if old, ok := w.via[person]; ok {
+		// 来源优先级 owner > scan > collab
+		if old == viaOwner || (old == viaScan && via == viaCollab) {
+			return
+		}
+		w.via[person] = via
+		return
 	}
-	c.pending = append(c.pending, rec)
+	w.via[person] = via
+	w.persons = append(w.persons, person)
+}
 
-	// 这里只入队，不写 doc_state。
-	// 状态必须等 Sink 全部写入成功后再由 Ack 记录，否则写 NAS 失败时
-	// 下一轮会被判为「未变化」而永久跳过——文档静默丢失。
-	// 待确认的记录暂存在 pendingMeta，供 Ack 取用元数据。
-	c.pendingMeta[rec.ID] = pendingDoc{
-		title:    attachmentNameOf(rec),
-		ownerID:  rec.SenderID,
-		editTime: editTime,
+type scannedUser struct {
+	id   string
+	seen map[string]bool
+}
+
+// scanState 一轮扫描的汇总结果。
+type scanState struct {
+	want        map[string]*wantDoc
+	order       []string                   // 文档首次出现的顺序（产出顺序）
+	scanned     []scannedUser              // 本轮扫描完全成功的授权员工
+	globalSeen  map[string]bool            // 所有扫描成功的员工看到的文档并集
+	failedUsers map[string]bool            // 本轮扫描失败或被跳过的员工
+	collabFresh map[string]map[string]bool // 本轮刷新成功的协作者列表：token → open_id 集合
+}
+
+func newScanState() *scanState {
+	return &scanState{
+		want:        map[string]*wantDoc{},
+		globalSeen:  map[string]bool{},
+		failedUsers: map[string]bool{},
+		collabFresh: map[string]map[string]bool{},
 	}
 }
 
-// pendingDoc 待确认文档的元数据（Ack 时写 doc_state 用）。
+// collect 把“viewer 能看到这篇文档”合并进本轮汇总（不再按 token 全局去重丢掉后来的查看人）。
+// 是否需要写入、写给谁，等全部用户扫完后由 emitWrites 按副本状态统一判断。
+func (c *Connector) collect(st *scanState, rec model.Record, viewer string) {
+	w, ok := st.want[rec.ID]
+	if !ok {
+		w = &wantDoc{rec: rec, editTs: rec.Timestamp / 1000, owner: rec.SenderID, via: map[string]string{}}
+		st.want[rec.ID] = w
+		st.order = append(st.order, rec.ID)
+	}
+	if ts := rec.Timestamp / 1000; ts > w.editTs {
+		w.editTs = ts
+	}
+	w.addPerson(w.owner, viaOwner)
+	if viewer != "" && viewer != w.owner {
+		w.addPerson(viewer, viaScan)
+	}
+	if viewer != "" && (w.reader == "" || viewer == w.owner) {
+		w.reader = viewer
+	}
+}
+
+// refreshCollaborators 对本人是所有者的文档，按周期（或文档有变化时）刷新协作者列表；
+// 不刷新的沿用上次查到的列表。只取 member_type=openid 的个人，群/部门不展开。
+func (c *Connector) refreshCollaborators(st *scanState, userToken string, owned map[string]string, now int64) {
+	every := c.cfg.CollabRefresh
+	if every <= 0 {
+		every = collabRefreshDefault
+	}
+	for token, typ := range owned {
+		w := st.want[token]
+		if w == nil {
+			continue
+		}
+		checkedAt, members := c.store.GetDocMembers(token)
+		changed := true
+		if copies, err := c.store.ListCopies(token); err == nil {
+			for _, cp := range copies {
+				if cp.PersonID == w.owner && cp.EditTime >= w.editTs {
+					changed = false
+				}
+			}
+		}
+		if changed || now-checkedAt >= int64(every/time.Second) {
+			c.throttle()
+			items, err := c.api.ListPermissionMembers(userToken, token, typ)
+			if err != nil {
+				log.Printf("[feishu] 查 %s 协作者失败（沿用上次结果）: %v", token, err)
+			} else {
+				fresh := map[string]bool{}
+				members = members[:0]
+				for _, m := range items {
+					if m.MemberType == "openid" && m.MemberID != "" {
+						fresh[m.MemberID] = true
+						members = append(members, m.MemberID)
+					}
+				}
+				st.collabFresh[token] = fresh
+				if err := c.store.SetDocMembers(token, now, members); err != nil {
+					log.Printf("[feishu] 记录 %s 协作者失败: %v", token, err)
+				}
+			}
+		}
+		for _, p := range members {
+			w.addPerson(p, viaCollab)
+		}
+	}
+}
+
+// emitWrites 按副本状态产出写入记录：某人还没有这一份、或文档变了、或文件名变了，才写给他。
+func (c *Connector) emitWrites(st *scanState) {
+	for _, token := range st.order {
+		w := st.want[token]
+		name := attachmentNameOf(w.rec)
+		have := map[string]storage.DocCopy{}
+		if copies, err := c.store.ListCopies(token); err == nil {
+			for _, cp := range copies {
+				have[cp.PersonID] = cp
+			}
+		}
+		var need []string
+		prev := ""
+		for _, p := range w.persons {
+			cp, ok := have[p]
+			if ok && cp.FileName != "" && cp.FileName != name && prev == "" {
+				prev = cp.FileName
+			}
+			if !ok || (w.editTs > 0 && cp.EditTime < w.editTs) || cp.FileName != name {
+				need = append(need, p)
+				continue
+			}
+			if cp.Via != w.via[p] { // 内容没变、只是来源变了：只更新状态，不重写文件
+				cp.Via = w.via[p]
+				_ = c.store.UpsertCopy(cp)
+			}
+		}
+		if len(need) == 0 {
+			continue
+		}
+		rec := w.rec
+		rec.OwnerIDs = need
+		rec.Attachments = append([]model.Attachment(nil), w.rec.Attachments...)
+		if w.reader != "" {
+			for i := range rec.Attachments {
+				rec.Attachments[i].UserID = w.reader
+			}
+		}
+		if prev != "" && rec.Kind != "mail" && len(rec.Attachments) > 0 {
+			rec.Attachments[0].PrevName = prev
+		}
+		c.pending = append(c.pending, rec)
+
+		// 这里只入队，不写状态：Sink 全部写入成功后由 Ack 逐人记录副本，
+		// 否则写 NAS 失败时下一轮会被判为「已有」而永久跳过。
+		vias := map[string]string{}
+		for _, p := range need {
+			vias[p] = w.via[p]
+		}
+		c.pendingMeta[rec.ID] = pendingDoc{
+			token:    token,
+			title:    name,
+			ownerID:  w.owner,
+			editTime: w.editTs,
+			persons:  vias,
+		}
+	}
+}
+
+// emitDeletes 产出删除记录。只对本轮扫描完全成功的员工判断，原熔断保留：
+//   - 本人看不到了、但还有别人看得到：只删本人那份（权限收回）；本人是所有者时保留
+//     （所有者的文档可能放在别人的文件夹里，本人云盘树下本来就列不到）
+//   - 本轮所有扫描成功的员工都看不到了：整篇删除（所有副本），前提是持有副本的人本轮都扫描成功
+//   - 协作者列表刷新后某人不在了：只删他那份
+// 邮件只取最近 50 封，列表不完整，不参与删除判断。
+func (c *Connector) emitDeletes(st *scanState) {
+	dels := map[string]bool{}
+	del := func(cp storage.DocCopy) {
+		key := cp.Token + "\x00" + cp.PersonID
+		if dels[key] {
+			return
+		}
+		dels[key] = true
+		id := "del_" + cp.Token + "_" + cp.PersonID
+		c.pending = append(c.pending, model.Record{
+			Source:   "feishu",
+			Kind:     "delete",
+			ID:       id,
+			SenderID: cp.OwnerID,
+			OwnerIDs: []string{cp.PersonID},
+			Attachments: []model.Attachment{{
+				Name:   cp.FileName,
+				FileID: cp.Token,
+				UserID: cp.PersonID,
+			}},
+		})
+		c.pendingMeta[id] = pendingDoc{token: cp.Token, deletePerson: cp.PersonID, isDelete: true}
+		log.Printf("[feishu] %s 的副本需删除: %s (%s)", cp.PersonID, cp.FileName, cp.Token)
+	}
+
+	lost := map[string]bool{} // 本轮没有任何人看到的文档
+	for _, u := range st.scanned {
+		copies, err := c.store.ListCopiesByPerson(u.id)
+		if err != nil {
+			continue
+		}
+		var mine, missing []storage.DocCopy
+		for _, cp := range copies {
+			if strings.HasPrefix(cp.Token, "mail_") || (cp.Via != viaOwner && cp.Via != viaScan) {
+				continue
+			}
+			mine = append(mine, cp)
+			if u.seen[cp.Token] || (cp.Via == viaOwner && st.globalSeen[cp.Token]) {
+				continue
+			}
+			missing = append(missing, cp)
+		}
+		// 熔断保护：单次扫描缺失比例超过 50%（且历史文档 > 5），防止接口异常大面积误删
+		if len(mine) > 5 && len(missing) > len(mine)/2 {
+			log.Printf("[feishu] 警告：用户 %s 缺失文档比例过高 (%d/%d)，触发熔断防误删保护，跳过本轮删除",
+				u.id, len(missing), len(mine))
+			continue
+		}
+		for _, cp := range missing {
+			if st.globalSeen[cp.Token] {
+				del(cp) // 别人还看得到：只删本人那份
+				continue
+			}
+			lost[cp.Token] = true
+		}
+	}
+
+	for token := range lost {
+		copies, err := c.store.ListCopies(token)
+		if err != nil {
+			continue
+		}
+		blocked := false
+		for _, cp := range copies {
+			if (cp.Via == viaOwner || cp.Via == viaScan) && st.failedUsers[cp.PersonID] {
+				blocked = true // 有持有人本轮没扫成功：可能只是没扫到，下轮再判断
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		for _, cp := range copies {
+			del(cp)
+		}
+	}
+
+	for token, fresh := range st.collabFresh {
+		if copies, err := c.store.ListCopies(token); err == nil {
+			for _, cp := range copies {
+				if cp.Via == viaCollab && !fresh[cp.PersonID] {
+					del(cp)
+				}
+			}
+		}
+	}
+}
+
+// pendingDoc 待确认记录的元数据（Ack 时写副本状态用）。
 type pendingDoc struct {
-	title    string
-	ownerID  string
-	editTime int64
-	isDelete bool
+	token        string
+	title        string
+	ownerID      string
+	editTime     int64
+	persons      map[string]string // 写入记录：person → 来源
+	isDelete     bool
+	deletePerson string // 删除记录：删的是谁的那份
 }
 
-// Ack 实现 connector.AckConnector：Sink 写入成功后记录变更检测状态。
+// Ack 实现 connector.AckConnector：Sink 写入成功后记录副本状态。
 func (c *Connector) Ack(recordID string) error {
 	meta, ok := c.pendingMeta[recordID]
 	if !ok {
@@ -577,9 +830,23 @@ func (c *Connector) Ack(recordID string) error {
 	}
 	delete(c.pendingMeta, recordID)
 	if meta.isDelete {
-		return c.store.DeleteDocState(recordID)
+		if err := c.store.DeleteCopy(meta.token, meta.deletePerson); err != nil {
+			return err
+		}
+		if rest, err := c.store.ListCopies(meta.token); err == nil && len(rest) == 0 {
+			return c.store.DeleteDocState(meta.token)
+		}
+		return nil
 	}
-	return c.store.UpsertDocState(recordID, meta.title, meta.ownerID, meta.editTime)
+	for p, via := range meta.persons {
+		if err := c.store.UpsertCopy(storage.DocCopy{
+			Token: meta.token, PersonID: p, Via: via,
+			EditTime: meta.editTime, FileName: meta.title, OwnerID: meta.ownerID,
+		}); err != nil {
+			return err
+		}
+	}
+	return c.store.UpsertDocState(meta.token, meta.title, meta.ownerID, meta.editTime)
 }
 
 // attachmentNameOf 取 Record 里第一个附件的名字（写 doc_state 用）。

@@ -114,6 +114,7 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 		return err
 	}
 	activePaths := map[string]bool{}
+	listFailed := false // 有目录没列出来时，本轮不做反向对账，避免把没列到的文件当成已删除
 	for _, e := range entries {
 		if skipDirs[e.Name] {
 			continue
@@ -131,6 +132,7 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 			// 会话 markdown：分类记为 会话
 			if err := t.pushDir(ctx, person, source, "会话", e.Path, datasetID, activePaths); err != nil {
 				log.Printf("[fastgpt] %s/%s/%s 出错: %v", person, platLabel, e.Name, err)
+				listFailed = true
 			}
 			continue
 		}
@@ -142,7 +144,12 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 		}
 		if err := t.pushDir(ctx, person, source, category, e.Path, datasetID, activePaths); err != nil {
 			log.Printf("[fastgpt] %s/%s/%s 出错: %v", person, platLabel, e.Name, err)
+			listFailed = true
 		}
+	}
+	if listFailed {
+		log.Printf("[fastgpt] %s/%s 本轮有目录未列出，跳过反向对账", person, platLabel)
+		return nil
 	}
 
 	// 反向对账：检测 NAS 上已删除但在 FastGPT 知识库与本地 SQLite 中仍有残留的集合，完成彻底清理闭环
@@ -171,6 +178,7 @@ func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir
 	if err != nil {
 		return err
 	}
+	var firstErr error
 	for _, f := range files {
 		if strings.HasSuffix(f.Name, ".meta.json") {
 			continue
@@ -178,6 +186,9 @@ func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir
 		if f.IsDir {
 			if err := t.pushDir(ctx, person, source, defaultCategory, f.Path, datasetID, activePaths); err != nil {
 				log.Printf("[fastgpt] 遍历子目录失败 %s: %v", f.Path, err)
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 			continue
 		}
@@ -192,7 +203,7 @@ func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir
 			log.Printf("[fastgpt] 推送失败 %s: %v", f.Path, err)
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // classifyFilename 根据文件名关键词识别分类。

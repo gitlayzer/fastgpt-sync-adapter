@@ -64,11 +64,11 @@ connectors:
     app_secret: ""
     mode: both                     # tenant（共享区/知识库）+ user（已授权用户个人云文档）
     folders: []                    # tenant 模式：共享文件夹 token 列表
-    # 额外遍历的知识库空间 ID（纯数字）。
-    # 「我的文档库」不会被 wiki/v2/spaces 返回，必须在这里显式指定。
-    # 获取方式：打开文档，取 URL 里的 token（如 .../wiki/Ti5wwEEu2iHTlFkEbzFcGLWPnph），
-    # 调 GET /open-apis/wiki/v2/spaces/get_node?token=<该token>，返回的 space_id 即是。
+    # 用户模式已不再使用：我的文档库通过 my_library 自动发现，团队知识库由 wiki/v2/spaces 返回。
+    # 不要在这里填个人文档库：别人读会报无权限，导致删除同步被熔断。
     wiki_space_ids: []
+    # 文档协作者列表刷新周期（加减协作者不会改变文档修改时间，只能定期查）
+    collab_refresh_interval: 6h
 
 # ===== 文件用途分类器（R4，可配规则；命中关键词即归类，只影响归档子目录与标签，不动原文）=====
 classifier:

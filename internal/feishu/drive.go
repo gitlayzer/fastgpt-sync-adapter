@@ -227,3 +227,27 @@ func (c *Client) SearchDocs(userToken, searchKey string, offset, count int) ([]S
 	}
 	return out.Data.DocsEntities, nil
 }
+
+// PermissionMember 文档协作者。
+type PermissionMember struct {
+	MemberType string `json:"member_type"` // openid / openchat / opendepartmentid / ...
+	MemberID   string `json:"member_id"`
+	Perm       string `json:"perm"` // view / edit / full_access
+}
+
+// ListPermissionMembers 列出文档协作者（GET /drive/v1/permissions/{token}/members）。
+// docType 取 doc/docx/sheet/bitable/file/slides 等；调用者必须是该文档的协作者（所有者可以）。
+func (c *Client) ListPermissionMembers(userToken, token, docType string) ([]PermissionMember, error) {
+	q := url.Values{}
+	q.Set("type", docType)
+	var out struct {
+		apiResp
+		Data struct {
+			Items []PermissionMember `json:"items"`
+		} `json:"data"`
+	}
+	if err := c.get("/drive/v1/permissions/"+token+"/members", userToken, q, &out); err != nil {
+		return nil, err
+	}
+	return out.Data.Items, nil
+}

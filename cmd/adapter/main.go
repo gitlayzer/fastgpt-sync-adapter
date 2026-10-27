@@ -150,7 +150,7 @@ func main() {
 	if fc.Enabled {
 		fcConn := feishuconnector.New(feishuconnector.Config{
 			AppID: fc.AppID, AppSecret: fc.AppSecret, Mode: fc.Mode, Folders: fc.Folders,
-			WikiSpaceIDs: fc.WikiSpaceIDs,
+			WikiSpaceIDs: fc.WikiSpaceIDs, CollabRefresh: fc.CollabRefresh.D(),
 		}, st)
 		eng.AddConnector(engine.ConnectorJob{
 			Conn:       fcConn,

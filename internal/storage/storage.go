@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -128,6 +129,22 @@ CREATE TABLE IF NOT EXISTS feishu_doc_state (
   title      TEXT NOT NULL DEFAULT '',
   owner_id   TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS feishu_doc_copy (
+  token      TEXT NOT NULL,
+  person_id  TEXT NOT NULL,
+  via        TEXT NOT NULL DEFAULT '',
+  edit_time  INTEGER NOT NULL DEFAULT 0,
+  file_name  TEXT NOT NULL DEFAULT '',
+  owner_id   TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (token, person_id)
+);
+CREATE INDEX IF NOT EXISTS idx_feishu_doc_copy_person ON feishu_doc_copy(person_id);
+CREATE TABLE IF NOT EXISTS feishu_doc_members (
+  token      TEXT PRIMARY KEY,
+  checked_at INTEGER NOT NULL DEFAULT 0,
+  members    TEXT NOT NULL DEFAULT ''
 );`)
 	if err != nil {
 		return fmt.Errorf("建表迁移: %w", err)
@@ -446,5 +463,85 @@ INSERT INTO feishu_doc_state (token, edit_time, title, owner_id, updated_at) VAL
 ON CONFLICT(token) DO UPDATE SET edit_time=excluded.edit_time, title=excluded.title,
   owner_id=excluded.owner_id, updated_at=excluded.updated_at`,
 		token, editTime, title, ownerID, time.Now().Unix())
+	return err
+}
+
+// ===== 飞书文档副本（一篇文档 × 一个人 = NAS 上的一份文件）=====
+
+// DocCopy 某人目录下的一份飞书文档副本。
+// Via：owner=所有者本人；scan=该授权员工扫描时能看到；collab=来自协作者列表。
+type DocCopy struct {
+	Token    string
+	PersonID string
+	Via      string
+	EditTime int64
+	FileName string
+	OwnerID  string
+}
+
+func (s *Store) queryCopies(where string, arg string) ([]DocCopy, error) {
+	rows, err := s.db.Query(`SELECT token, person_id, via, edit_time, file_name, owner_id
+FROM feishu_doc_copy WHERE `+where, arg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DocCopy
+	for rows.Next() {
+		var c DocCopy
+		if err := rows.Scan(&c.Token, &c.PersonID, &c.Via, &c.EditTime, &c.FileName, &c.OwnerID); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListCopies 列出一篇文档的全部副本。
+func (s *Store) ListCopies(token string) ([]DocCopy, error) {
+	return s.queryCopies("token=?", token)
+}
+
+// ListCopiesByPerson 列出某人目录下的全部飞书文档副本。
+func (s *Store) ListCopiesByPerson(personID string) ([]DocCopy, error) {
+	return s.queryCopies("person_id=?", personID)
+}
+
+// UpsertCopy 记录某人的副本已写入 NAS。
+func (s *Store) UpsertCopy(c DocCopy) error {
+	_, err := s.db.Exec(`
+INSERT INTO feishu_doc_copy (token, person_id, via, edit_time, file_name, owner_id, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(token, person_id) DO UPDATE SET via=excluded.via, edit_time=excluded.edit_time,
+  file_name=excluded.file_name, owner_id=excluded.owner_id, updated_at=excluded.updated_at`,
+		c.Token, c.PersonID, c.Via, c.EditTime, c.FileName, c.OwnerID, time.Now().Unix())
+	return err
+}
+
+// DeleteCopy 删除某人的一份副本记录。
+func (s *Store) DeleteCopy(token, personID string) error {
+	_, err := s.db.Exec(`DELETE FROM feishu_doc_copy WHERE token=? AND person_id=?`, token, personID)
+	return err
+}
+
+// GetDocMembers 返回某篇文档上次查到的协作者（open_id 列表）及查询时间（秒）；没查过返回 0。
+func (s *Store) GetDocMembers(token string) (checkedAt int64, members []string) {
+	var list string
+	if err := s.db.QueryRow(`SELECT checked_at, members FROM feishu_doc_members WHERE token=?`, token).
+		Scan(&checkedAt, &list); err != nil {
+		return 0, nil
+	}
+	if list != "" {
+		members = strings.Split(list, ",")
+	}
+	return checkedAt, members
+}
+
+// SetDocMembers 记录某篇文档本次查到的协作者及查询时间。
+func (s *Store) SetDocMembers(token string, ts int64, members []string) error {
+	_, err := s.db.Exec(`
+INSERT INTO feishu_doc_members (token, checked_at, members) VALUES (?, ?, ?)
+ON CONFLICT(token) DO UPDATE SET checked_at=excluded.checked_at, members=excluded.members`,
+		token, ts, strings.Join(members, ","))
 	return err
 }

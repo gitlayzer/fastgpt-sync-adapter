@@ -251,7 +251,10 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 				for _, a := range r.Attachments {
 					for _, sub := range []string{"云文档", "邮件", ""} {
 						targetFile := path.Join(base, sub, sanitize(a.Name))
-						_ = s.fs.Delete(targetFile)
+						// 删除失败要返回错误：不 Ack，下一轮重试（文件不存在已在 Delete 内视为成功）
+						if err := s.fs.Delete(targetFile); err != nil {
+							return err
+						}
 					}
 					log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s/%s", base, sanitize(a.Name))
 				}
@@ -605,6 +608,15 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 				continue
 			}
 			log.Printf("[nas] 已归档 %s/%s（%.1f KB）", destDir, a.Name, float64(len(data))/1024)
+			// 文档改名：新文件写成功后再删旧文件，中途失败也不会丢文件
+			if a.PrevName != "" && a.PrevName != a.Name {
+				if err := s.fs.Delete(path.Join(destDir, sanitize(a.PrevName))); err != nil {
+					log.Printf("[nas] 删除改名前的旧文件失败 %s: %v", a.PrevName, err)
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+			}
 	}
 	return firstErr
 }

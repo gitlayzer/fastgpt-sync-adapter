@@ -24,4 +24,6 @@ type Attachment struct {
 	Size   int64  `json:"size"`
 	MD5    string `json:"md5"`
 	UserID string `json:"user_id,omitempty"` // 扫描/持有权限的用户 ExternalUserID (open_id)，用于精确定向取 Token
+	// PrevName 上一次写入 NAS 时的文件名；与 Name 不同时，Sink 写入新文件成功后删除旧文件（文档改名）。
+	PrevName string `json:"prev_name,omitempty"`
 }

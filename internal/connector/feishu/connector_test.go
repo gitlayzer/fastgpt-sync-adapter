@@ -24,6 +24,8 @@ type mockAPI struct {
 	wikiSpaces map[string][]feishuapi.WikiSpace // userToken -> spaces
 	wikiNodes  map[string][]feishuapi.WikiNode  // spaceID -> nodes
 	exports    int                              // 导出次数
+
+	members map[string][]feishuapi.PermissionMember // docToken -> 协作者
 }
 
 func newMockAPI() *mockAPI {
@@ -106,6 +108,10 @@ func (m *mockAPI) DownloadExport(tok, fileToken string) (io.ReadCloser, error) {
 
 func (m *mockAPI) SearchDocs(userToken, searchKey string, offset, count int) ([]feishuapi.SearchDocEntity, error) {
 	return nil, nil
+}
+
+func (m *mockAPI) ListPermissionMembers(userToken, token, docType string) ([]feishuapi.PermissionMember, error) {
+	return m.members[token], nil
 }
 
 func (m *mockAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error) {
@@ -343,7 +349,7 @@ func TestFeishuCloudDeleteEmitsDeleteRecord(t *testing.T) {
 	if len(recs2) != 1 {
 		t.Fatalf("次轮应检测到 1 篇云端删除，实际产出 %d 篇: %+v", len(recs2), recs2)
 	}
-	if recs2[0].Kind != "delete" || recs2[0].ID != "doc1" {
+	if recs2[0].Kind != "delete" || recs2[0].ID != "del_doc1_ou_u" {
 		t.Fatalf("删除记录属性不符合预期: %+v", recs2[0])
 	}
 
@@ -583,7 +589,7 @@ func TestMailAttachmentsSync(t *testing.T) {
 		t.Fatalf("应抓取到 1 封含附件邮件, 实际: %d", len(recs))
 	}
 	r := recs[0]
-	if r.Kind != "mail" || len(r.Attachments) != 1 || r.Attachments[0].Name != "采购合同.pdf" {
+	if r.Kind != "mail" || len(r.Attachments) != 1 || r.Attachments[0].Name != "采购合同_msg_m1.pdf" {
 		t.Fatalf("邮件记录附件属性错误: %+v", r)
 	}
 
