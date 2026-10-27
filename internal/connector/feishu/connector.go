@@ -197,12 +197,23 @@ func attachmentName(f feishuapi.DriveFile) string {
 		targetExt = ".pptx"
 	}
 
-	// 仅当用户在文档标题末尾显式输入了对应扩展名，或属于原始上传文件(file)时才剥离扩展名
+	// 仅当用户在文档标题末尾显式输入了对应扩展名（含同类旧版格式 .doc/.xls/.ppt），或属于原始上传文件(file)时才剥离扩展名
+	shouldTrim := false
 	if f.Type == "file" {
-		if ext != "" {
-			base = strings.TrimSuffix(base, ext)
+		shouldTrim = ext != ""
+	} else if ext != "" {
+		switch f.Type {
+		case "docx", "doc":
+			shouldTrim = strings.EqualFold(ext, ".docx") || strings.EqualFold(ext, ".doc")
+		case "sheet", "bitable":
+			shouldTrim = strings.EqualFold(ext, ".xlsx") || strings.EqualFold(ext, ".xls")
+		case "slides":
+			shouldTrim = strings.EqualFold(ext, ".pptx") || strings.EqualFold(ext, ".ppt")
+		default:
+			shouldTrim = strings.EqualFold(ext, targetExt)
 		}
-	} else if ext != "" && strings.EqualFold(ext, targetExt) {
+	}
+	if shouldTrim {
 		base = strings.TrimSuffix(base, ext)
 	}
 
@@ -724,16 +735,7 @@ func (c *Connector) emitWrites(st *scanState) {
 			}
 		}
 			if prev != "" && rec.Kind != "mail" && len(rec.Attachments) > 0 {
-				allHadPrev := true
-				for _, p := range need {
-					if cp, ok := have[p]; !ok || cp.FileName == "" {
-						allHadPrev = false
-						break
-					}
-				}
-				if allHadPrev {
-					rec.Attachments[0].PrevName = prev
-				}
+				rec.Attachments[0].PrevName = prev
 			}
 		c.pending = append(c.pending, rec)
 

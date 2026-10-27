@@ -41,12 +41,14 @@ type LocalBackend struct{ *store.Store }
 
 func (l LocalBackend) Open(n *store.Node) (io.ReadCloser, error) { return l.Store.Open(n) }
 func (l LocalBackend) OpenPath(filePath string) (io.ReadCloser, error) {
-	root := l.Store.Root()
+	root := filepath.Clean(l.Store.Root())
 	clean := filepath.Clean(filePath)
-	if !strings.HasPrefix(clean, root) {
+	rel, err := filepath.Rel(root, clean)
+	if err != nil || strings.HasPrefix(rel, "..") {
 		clean = filepath.Clean(filepath.Join(root, clean))
+		rel, err = filepath.Rel(root, clean)
 	}
-	if !strings.HasPrefix(clean, root) {
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
 		return nil, fmt.Errorf("非法访问路径: %s", filePath)
 	}
 	return os.Open(clean)

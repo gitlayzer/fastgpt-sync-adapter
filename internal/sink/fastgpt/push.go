@@ -157,15 +157,21 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 		indexedFiles, err := t.store.ListFileIndexByPersonAndSource(person, source)
 		if err == nil {
 			for _, entry := range indexedFiles {
-				if !activePaths[entry.NasPath] && entry.CollectionID != "" {
-					log.Printf("[fastgpt] 检测到 NAS 文件已删除，同步清理 FastGPT 知识库集合: %s (collection: %s)", entry.NasPath, entry.CollectionID)
+					if !activePaths[entry.NasPath] && entry.CollectionID != "" {
+						log.Printf("[fastgpt] 检测到 NAS 文件已删除，同步清理 FastGPT 知识库集合: %s (collection: %s)", entry.NasPath, entry.CollectionID)
 						c := t.manager.ClientFor(datasetID)
 						if err := c.DeleteCollection(entry.CollectionID); err != nil {
-							log.Printf("[fastgpt] 删除 FastGPT 集合失败 %s: %v", entry.CollectionID, err)
+							errStr := strings.ToLower(err.Error())
+							// 若远端已不存在（404 或 not found），视为成功并同步清理本地索引，避免死循环重试
+							if strings.Contains(errStr, "not found") || strings.Contains(errStr, "不存在") || strings.Contains(errStr, "404") {
+								_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
+							} else {
+								log.Printf("[fastgpt] 删除 FastGPT 集合失败 %s: %v", entry.CollectionID, err)
+							}
 						} else {
 							_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
 						}
-				}
+					}
 			}
 		}
 	}
@@ -272,19 +278,20 @@ func (t *Task) pushFile(ctx context.Context, person, source, category string, f 
 		if category != "会话" {
 			ext := path.Ext(f.Name)
 			base := strings.TrimSuffix(f.Name, ext)
-			// 1) 历史遗留带 <msgid>_ 机器前缀的文件（包含大量数字且长度 > 10）：剥离前缀
-			if idx := strings.Index(base, "_"); idx > 0 {
-				prefix := base[:idx]
-				if strings.ContainsAny(prefix, "0123456789") && len(prefix) > 10 {
-					base = base[idx+1:]
+			// 1) 优先剥离末尾的 _<8位Token短码> 后缀（必须为8位且包含字母，避免误伤 _20240516 等纯数字日期）
+			if idx := strings.LastIndex(base, "_"); idx > 0 {
+				suffix := base[idx+1:]
+				if len(suffix) == 8 && isAlphanumericToken(suffix) && strings.ContainsAny(suffix, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+					base = base[:idx]
 					display = base + ext
 				}
 			}
-			// 2) 若带有 _<8位Token短码> 后缀（纯字母数字且长度在 6~12 之间）：剥离后缀以展示纯净标题
-			if idx := strings.LastIndex(base, "_"); idx > 0 {
-				suffix := base[idx+1:]
-				if isAlphanumericToken(suffix) && len(suffix) >= 6 && len(suffix) <= 12 {
-					display = base[:idx] + ext
+			// 2) 历史遗留带纯数字 <msgid>_ 机器前缀（长度 > 10 且纯数字）：剥离前缀
+			if idx := strings.Index(base, "_"); idx > 0 {
+				prefix := base[:idx]
+				if len(prefix) > 10 && isAllDigits(prefix) {
+					base = base[idx+1:]
+					display = base + ext
 				}
 			}
 		}
@@ -360,6 +367,18 @@ func (t *Task) isFrozen(nasPath string) bool {
 		}
 		for _, c := range s {
 			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+				return false
+			}
+		}
+		return true
+	}
+
+	func isAllDigits(s string) bool {
+		if s == "" {
+			return false
+		}
+		for _, c := range s {
+			if c < '0' || c > '9' {
 				return false
 			}
 		}

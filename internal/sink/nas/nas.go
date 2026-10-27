@@ -279,8 +279,8 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 				base := path.Join(s.cfg.RootPath, person, platform)
 					for _, a := range r.Attachments {
 						cleanName := sanitize(a.Name)
-						if cleanName == "" {
-							continue // 文件名为空时绝对禁止删除，防止 path.Join 返回目录本身造成整目录误删
+						if cleanName == "" || cleanName == "." || cleanName == ".." {
+							continue // 文件名为空或特殊相对路径时绝对禁止删除，防止 path.Join 返回目录本身造成整目录误删
 						}
 						for _, sub := range []string{"云文档", "邮件", ""} {
 							targetFile := path.Join(base, sub, cleanName)
@@ -677,7 +677,8 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 			log.Printf("[nas] 已归档 %s/%s（%.1f KB）", destDir, a.Name, float64(len(data))/1024)
 				// 文档改名：新文件写成功后再删旧文件，中途失败也不会丢文件
 				if a.PrevName != "" && a.PrevName != a.Name {
-					if cleanPrev := sanitize(a.PrevName); cleanPrev != "" {
+					cleanName := sanitize(a.Name)
+					if cleanPrev := sanitize(a.PrevName); cleanPrev != "" && cleanPrev != cleanName && cleanPrev != "." && cleanPrev != ".." {
 						if err := s.fs.Delete(path.Join(destDir, cleanPrev)); err != nil {
 							log.Printf("[nas] 删除改名前的旧文件失败 %s: %v", a.PrevName, err)
 							if firstErr == nil {
