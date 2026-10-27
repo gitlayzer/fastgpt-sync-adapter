@@ -158,15 +158,37 @@ func messageToRecord(m *Message) model.Record {
 // 混合消息、聊天记录等嵌套类型暂不处理（TODO）。
 
 // extractAttachments 从原始消息 JSON 提取附件引用（sdkfileid 等）。
-// 支持 file 直接文件与 chatrecord 合并转发中的嵌套文件。
+// 支持 file 直接文件、chatrecord 合并转发中的嵌套文件以及 image 图片。
 func extractAttachments(m *Message) []model.Attachment {
-	// 图片、语音、视频、表情一律不下载：
-	//   - 业务上只需要办公文档，媒体文件对检索没价值
-	//   - 压缩包在企微侧取的时候经常连续 10001 失败，重试只白耗时间
-	// 消息本身仍会写进会话 Markdown（如「[文件：xxx.rar]」「[图片]」），
-	// 保留“谁在什么时候发了什么”的事实，只是不落文件本体。
-	if m.MsgType != "file" && m.MsgType != "chatrecord" {
+	// 语音、视频、表情一律不下载，只下载办公文档与聊天原图。
+	if m.MsgType != "file" && m.MsgType != "chatrecord" && m.MsgType != "image" {
 		return nil
+	}
+
+	if m.MsgType == "image" {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(m.Raw, &raw); err != nil {
+			return nil
+		}
+		content, ok := raw[m.MsgType]
+		if !ok {
+			return nil
+		}
+		var body struct {
+			SDKFileID string `json:"sdkfileid"`
+			FileSize  int64  `json:"filesize"`
+			MD5Sum    string `json:"md5sum"`
+		}
+		if err := json.Unmarshal(content, &body); err != nil || body.SDKFileID == "" {
+			return nil
+		}
+		imgName := fmt.Sprintf("image_%s.jpg", m.MsgID)
+		return []model.Attachment{{
+			Name:   imgName,
+			FileID: body.SDKFileID,
+			Size:   body.FileSize,
+			MD5:    body.MD5Sum,
+		}}
 	}
 
 	if m.MsgType == "file" {

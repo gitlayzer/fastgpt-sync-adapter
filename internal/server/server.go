@@ -475,10 +475,13 @@ async function handleItemClick(id, name, type) {
     title.innerText = name;
     dl.href = previewUrl;
 
-    if (name.endsWith('.md') || name.endsWith('.txt') || name.endsWith('.json')) {
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.md') || lower.endsWith('.txt') || lower.endsWith('.json')) {
       const fileRes = await fetch(previewUrl);
       const text = await fileRes.text();
       content.innerText = text;
+    } else if (lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp')) {
+      content.innerHTML = '<div style="text-align:center;"><img src="' + escapeHtml(previewUrl) + '" style="max-width:100%;max-height:480px;object-fit:contain;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.1);" /></div>';
     } else {
       content.innerText = '该文件为二进制文档 (' + name.split('.').pop() + ')，无法在文本框直接渲染。\n请点击右上角「下载原文件」按钮直接打开查阅。';
     }

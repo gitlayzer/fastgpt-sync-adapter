@@ -177,16 +177,47 @@ func TestSingleChatFanOut(t *testing.T) {
 		t.Fatalf("WriteRecord: %v", err)
 	}
 		// 附件按日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A），保持原始文件名无 msgid 前缀
-		dateFolder := time.UnixMilli(rec.Timestamp).Format("2006-01-02")
-		for _, p := range []string{"张三", "李四"} {
-			att := fmt.Sprintf("/FastGPT-test/%s/企微/%s/采购合同V1.docx", p, dateFolder)
-			if string(fs.files[att]) != "PDF" {
-				t.Fatalf("%s 附件内容不对（路径应为: %s）", p, att)
+			dateFolder := time.UnixMilli(rec.Timestamp).Format("2006-01-02")
+			for _, p := range []string{"张三", "李四"} {
+				att := fmt.Sprintf("/FastGPT-test/%s/企微/%s/采购合同V1.docx", p, dateFolder)
+				if string(fs.files[att]) != "PDF" {
+					t.Fatalf("%s 附件内容不对（路径应为: %s）", p, att)
+				}
+				if _, ok := fs.files[att+".meta.json"]; ok {
+					t.Fatalf("%s 不应再写 .meta.json 侧边车", p)
+				}
 			}
-			if _, ok := fs.files[att+".meta.json"]; ok {
-				t.Fatalf("%s 不应再写 .meta.json 侧边车", p)
-			}
+}
+
+func TestImageAttachmentArchive(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	rec := dmRecord("img101", "u1", "u2", "发了一张图片")
+	rec.Kind = "image"
+	rec.Body = []byte(`{"msgid":"img101","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"image","image":{"sdkfileid":"fid_img101","filesize":2048}}`)
+	rec.Attachments = []model.Attachment{{Name: "image_img101.jpg", FileID: "fid_img101", Size: 2048}}
+	read := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("IMAGE_BYTES")), nil
+	}
+	if err := s.WriteRecord(context.Background(), rec, read); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+
+	// 1760000000000 对应 2025-10-09
+	dateFolder := time.UnixMilli(rec.Timestamp).Format("2006-01-02")
+	for _, p := range []string{"张三", "李四"} {
+		// 图片应存放于 群聊记录/images/<date>/image_img101.jpg
+		imgPath := fmt.Sprintf("/FastGPT-test/%s/企微/群聊记录/images/%s/image_img101.jpg", p, dateFolder)
+		if string(fs.files[imgPath]) != "IMAGE_BYTES" {
+			t.Fatalf("%s 图片未正确落盘至专属路径: %s, 内容: %q", p, imgPath, string(fs.files[imgPath]))
 		}
+		// 会话 markdown 应包含相对路径出图语法
+		convPath := fmt.Sprintf("/FastGPT-test/%s/企微/群聊记录/与%s的单聊.md", p, map[string]string{"张三": "李四", "李四": "张三"}[p])
+		md := string(fs.files[convPath])
+		expectedImgSyntax := fmt.Sprintf("![图片](images/%s/image_img101.jpg)", dateFolder)
+		if !strings.Contains(md, expectedImgSyntax) {
+			t.Fatalf("%s 会话记录中应包含相对图片链接 %q, 实际: %s", p, expectedImgSyntax, md)
+		}
+	}
 }
 
 func TestAppendFileCleansLegacyHTML(t *testing.T) {

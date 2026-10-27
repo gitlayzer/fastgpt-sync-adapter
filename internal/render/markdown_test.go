@@ -54,11 +54,17 @@ func TestRenderLine(t *testing.T) {
 		t.Fatalf("text 渲染: %q skip=%v", line, skip)
 	}
 
-	file := mustParse(t, `{"msgid":"m2","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"file","file":{"sdkfileid":"fid","filename":"采购合同V1.docx","filesize":123}}`)
-	line, _ = RenderLine(file, resolve)
-	if !strings.Contains(line, "[文件：采购合同V1.docx]") {
-		t.Fatalf("file 渲染: %q", line)
-	}
+		file := mustParse(t, `{"msgid":"m2","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"file","file":{"sdkfileid":"fid","filename":"采购合同V1.docx","filesize":123}}`)
+		line, _ = RenderLine(file, resolve)
+		if !strings.Contains(line, "[文件：采购合同V1.docx]") {
+			t.Fatalf("file 渲染: %q", line)
+		}
+
+		imgMsg := mustParse(t, `{"msgid":"img123","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"image","image":{"sdkfileid":"fid_img"}}`)
+		line, _ = RenderLine(imgMsg, resolve)
+		if !strings.Contains(line, "![图片](images/2025-10-09/image_img123.jpg)") {
+			t.Fatalf("image 渲染未按相对路径出图: %q", line)
+		}
 
 	recall := mustParse(t, `{"msgid":"m3","action":"recall","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"text"}`)
 	line, skip = RenderLine(recall, resolve)

@@ -171,8 +171,15 @@ func (m *Msg) contentText() string {
 		//      —— 直接写进会话文件会变成一堆 <!DOCTYPE html> 和 base64 乱码
 		// 这里检测到 HTML 就剥离标签只留文本，base64 图片替换成占位符。
 		return sanitizeMarkdown(m.Markdown.Content)
-	case m.Image != nil:
-		return "[图片]"
+		case m.Image != nil:
+			if m.MsgID != "" {
+				dateFolder := time.UnixMilli(m.MsgTime).Format("2006-01-02")
+				if dateFolder == "" || m.MsgTime <= 0 {
+					dateFolder = time.Now().Format("2006-01-02")
+				}
+				return fmt.Sprintf("![图片](images/%s/image_%s.jpg)", dateFolder, m.MsgID)
+			}
+			return "[图片]"
 	case m.File != nil:
 		name := m.File.FileName
 		if name == "" {

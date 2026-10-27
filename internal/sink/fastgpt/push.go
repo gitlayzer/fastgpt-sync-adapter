@@ -35,8 +35,8 @@ type NASFS interface {
 // 平台目录名 → 来源标识。
 var platformSource = map[string]string{"企微": "wecom", "飞书": "feishu"}
 
-// 不推送的目录：messages=原始归档保真（不进知识库）。
-var skipDirs = map[string]bool{"messages": true, "#recycle": true}
+// 不推送的目录：messages=原始归档保真；images=聊天内嵌图片（不进知识库）。
+var skipDirs = map[string]bool{"messages": true, "#recycle": true, "images": true}
 
 // Task FastGPT 按人推送任务（实现 engine.Task）。
 type Task struct {
@@ -183,8 +183,11 @@ func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir
 		if strings.HasSuffix(f.Name, ".meta.json") {
 			continue
 		}
-		if f.IsDir {
-			if err := t.pushDir(ctx, person, source, defaultCategory, f.Path, datasetID, activePaths); err != nil {
+			if f.IsDir {
+				if skipDirs[f.Name] {
+					continue
+				}
+				if err := t.pushDir(ctx, person, source, defaultCategory, f.Path, datasetID, activePaths); err != nil {
 				log.Printf("[fastgpt] 遍历子目录失败 %s: %v", f.Path, err)
 				if firstErr == nil {
 					firstErr = err

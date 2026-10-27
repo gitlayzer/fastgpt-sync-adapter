@@ -63,7 +63,22 @@ func TestExtractAttachments(t *testing.T) {
 	if attsCR[0].Name != "设计方案.docx" || attsCR[0].FileID != "fid_cr1" {
 		t.Fatalf("第一个附件属性不匹配: %+v", attsCR[0])
 	}
-	if attsCR[1].Name != "项目说明.pdf" || attsCR[1].FileID != "fid_cr2" {
-		t.Fatalf("第二个附件属性不匹配: %+v", attsCR[1])
+		if attsCR[1].Name != "项目说明.pdf" || attsCR[1].FileID != "fid_cr2" {
+			t.Fatalf("第二个附件属性不匹配: %+v", attsCR[1])
+		}
+
+		// 3. 图片消息类型（提取为 image_<msgid>.jpg）
+		imgJSON := `{"msgtype":"image","image":{"sdkfileid":"fid_img_123","filesize":54321,"md5sum":"imgmd5"}}`
+		msgImg := &Message{
+			MsgID:   "msg_img_999",
+			MsgType: "image",
+			Raw:     json.RawMessage(imgJSON),
+		}
+		attsImg := extractAttachments(msgImg)
+		if len(attsImg) != 1 {
+			t.Fatalf("应提取 1 个图片附件, 实际: %d", len(attsImg))
+		}
+		if attsImg[0].Name != "image_msg_img_999.jpg" || attsImg[0].FileID != "fid_img_123" || attsImg[0].Size != 54321 {
+			t.Fatalf("图片附件属性不匹配: %+v", attsImg[0])
+		}
 	}
-}

@@ -318,13 +318,16 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 			}
 		}
 
-		// 2) 附件：按发送日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A）。
-		// 文件名保持原始真实名称，完全不加丑陋的 msgid 机器前缀；以日期子目录自然隔离同名文件。
+		// 2) 附件：普通文件按发送日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A）；
+		// 图片消息则归档至 <人名>/企微/群聊记录/images/<YYYY-MM-DD>/ 下，供会话 Markdown 相对路径出图。
 		dateFolder := time.UnixMilli(r.Timestamp).Format("2006-01-02")
 		if dateFolder == "" || r.Timestamp <= 0 {
 			dateFolder = time.Now().Format("2006-01-02")
 		}
 		targetDir := path.Join(base, dateFolder)
+		if r.Kind == "image" {
+			targetDir = path.Join(base, "群聊记录", "images", dateFolder)
+		}
 
 		for i := range r.Attachments {
 			if ctx.Err() != nil {
