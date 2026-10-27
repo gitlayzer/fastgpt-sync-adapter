@@ -449,3 +449,42 @@ func TestCopyBackfillFromDocState(t *testing.T) {
 		t.Fatalf("应只删除升级前已同步、现已不存在的 dGone，实际 %v", kinds(got))
 	}
 }
+
+// 授权失效的所有者 A：B 失去权限后本轮谁都看不到 → 只删 B 的；A 的先留着，A 重新授权后再按正常规则判断。
+func TestCopyInactiveOwnerKeptUntilReauth(t *testing.T) {
+	st := copyStore(t, "ou_a", "ou_b")
+	api := newCopyAPI()
+	api.wikiSpaces["ut0"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
+	api.wikiSpaces["ut1"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
+	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_a"}}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+
+	setStatus := func(status string) {
+		g, err := st.GetOAuthGrant("feishu", "ou_a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		g.Status = status
+		if err := st.UpsertOAuthGrant(g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setStatus("expired")
+	api.wikiSpaces["ut1"] = nil // B 退出团队库
+	got := round(t, c)
+	if len(got) != 1 || got[0].ID != "del_teamdoc_ou_b" {
+		t.Fatalf("应只删 B 的那份，实际 %v", kinds(got))
+	}
+	if p := copyPersons(t, st, "teamdoc"); len(p) != 1 || p[0] != "ou_a" {
+		t.Fatalf("A 的副本应保留，实际 %v", p)
+	}
+
+	// A 重新授权，文档其实已被删 → A 的那份按正常规则删除
+	setStatus("authorized")
+	api.wikiNodes["team"] = nil
+	got = round(t, c)
+	if len(got) != 1 || got[0].ID != "del_teamdoc_ou_a" {
+		t.Fatalf("A 重新授权后应删 A 的那份，实际 %v", kinds(got))
+	}
+}

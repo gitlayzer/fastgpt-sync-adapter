@@ -88,18 +88,14 @@ func (s *Service) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 确认授权人身份
-	openID, unionID, name, err := s.fs.UserInfo(tok.AccessToken)
-	if err != nil {
-		log.Printf("[auth] 拿用户信息失败（仍保存 token）: %v", err)
+	// 确认授权人身份：拿不到 open_id 就不保存，否则会以假 ID 建出一个多余的人员目录
+	openID, _, name, err := s.fs.UserInfo(tok.AccessToken)
+	if err != nil || openID == "" {
+		log.Printf("[auth] 拿用户信息失败，未保存授权: %v", err)
+		s.html(w, 502, "获取飞书用户信息失败，请重新打开授权链接再试一次")
+		return
 	}
 	externalID := openID
-	if externalID == "" {
-		externalID = unionID
-	}
-	if externalID == "" {
-		externalID = "unknown_" + fmt.Sprint(time.Now().Unix())
-	}
 
 	now := time.Now().Unix()
 	// refresh_token 的有效期以接口返回为准；接口没给（未授予 offline_access，

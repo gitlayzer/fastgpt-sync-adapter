@@ -176,3 +176,27 @@ func TestRefreshSuccessUpdatesToken(t *testing.T) {
 		t.Fatalf("刷新结果不对: status=%s at=%s rt=%s", g.Status, g.AccessToken, g.RefreshToken)
 	}
 }
+
+// 拿不到用户信息时授权失败，不保存以假 ID（unknown_…）开头的授权。
+func TestCallbackUserInfoFailNotSaved(t *testing.T) {
+	svc, st := newTestService(t)
+	svc.fs.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) (*http.Response, error) {
+		body := `{"code":0,"access_token":"at","refresh_token":"rt","expires_in":7200,"refresh_token_expires_in":604800}`
+		if strings.HasSuffix(r.URL.Path, "/authen/v1/user_info") {
+			body = `{"code":99991663,"msg":"invalid access token"}`
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+	})}
+	rec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/oauth/feishu/callback?code=c1", nil))
+	if rec.Code == 200 {
+		t.Fatalf("拿不到用户信息时不应返回授权成功")
+	}
+	grants, err := st.ListOAuthGrants("feishu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants) != 0 {
+		t.Fatalf("不应保存授权，实际 %d 条（%s）", len(grants), grants[0].ExternalUserID)
+	}
+}

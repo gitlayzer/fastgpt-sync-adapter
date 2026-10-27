@@ -265,6 +265,7 @@ func (c *Connector) scan(ctx context.Context) error {
 				for _, g := range grants {
 					if g.Status != "authorized" || g.AccessToken == "" {
 						log.Printf("[feishu] 用户 %s 未处于已授权状态（status=%s），跳过", g.ExternalUserID, g.Status)
+						st.inactiveUsers[g.ExternalUserID] = true // 没扫：整篇删除时保留他那份，重新授权后再判断
 						continue
 					}
 					if g.ExpireAt <= now {
@@ -589,6 +590,7 @@ type scanState struct {
 	scanned     []scannedUser              // 本轮扫描完全成功的授权员工
 	globalSeen  map[string]bool            // 所有扫描成功的员工看到的文档并集
 	failedUsers map[string]bool            // 本轮扫描失败或被跳过的员工
+	inactiveUsers map[string]bool          // 有授权记录但当前不可用（未授权/已失效）的员工
 	collabFresh map[string]map[string]bool // 本轮刷新成功的协作者列表：token → open_id 集合
 }
 
@@ -597,6 +599,7 @@ func newScanState() *scanState {
 		want:        map[string]*wantDoc{},
 		globalSeen:  map[string]bool{},
 		failedUsers: map[string]bool{},
+		inactiveUsers: map[string]bool{},
 		collabFresh: map[string]map[string]bool{},
 	}
 }
@@ -811,6 +814,9 @@ func (c *Connector) emitDeletes(st *scanState) {
 			continue
 		}
 		for _, cp := range copies {
+			if (cp.Via == viaOwner || cp.Via == viaScan) && st.inactiveUsers[cp.PersonID] {
+				continue // 授权失效的员工本轮没扫，分不清是文档被删还是别人失去权限：他那份先留着
+			}
 			del(cp)
 		}
 	}
