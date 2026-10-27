@@ -199,28 +199,36 @@ func (r *BitableResolver) syncLocked() (int, error) {
 		return 0, fmt.Errorf("查询记录: %w", err)
 	}
 	n := 0
-	for _, rec := range recs {
-		f := rec.Fields
-		wecomID := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComID]))
-		if wecomID == "" {
-			continue
+		for _, rec := range recs {
+			f := rec.Fields
+			wecomID := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComID]))
+			name := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComName]))
+			// 优先使用显式指定的飞书 open_id 文本字段（适配读表格与文档同步为不同应用的情况）
+			openID := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldOpenID]))
+			if openID == "" {
+				openID, _ = feishuapi.FieldUser(f[r.cfg.FieldFeishuUser])
+			}
+			if wecomID == "" && openID == "" {
+				continue
+			}
+			if wecomID == "" {
+				wecomID = "feishu:" + openID
+			}
+			if name == "" {
+				if !strings.HasPrefix(wecomID, "feishu:") {
+					name = wecomID // 姓名为空时退回 userid，至少不产生空目录
+				} else {
+					name = openID
+				}
+			}
+			if err := r.store.UpsertIdentity(&storage.Identity{
+				WeComUserID:  wecomID,
+				FeishuUserID: openID,
+				PersonName:   name,
+			}); err == nil {
+				n++
+			}
 		}
-		name := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComName]))
-		openID, _ := feishuapi.FieldUser(f[r.cfg.FieldFeishuUser])
-		if openID == "" {
-			openID = strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldOpenID]))
-		}
-		if name == "" {
-			name = wecomID // 姓名为空时退回 userid，至少不产生空目录
-		}
-		if err := r.store.UpsertIdentity(&storage.Identity{
-			WeComUserID:  wecomID,
-			FeishuUserID: openID,
-			PersonName:   name,
-		}); err == nil {
-			n++
-		}
-	}
 	if n == 0 && len(recs) > 0 {
 		return 0, fmt.Errorf("解析出 0 条映射（检查字段名配置是否正确）")
 	}

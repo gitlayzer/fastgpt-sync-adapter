@@ -35,6 +35,7 @@ func (c *Client) SearchRecords(token, appToken, tableID string) ([]BitableRecord
 	for {
 		q := url.Values{}
 		q.Set("page_size", "500")
+		q.Set("user_id_type", "open_id")
 		if pageToken != "" {
 			q.Set("page_token", pageToken)
 		}
