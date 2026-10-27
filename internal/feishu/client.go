@@ -126,7 +126,7 @@ func (c *Client) postJSON(fullURL string, payload any, token string, out any) er
 			continue
 		}
 		if ar.Code != 0 {
-			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+			lastErr = &APIError{Code: ar.Code, Msg: ar.Msg}
 			if retryableCode(ar.Code) {
 				continue
 			}
@@ -170,7 +170,7 @@ func (c *Client) getWithToken(fullURL, token string, out any) error {
 			continue
 		}
 		if ar.Code != 0 {
-			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+			lastErr = &APIError{Code: ar.Code, Msg: ar.Msg}
 			if retryableCode(ar.Code) {
 				continue
 			}
