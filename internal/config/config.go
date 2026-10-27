@@ -252,7 +252,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("connectors.feishu.app_id / app_secret 必填")
 		}
 		if f.Mode == "" {
-			f.Mode = "tenant"
+			f.Mode = "both"
 		}
 		if f.Interval.D() <= 0 {
 			f.Interval = Duration(5 * time.Minute)

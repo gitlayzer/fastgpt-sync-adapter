@@ -1,116 +1,76 @@
-# fastgpt-sync-adapter 配置模板
-# 复制为 config.yaml 后再填自己的凭证：cp config.example.yaml config.yaml
-# config.yaml 已被 .gitignore 忽略，不要把真实凭证提交到仓库。
+# fastgpt-sync-adapter 生产配置模板
+# 使用方法：复制本文件为 config.yaml 并填入业务凭据即可开箱即用：
+#   cp config.example.yaml config.yaml
+# 注：config.yaml、private.pem 已被 .gitignore 严格忽略，避免将生产密钥提交至代码仓库。
 
-# ===== 引擎 =====
-engine:
-  state_file: "./connector_state.json"  # 各连接器 checkpoint（企微为 seq）
-  run_on_start: true                    # 启动后立即跑一轮
+# ==============================================================================
+# 1. 对外服务与接口（集成端点）
+# ==============================================================================
 
-# ===== 存储层（SQLite：授权/身份/文件台账/消息去重）=====
-storage:
-  db_file: "./adapter.db"
+# FastGPT API 文件库 HTTP 服务（常驻单进程服务，提供文件流与 Web 浏览器）
+# FastGPT 控制台添加「API 文件库」数据源时，填写：http://<IP>:8080/v1/file/list
+server:
+  enabled: true                    # 随主服务常驻启动
+  addr: ":8080"                    # FastGPT 接口监听地址与内嵌 Web 浏览器页面
+  token: "dev-token"               # FastGPT Bearer 鉴权 Token（建议生产环境更换为复杂随机密钥）
+  external_url: ""                 # 对外暴露地址（经反代/隧道暴露时填写，如 https://file.example.com；留空自动推断）
 
-# ===== 身份解析（企微 userid → 人员姓名）=====
-identity:
-  source: local                    # local（本地映射文件）/ bitable（飞书多维表格，自动同步）
-  local_file: "./identity_map.json"
-  bitable:
-    app_token: ""                  # 多维表格 app_token（source=bitable 时必填）
-    table_id: ""                   # 数据表 id
-    app_id: ""                     # 读表格的应用（可与 connectors.feishu 不同）
-    app_secret: ""
-    refresh_interval: 1h           # 同步间隔
-    # 字段名，表格改列名时改这里即可
-    field_wecom_id: "企业微信UserID"
-    field_wecom_name: "企业微信姓名"
-    field_feishu_user: "飞书人员"
-    field_openid: "飞书open_id"
-
-# ===== 飞书 OAuth 授权 webhook（常驻；飞书 user 模式必须开）=====
+# 飞书 OAuth 授权服务（员工通过此页面完成飞书账号授权）
+# 员工打开该链接完成扫码：http://<IP>:8089/oauth/feishu/start
 auth:
   enabled: true
-  addr: ":8089"
-  external_url: ""                 # 本机测试留空（按请求推断 127.0.0.1:8089）；挂隧道时填公网地址
-  refresh_interval: 1h             # user_access_token 刷新巡检间隔
+  addr: ":8089"                    # 飞书授权回调监听地址（需与飞书开放平台后台配置的回调地址一致）
+  external_url: ""                 # 挂公网域名/反代时填写，留空自动按请求 Host 推断
 
-# ===== FastGPT API 文件库 HTTP 服务（serve 模式；随主服务常驻启动）=====
-server:
-  enabled: true                    # 是否随 daemon 同步启动 API 文件库服务
-  addr: ":8080"                    # FastGPT 接口监听地址
-  token: "dev-token"               # FastGPT Bearer 鉴权 token（请求需带 Authorization: Bearer <token>）
-  external_url: ""                 # 对外暴露地址（隧道/反代时必填，留空则根据请求 Host 自动推断）
-
-# ===== 连接器（数据源）=====
-connectors:
-  # 企业微信会话内容存档
-  wecom:
-    enabled: false                 # 填好凭证后改 true
-    interval: 60s                  # 拉取间隔（媒体附件企微侧只留 ~3 天，务必远小于它）
-    batch_limit: 100               # 单批条数（SDK 上限 1000）
-    corp_id: ""                    # 企业 corpid
-    secret: ""                     # 会话存档 secret
-    # RSA 私钥：直接贴 PEM 文本（rsa_private_key），或用 rsa_private_key_file 指文件路径（二选一）
-    rsa_private_key_file: "./private.pem"
-    # SDK 动态库目录（开发机 arm64 用 ./lib/arm64，生产 amd64 用 ./lib/amd64）
-    sdk_lib_path: "./lib/arm64"
-
-  # 飞书云文档
-  feishu:
-    enabled: false
-    interval: 5m
-    batch_limit: 50
-    app_id: ""
-    app_secret: ""
-    mode: both                     # tenant（共享区/知识库）+ user（已授权用户个人云文档）
-    folders: []                    # tenant 模式：共享文件夹 token 列表
-    # 用户模式已不再使用：我的文档库通过 my_library 自动发现，团队知识库由 wiki/v2/spaces 返回。
-    # 不要在这里填个人文档库：别人读会报无权限，导致删除同步被熔断。
-    wiki_space_ids: []
-    # 文档协作者列表刷新周期（加减协作者不会改变文档修改时间，只能定期查）
-    collab_refresh_interval: 6h
-    # 显式指定的共享文档搜索关键词列表（留空则不触发搜索，避免抓入公共模板）
-    search_keys: []
-
-# ===== 文件用途分类器（R4，可配规则；命中关键词即归类，只影响归档子目录与标签，不动原文）=====
-classifier:
-  enabled: true
-  default_label: "其他"            # 未命中规则的归类
-  rules:                           # 可自由增改：label=分类目录名，keywords=关键词（不区分大小写）
-    - label: "合同"
-      keywords: ["合同", "协议", "contract", "agreement", "订单", "采购"]
-    - label: "方案"
-      keywords: ["方案", "plan", "proposal", "设计", "规划"]
-    - label: "手册"
-      keywords: ["手册", "说明书", "指南", "manual", "guide", "白皮书"]
-    - label: "专利"
-      keywords: ["专利", "patent", "cn1"]
-    - label: "报告"
-      keywords: ["报告", "report", "周报", "月报", "总结"]
-    - label: "数据表"
-      keywords: ["数据", "报表", "台账", "清单", ".xlsx", ".csv"]
-
-# ===== Sink =====
-# NAS 归档结构：<root>/<人名>/<企微|飞书>/messages/<msgid>.json      （消息原文，幂等覆盖）
-#               <root>/<人名>/<企微|飞书>/conversations/<会话>.md   （会话 Markdown，滚动追加）
-#               <root>/<人名>/<企微|飞书>/<分类>/<msgid>_<附件名>    （附件 + .meta.json 侧边车）
+# ==============================================================================
+# 2. 存储后端（群晖 NAS 归档配置）
+# ==============================================================================
 sinks:
   nas:
     enabled: true
-    url: "https://nas.example.com:5001"    # 也可用环境变量 NAS_URL 覆盖
-    username: ""
-    password: ""
-    root_path: "/FastGPT-test"             # 必须是 NAS 上已存在的共享文件夹开头
-    max_file_size_mb: 200                  # 单附件上限（MB，默认 200），超出跳过下载以保护内存防 OOM
-    # 按 FastGPT 用户列表在 NAS 自动建目录（人工上传区；需账号级 api_key）
-    user_dirs:
-      enabled: false
-      fastgpt_base_url: ""
-      fastgpt_api_key: ""
+    url: "https://nas.example.com:5001"    # 群晖 NAS 地址（支持环境变量 NAS_URL 覆盖）
+    username: "FastGPT"                   # 拥有读写权限的群晖账号
+    password: "YourPassword"              # 群晖账号密码
+    root_path: "/FastGPT-test"             # 归档根路径（必须以 NAS 上已创建的共享文件夹开头）
+    max_file_size_mb: 200                  # 单附件大小上限（MB，默认 200），超出跳过下载以防 OOM 崩溃
 
-  # FastGPT 推送（方案 A：按人建知识库，主动推；本期不做文档级权限）
+  # [可选] FastGPT 主动按人推送（一人一库模式；默认通过上方的 API 文件库被动拉取即可）
   fastgpt:
-    enabled: false
-    base_url: "https://cloud.fastgpt.cn"
-    api_key: ""
-    interval: 5m                   # 推送巡检间隔
+    enabled: false                         # 需要适配器主动调用 FastGPT OpenAPI 推送建库时设为 true
+    base_url: "https://cloud.fastgpt.cn"   # FastGPT 域名（自建填写自建域名）
+    api_key: "fastgpt-xxxxxxxxxxxx"        # FastGPT 账号级 API Key
+    interval: 5m                           # 主动推送巡检周期
+
+# ==============================================================================
+# 3. 数据源：企业微信（会话存档）
+# ==============================================================================
+connectors:
+  wecom:
+    enabled: true                          # 是否启用企微会话归档
+    corp_id: "ww1234567890abcdef"          # 企业微信 CorpID
+    secret: "YourWeComChatSecret"          # 会话内容存档 Secret
+    rsa_private_key_file: "./private.pem"  # 解密消息用的 RSA 私钥文件路径
+    interval: 60s                          # 增量拉取轮询间隔
+
+  # ==============================================================================
+  # 4. 数据源：飞书（云文档 + 邮件 + 知识库）
+  # ==============================================================================
+  feishu:
+    enabled: true                          # 是否启用飞书同步
+    app_id: "cli_1234567890abcdef"         # 飞书自建应用 App ID
+    app_secret: "YourFeishuAppSecret"      # 飞书自建应用 App Secret
+    interval: 5m                           # 增量扫描周期（建议 100 人规模设置为 15m~30m）
+    mode: "both"                           # both（个人云文档 + 团队知识库）/ user（仅个人云文档）
+
+# ==============================================================================
+# 5. 跨平台实名身份解析（企微 UserID ↔ 飞书 OpenID ↔ 员工真实姓名）
+# ==============================================================================
+identity:
+  source: bitable                          # bitable（飞书多维表格自动同步，推荐）/ local（本地 JSON 文件）
+  local_file: "./identity_map.json"        # source=local 时的离线备份映射表
+  bitable:
+    app_token: "bascnxxxxxxxxxxxxxxxxxxxxxx" # 多维表格 base app_token
+    table_id: "tblxxxxxxxxxxxx"            # 数据表 ID
+    app_id: "cli_1234567890abcdef"         # 读取多维表格的应用凭证（建议直接使用飞书同步应用，消除跨应用 open_id 差异）
+    app_secret: "YourFeishuAppSecret"
+    refresh_interval: 1h                   # 全员名单自动定时刷新间隔
