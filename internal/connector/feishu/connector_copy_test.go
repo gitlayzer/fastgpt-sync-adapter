@@ -19,6 +19,7 @@ type copyAPI struct {
 	mails    []feishuapi.MailMessage
 	mailAtts []feishuapi.MailAttachment
 	minutes  []feishuapi.MinuteItem
+	minErr   error
 	myLib    map[string]string // userToken -> 我的文档库 space_id
 	myLibErr error
 	walkErr  map[string]bool // spaceID -> 遍历报错
@@ -34,7 +35,7 @@ func (m *copyAPI) ListMailboxMessages(string, int) ([]feishuapi.MailMessage, err
 func (m *copyAPI) ListMailAttachments(string, string) ([]feishuapi.MailAttachment, error) {
 	return m.mailAtts, nil
 }
-func (m *copyAPI) SearchMinutes(string) ([]feishuapi.MinuteItem, error) { return m.minutes, nil }
+func (m *copyAPI) SearchMinutes(string) ([]feishuapi.MinuteItem, error) { return m.minutes, m.minErr }
 func (m *copyAPI) GetMyLibrarySpace(tok string) (*feishuapi.WikiSpace, error) {
 	if m.myLibErr != nil {
 		return nil, m.myLibErr
@@ -376,5 +377,75 @@ func TestCopyDocDeleteBlockedByFailedHolder(t *testing.T) {
 	got := round(t, c)
 	if k := kinds(got); len(k) != 3 {
 		t.Fatalf("应删除 A、B、C 三份，实际 %v", k)
+	}
+}
+
+// 第 1 条：妙记接口这一轮失败 → 不判断妙记删除，也不影响其他文档。
+func TestCopyMinutesErrorNoDelete(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "文档1", "ou_a", "100")}
+	api.minutes = []feishuapi.MinuteItem{{MinuteToken: "min1", Title: "周会", OwnerID: "ou_a", CreateTime: 1700000000000}}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+
+	api.minutes, api.minErr = nil, errors.New("rate limited")
+	if got := round(t, c); len(got) != 0 {
+		t.Fatalf("妙记接口失败时不应删除，实际 %v", kinds(got))
+	}
+	api.folders["rootA"] = nil // 其他文档的删除不受影响
+	if got := round(t, c); len(got) != 1 || got[0].ID != "del_d1_ou_a" {
+		t.Fatalf("云盘文档删除应照常产出，实际 %v", kinds(got))
+	}
+}
+
+// 第 8 条：同一封邮件里两个同名附件 → 文件名不同。
+func TestCopyMailSameNameAttachments(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.mails = []feishuapi.MailMessage{{MessageID: "msg_abcdefgh123", HasAttachments: true, CreatedTime: 1700000000000}}
+	api.mailAtts = []feishuapi.MailAttachment{{ID: "a1", Name: "合同.pdf"}, {ID: "a2", Name: "合同.pdf"}}
+	c := newUserConn(t, st, api, Config{})
+	got := round(t, c)
+	if len(got) != 1 || len(got[0].Attachments) != 2 {
+		t.Fatalf("应产出 1 封邮件 2 个附件，实际 %+v", got)
+	}
+	if a, b := got[0].Attachments[0].Name, got[0].Attachments[1].Name; a != "合同_defgh123.pdf" || b != "合同_defgh123_2.pdf" {
+		t.Fatalf("同名附件应区分，实际 %q %q", a, b)
+	}
+}
+
+// 升级：旧版 feishu_doc_state 回填成所有者副本 → 升级前已同步、升级后被删的文档也会被删除。
+func TestCopyBackfillFromDocState(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	old, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_a", AccessToken: "ut0", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+	old.UpsertDocState("dKeep", "保留_dKeep.docx", "ou_a", 100)
+	old.UpsertDocState("dGone", "已删_dGone.docx", "ou_a", 100)
+	old.Close()
+
+	st, err := storage.Open(dbPath) // 重新打开时执行回填
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if p := copyPersons(t, st, "dGone"); len(p) != 1 || p[0] != "ou_a" {
+		t.Fatalf("应回填所有者副本，实际 %v", p)
+	}
+
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("dKeep", "保留", "ou_a", "100")}
+	c := newUserConn(t, st, api, Config{})
+	if got := round(t, c); len(got) != 1 || got[0].ID != "del_dGone_ou_a" {
+		t.Fatalf("应只删除升级前已同步、现已不存在的 dGone，实际 %v", kinds(got))
 	}
 }

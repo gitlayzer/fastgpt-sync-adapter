@@ -382,8 +382,13 @@ func (c *Connector) scan(ctx context.Context) error {
 					}
 				}
 
-				// d) 智能纪要/妙记扫描（SearchMinutes 会翻完所有页，列表完整，可参与删除判断）
+				// d) 智能纪要/妙记扫描（SearchMinutes 会翻完所有页，列表完整，可参与删除判断）。
+				// 接口失败时不算整个人扫描失败（没开通妙记的账号可能一直报错），只是本轮不判断妙记的删除。
 				minutesList, err := c.api.SearchMinutes(g.AccessToken)
+				minutesOK := err == nil
+				if err != nil {
+					log.Printf("[feishu] 取 %s 的妙记失败（本轮不判断妙记删除）: %v", g.ExternalUserID, err)
+				}
 				if err == nil && len(minutesList) > 0 {
 					for _, m := range minutesList {
 						if m.MinuteToken == "" {
@@ -424,6 +429,7 @@ func (c *Connector) scan(ctx context.Context) error {
 							continue
 						}
 						var recordAtts []model.Attachment
+						usedNames := map[string]int{} // 同一封邮件里的同名附件再加序号
 						for _, ma := range atts {
 							if ma.ID == "" || ma.Name == "" {
 								continue
@@ -434,8 +440,12 @@ func (c *Connector) scan(ctx context.Context) error {
 								shortID = shortID[len(shortID)-8:]
 							}
 							ext := path.Ext(ma.Name)
+							attName := sanitizeFilename(strings.TrimSuffix(ma.Name, ext)) + "_" + shortID
+							if usedNames[attName]++; usedNames[attName] > 1 {
+								attName = fmt.Sprintf("%s_%d", attName, usedNames[attName])
+							}
 							recordAtts = append(recordAtts, model.Attachment{
-								Name:   sanitizeFilename(strings.TrimSuffix(ma.Name, ext)) + "_" + shortID + ext,
+								Name:   attName + ext,
 								FileID: "mail:" + msg.MessageID + ":" + ma.ID,
 								Size:   ma.Size,
 								UserID: g.ExternalUserID,
@@ -468,7 +478,7 @@ func (c *Connector) scan(ctx context.Context) error {
 					st.failedUsers[g.ExternalUserID] = true
 					log.Printf("[feishu] 用户 %s 扫描过程存在接口错误，触发熔断保护，暂停该用户本轮删除同步", g.ExternalUserID)
 				} else {
-					st.scanned = append(st.scanned, scannedUser{id: g.ExternalUserID, seen: userSeen})
+					st.scanned = append(st.scanned, scannedUser{id: g.ExternalUserID, seen: userSeen, minutesOK: minutesOK})
 					for t := range userSeen {
 						st.globalSeen[t] = true
 					}
@@ -567,8 +577,9 @@ func (w *wantDoc) addPerson(person, via string) {
 }
 
 type scannedUser struct {
-	id   string
-	seen map[string]bool
+	id        string
+	seen      map[string]bool
+	minutesOK bool // 本轮妙记列表取成功；失败时不判断妙记删除
 }
 
 // scanState 一轮扫描的汇总结果。
@@ -709,6 +720,7 @@ func (c *Connector) emitWrites(st *scanState) {
 		}
 		c.pendingMeta[rec.ID] = pendingDoc{
 			token:    token,
+			kind:     w.rec.Kind,
 			title:    name,
 			ownerID:  w.owner,
 			editTime: w.editTs,
@@ -756,7 +768,10 @@ func (c *Connector) emitDeletes(st *scanState) {
 		}
 		var mine, missing []storage.DocCopy
 		for _, cp := range copies {
-			if strings.HasPrefix(cp.Token, "mail_") || (cp.Via != viaOwner && cp.Via != viaScan) {
+			if cp.Kind == "mail" || strings.HasPrefix(cp.Token, "mail_") || (cp.Via != viaOwner && cp.Via != viaScan) {
+				continue
+			}
+			if cp.Kind == "minutes" && !u.minutesOK {
 				continue
 			}
 			mine = append(mine, cp)
@@ -814,6 +829,7 @@ func (c *Connector) emitDeletes(st *scanState) {
 // pendingDoc 待确认记录的元数据（Ack 时写副本状态用）。
 type pendingDoc struct {
 	token        string
+	kind         string
 	title        string
 	ownerID      string
 	editTime     int64
@@ -841,7 +857,7 @@ func (c *Connector) Ack(recordID string) error {
 	for p, via := range meta.persons {
 		if err := c.store.UpsertCopy(storage.DocCopy{
 			Token: meta.token, PersonID: p, Via: via,
-			EditTime: meta.editTime, FileName: meta.title, OwnerID: meta.ownerID,
+			EditTime: meta.editTime, FileName: meta.title, OwnerID: meta.ownerID, Kind: meta.kind,
 		}); err != nil {
 			return err
 		}

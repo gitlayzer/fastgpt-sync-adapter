@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS feishu_doc_copy (
   edit_time  INTEGER NOT NULL DEFAULT 0,
   file_name  TEXT NOT NULL DEFAULT '',
   owner_id   TEXT NOT NULL DEFAULT '',
+  kind       TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (token, person_id)
 );
@@ -148,6 +149,16 @@ CREATE TABLE IF NOT EXISTS feishu_doc_members (
 );`)
 	if err != nil {
 		return fmt.Errorf("建表迁移: %w", err)
+	}
+	// 从旧版升级：副本表为空时，用 feishu_doc_state 给所有者回填一份副本记录（只做一次），
+	// 这样升级前已同步、升级后在飞书被删的文档也能被删除判断覆盖到。
+	if _, err := s.db.Exec(`
+INSERT OR IGNORE INTO feishu_doc_copy (token, person_id, via, edit_time, file_name, owner_id, kind, updated_at)
+SELECT token, owner_id, 'owner', edit_time, title, owner_id,
+       CASE WHEN token LIKE 'mail\_%' ESCAPE '\' THEN 'mail' ELSE '' END, updated_at
+FROM feishu_doc_state
+WHERE owner_id != '' AND title != '' AND NOT EXISTS (SELECT 1 FROM feishu_doc_copy)`); err != nil {
+		return fmt.Errorf("回填飞书副本状态: %w", err)
 	}
 	return nil
 }
@@ -477,10 +488,11 @@ type DocCopy struct {
 	EditTime int64
 	FileName string
 	OwnerID  string
+	Kind     string // 记录类型（docx/sheet/.../mail/minutes），删除判断按类型区分
 }
 
 func (s *Store) queryCopies(where string, arg string) ([]DocCopy, error) {
-	rows, err := s.db.Query(`SELECT token, person_id, via, edit_time, file_name, owner_id
+	rows, err := s.db.Query(`SELECT token, person_id, via, edit_time, file_name, owner_id, kind
 FROM feishu_doc_copy WHERE `+where, arg)
 	if err != nil {
 		return nil, err
@@ -489,7 +501,7 @@ FROM feishu_doc_copy WHERE `+where, arg)
 	var out []DocCopy
 	for rows.Next() {
 		var c DocCopy
-		if err := rows.Scan(&c.Token, &c.PersonID, &c.Via, &c.EditTime, &c.FileName, &c.OwnerID); err != nil {
+		if err := rows.Scan(&c.Token, &c.PersonID, &c.Via, &c.EditTime, &c.FileName, &c.OwnerID, &c.Kind); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -510,11 +522,11 @@ func (s *Store) ListCopiesByPerson(personID string) ([]DocCopy, error) {
 // UpsertCopy 记录某人的副本已写入 NAS。
 func (s *Store) UpsertCopy(c DocCopy) error {
 	_, err := s.db.Exec(`
-INSERT INTO feishu_doc_copy (token, person_id, via, edit_time, file_name, owner_id, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO feishu_doc_copy (token, person_id, via, edit_time, file_name, owner_id, kind, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(token, person_id) DO UPDATE SET via=excluded.via, edit_time=excluded.edit_time,
-  file_name=excluded.file_name, owner_id=excluded.owner_id, updated_at=excluded.updated_at`,
-		c.Token, c.PersonID, c.Via, c.EditTime, c.FileName, c.OwnerID, time.Now().Unix())
+  file_name=excluded.file_name, owner_id=excluded.owner_id, kind=excluded.kind, updated_at=excluded.updated_at`,
+		c.Token, c.PersonID, c.Via, c.EditTime, c.FileName, c.OwnerID, c.Kind, time.Now().Unix())
 	return err
 }
 
