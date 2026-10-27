@@ -6,6 +6,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -215,6 +216,18 @@ func (s *Service) refreshExpiring() int {
 		}
 		tok, err := s.fs.RefreshUserToken(g.RefreshToken)
 		if err != nil {
+			// 授权已失效（撤销/已使用/过期/用户状态异常等）：标 expired，
+			// 否则 connector 每轮都把他算作扫描失败，他持有副本的文档永远不做整篇删除
+			var apiErr *feishu.APIError
+			if errors.As(err, &apiErr) && needReauth(apiErr.Code) {
+				g.Status = "expired"
+				if err := s.store.UpsertOAuthGrant(g); err != nil {
+					log.Printf("[auth] 保存 %s 的授权状态失败: %v", g.ExternalUserID, err)
+					continue
+				}
+				log.Printf("[auth] %s 的授权已失效（code=%d），需重新授权", g.ExternalUserID, apiErr.Code)
+				continue
+			}
 			log.Printf("[auth] 刷新 %s token 失败: %v", g.ExternalUserID, err)
 			continue
 		}
@@ -234,6 +247,22 @@ func (s *Service) refreshExpiring() int {
 			time.Unix(g.ExpireAt, 0).Format("01-02 15:04"))
 	}
 	return refreshed
+}
+
+// needReauth 刷新接口返回这些错误码时，该用户只能重新授权才能恢复。
+// 应用级错误（凭证错误、应用未安装/未启用、未开刷新开关）不在此列：那是配置问题，不该把所有人标失效。
+func needReauth(code int) bool {
+	switch code {
+	case 20008, // 用户不存在
+		20010, // 用户无应用使用权限
+		20026, // refresh_token 无效
+		20037, // refresh_token 已过期
+		20064, // refresh_token 已被撤销
+		20066, // 用户状态非法
+		20073: // refresh_token 已被使用
+		return true
+	}
+	return false
 }
 
 func (s *Service) html(w http.ResponseWriter, status int, text string) {

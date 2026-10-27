@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -100,5 +101,78 @@ func TestCallbackMissingCode(t *testing.T) {
 	svc.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/oauth/feishu/callback", nil))
 	if rec.Code != 400 {
 		t.Fatalf("缺 code 应 400, 得到 %d", rec.Code)
+	}
+}
+
+// stubTransport 拦截飞书请求，返回固定响应。
+type stubTransport func(*http.Request) (*http.Response, error)
+
+func (f stubTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// seedExpiringGrant 塞一条 access_token 即将过期、会被本轮刷新的授权，并让刷新接口返回 body。
+func seedExpiringGrant(t *testing.T, svc *Service, st *storage.Store, httpStatus int, body string) {
+	t.Helper()
+	svc.fs.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/authen/v2/oauth/token") {
+			t.Fatalf("意外请求: %s", r.URL)
+		}
+		return &http.Response{StatusCode: httpStatus, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+	})}
+	now := time.Now().Unix()
+	if err := st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_zhangsan",
+		AccessToken: "at", RefreshToken: "rt",
+		ExpireAt: now + 60, RefreshExpireAt: now + 86400,
+		Status: "authorized",
+	}); err != nil {
+		t.Fatalf("UpsertOAuthGrant: %v", err)
+	}
+}
+
+func TestRefreshReauthCodeMarksExpired(t *testing.T) {
+	for _, code := range []string{"20064", "20073", "20037", "20066"} {
+		t.Run(code, func(t *testing.T) {
+			svc, st := newTestService(t)
+			seedExpiringGrant(t, svc, st, 400, `{"code":`+code+`,"error":"invalid_grant","error_description":"x"}`)
+			if n := svc.refreshExpiring(); n != 0 {
+				t.Fatalf("刷新失败不应计入成功数, 得到 %d", n)
+			}
+			g, err := st.GetOAuthGrant("feishu", "ou_zhangsan")
+			if err != nil {
+				t.Fatalf("GetOAuthGrant: %v", err)
+			}
+			if g.Status != "expired" {
+				t.Fatalf("code=%s 应标 expired, 得到 %s", code, g.Status)
+			}
+		})
+	}
+}
+
+func TestRefreshAppLevelErrorKeepsAuthorized(t *testing.T) {
+	svc, st := newTestService(t)
+	// 20074：应用没开刷新开关，是配置问题，不能把用户标失效
+	seedExpiringGrant(t, svc, st, 400, `{"code":20074,"error":"invalid_request","error_description":"x"}`)
+	svc.refreshExpiring()
+	g, err := st.GetOAuthGrant("feishu", "ou_zhangsan")
+	if err != nil {
+		t.Fatalf("GetOAuthGrant: %v", err)
+	}
+	if g.Status != "authorized" {
+		t.Fatalf("应用级错误不应改状态, 得到 %s", g.Status)
+	}
+}
+
+func TestRefreshSuccessUpdatesToken(t *testing.T) {
+	svc, st := newTestService(t)
+	seedExpiringGrant(t, svc, st, 200, `{"code":0,"access_token":"at2","refresh_token":"rt2","expires_in":7200,"refresh_token_expires_in":604800}`)
+	if n := svc.refreshExpiring(); n != 1 {
+		t.Fatalf("应刷新 1 条, 得到 %d", n)
+	}
+	g, err := st.GetOAuthGrant("feishu", "ou_zhangsan")
+	if err != nil {
+		t.Fatalf("GetOAuthGrant: %v", err)
+	}
+	if g.Status != "authorized" || g.AccessToken != "at2" || g.RefreshToken != "rt2" {
+		t.Fatalf("刷新结果不对: status=%s at=%s rt=%s", g.Status, g.AccessToken, g.RefreshToken)
 	}
 }

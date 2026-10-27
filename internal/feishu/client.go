@@ -31,6 +31,14 @@ type apiResp struct {
 	Msg  string `json:"msg"`
 }
 
+// APIError 飞书接口返回非 0 code 时的错误，调用方可用 errors.As 按 Code 区分处理。
+type APIError struct {
+	Code int
+	Msg  string
+}
+
+func (e *APIError) Error() string { return fmt.Sprintf("飞书错误 code=%d msg=%s", e.Code, e.Msg) }
+
 // apiAttempts 飞书 API 最大尝试次数。
 const apiAttempts = 3
 
@@ -71,7 +79,7 @@ func (c *Client) post(path string, payload any, out any) error {
 			continue
 		}
 		if ar.Code != 0 {
-			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
+			lastErr = &APIError{Code: ar.Code, Msg: ar.Msg}
 			if retryableCode(ar.Code) {
 				continue
 			}
