@@ -115,6 +115,8 @@ func exportExt(docType string) (string, bool) {
 		return "docx", true
 	case "sheet", "bitable":
 		return "xlsx", true
+	case "slides":
+		return "pptx", true
 	}
 	return "", false
 }

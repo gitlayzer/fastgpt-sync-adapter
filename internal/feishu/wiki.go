@@ -30,13 +30,13 @@ type WikiNode struct {
 	HasChild   bool   `json:"has_child"`
 	NodeType   string `json:"node_type"` // origin / shortcut
 
-		// NodeCreateTime / NodeEditTime 是节点自身的创建/编辑时间（秒级字符串）。
-		// 没有文档级的「内容修改时间」，用节点编辑时间做变更判断已经够用：
-		// 文档正文改动会刷新节点 edit_time。
+		// 节点与内容时间：obj_edit_time 为飞书服务端真实返回的文档修改时间
 		NodeCreateTime string `json:"node_create_time"`
 		NodeEditTime   string `json:"node_edit_time"`
-		Creator        string `json:"creator"` // 节点创建人（open_id）
-		Owner          string `json:"owner"`   // 节点归属人（open_id）
+		ObjCreateTime  string `json:"obj_create_time"`
+		ObjEditTime    string `json:"obj_edit_time"` // 关键：飞书实际返回的文档内容更新时间
+		Creator        string `json:"creator"`       // 节点创建人（open_id）
+		Owner          string `json:"owner"`         // 节点归属人（open_id）
 	}
 
 // ListWikiSpaces 列出调用者可访问的知识库空间（自动翻页）。
@@ -67,6 +67,23 @@ func (c *Client) ListWikiSpaces(token string) ([]WikiSpace, error) {
 		pageToken = out.Data.PageToken
 	}
 	return all, nil
+}
+
+// GetMyLibrarySpace 获取用户个人“我的文档库”空间信息（飞书固定路由 my_library）。
+func (c *Client) GetMyLibrarySpace(userToken string) (*WikiSpace, error) {
+	var out struct {
+		apiResp
+		Data struct {
+			Space WikiSpace `json:"space"`
+		} `json:"data"`
+	}
+	if err := c.get("/wiki/v2/spaces/my_library", userToken, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Data.Space.SpaceID == "" {
+		return nil, nil
+	}
+	return &out.Data.Space, nil
 }
 
 // ListWikiNodes 列出某个空间（或某个父节点）下的子节点（自动翻页）。

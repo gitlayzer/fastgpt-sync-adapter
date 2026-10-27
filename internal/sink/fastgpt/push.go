@@ -113,13 +113,15 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 	if err != nil {
 		return err
 	}
+	activePaths := map[string]bool{}
 	for _, e := range entries {
 		if skipDirs[e.Name] {
 			continue
 		}
 		if !e.IsDir {
-			// 平铺在平台根目录下的文件（如飞书导出的文档）：按文件名自动归类并推送
+			// 平铺在平台根目录下的文件：按文件名自动归类并推送
 			category := classifyFilename(e.Name)
+			activePaths[e.Path] = true
 			if err := t.pushFile(ctx, person, source, category, e, datasetID); err != nil {
 				log.Printf("[fastgpt] 推送失败 %s: %v", e.Path, err)
 			}
@@ -127,34 +129,60 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 		}
 		if e.Name == "群聊记录" || e.Name == "conversations" {
 			// 会话 markdown：分类记为 会话
-			if err := t.pushDir(ctx, person, source, "会话", e.Path, datasetID); err != nil {
+			if err := t.pushDir(ctx, person, source, "会话", e.Path, datasetID, activePaths); err != nil {
 				log.Printf("[fastgpt] %s/%s/%s 出错: %v", person, platLabel, e.Name, err)
 			}
 			continue
 		}
-		// 日期子目录（YYYY-MM-DD，方案 A）或传统分类目录（合同/方案等）
+		// 日期子目录（YYYY-MM-DD，方案 A）、云文档/、邮件/ 或传统分类目录（合同/方案等）
 		isDateDir := len(e.Name) == 10 && e.Name[4] == '-' && e.Name[7] == '-'
 		category := e.Name
-		if isDateDir {
+		if isDateDir || e.Name == "云文档" || e.Name == "邮件" {
 			category = "" // 由各文件按文件名关键词自动归类
 		}
-		if err := t.pushDir(ctx, person, source, category, e.Path, datasetID); err != nil {
+		if err := t.pushDir(ctx, person, source, category, e.Path, datasetID, activePaths); err != nil {
 			log.Printf("[fastgpt] %s/%s/%s 出错: %v", person, platLabel, e.Name, err)
+		}
+	}
+
+	// 反向对账：检测 NAS 上已删除但在 FastGPT 知识库与本地 SQLite 中仍有残留的集合，完成彻底清理闭环
+	if t.store != nil {
+		indexedFiles, err := t.store.ListFileIndexByPersonAndSource(person, source)
+		if err == nil {
+			for _, entry := range indexedFiles {
+				if !activePaths[entry.NasPath] && entry.CollectionID != "" {
+					log.Printf("[fastgpt] 检测到 NAS 文件已删除，同步清理 FastGPT 知识库集合: %s (collection: %s)", entry.NasPath, entry.CollectionID)
+					c := t.manager.ClientFor(datasetID)
+					if err := c.DeleteCollection(entry.CollectionID); err != nil {
+						log.Printf("[fastgpt] 删除 FastGPT 集合失败 %s: %v", entry.CollectionID, err)
+					}
+					_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
+				}
+			}
 		}
 	}
 	return nil
 }
 
-// pushDir 推送一个目录下的文件（跳过 .meta.json）。
+// pushDir 推送一个目录下的文件（跳过 .meta.json），支持多层子目录递归。
 // 当 defaultCategory 为空时，根据每个文件的名称关键词自动归类。
-func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir, datasetID string) error {
+func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir, datasetID string, activePaths map[string]bool) error {
 	files, err := t.nas.List(dir)
 	if err != nil {
 		return err
 	}
 	for _, f := range files {
-		if f.IsDir || strings.HasSuffix(f.Name, ".meta.json") {
+		if strings.HasSuffix(f.Name, ".meta.json") {
 			continue
+		}
+		if f.IsDir {
+			if err := t.pushDir(ctx, person, source, defaultCategory, f.Path, datasetID, activePaths); err != nil {
+				log.Printf("[fastgpt] 遍历子目录失败 %s: %v", f.Path, err)
+			}
+			continue
+		}
+		if activePaths != nil {
+			activePaths[f.Path] = true
 		}
 		category := defaultCategory
 		if category == "" {
@@ -224,12 +252,18 @@ func (t *Task) pushFile(ctx context.Context, person, source, category string, f 
 		return fmt.Errorf("读取: %w", err)
 	}
 
-		// 展示名：默认使用真实文件名；若为历史遗留带 <msgid>_ 机器前缀的文件，则剥离前缀以还原真实文件名
+		// 展示名：默认使用真实文件名；若带有 _<短Token> 后缀或历史遗留 <msgid>_ 机器前缀，则剥离以还原最纯净的中文标题
 		display := f.Name
 		if category != "会话" {
-			if idx := strings.LastIndex(f.Name, "_"); idx > 0 {
+			ext := path.Ext(f.Name)
+			base := strings.TrimSuffix(f.Name, ext)
+			if idx := strings.LastIndex(base, "_"); idx > 0 {
+				suffix := base[idx+1:]
+				if len(suffix) >= 6 && len(suffix) <= 12 {
+					display = base[:idx] + ext
+				}
+			} else if idx := strings.LastIndex(f.Name, "_"); idx > 0 {
 				prefix := f.Name[:idx]
-				// 包含数字且长度超过 10 判定为机器 msgid 前缀
 				if strings.ContainsAny(prefix, "0123456789") && len(prefix) > 10 {
 					display = f.Name[idx+1:]
 				}

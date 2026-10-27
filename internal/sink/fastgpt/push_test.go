@@ -392,4 +392,48 @@ func TestPushDateSubdirectoryOptionA(t *testing.T) {
 	}
 }
 
+func TestPushDeletesCollectionWhenNASFileDeleted(t *testing.T) {
+	fs := newFakeNAS()
+	root := "/FastGPT-test"
+	fs.dirs[root] = nil
+	fs.addDir(root, "赵六")
+	fs.addDir(root+"/赵六", "飞书")
+	fs.addDir(root+"/赵六/飞书", "云文档")
+	docPath := root + "/赵六/飞书/云文档/被删除的报告_abc12345.docx"
+	fs.addFile(root+"/赵六/飞书/云文档", "被删除的报告_abc12345.docx", []byte("报告内容"))
+
+	fg, baseURL := newFakeFastGPT(t)
+	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+
+	task := newPushTask(t, baseURL, fs, st)
+	if err := task.Run(context.Background()); err != nil {
+		t.Fatalf("Run 1 失败: %v", err)
+	}
+
+	if len(fg.collections) != 1 {
+		t.Fatalf("首轮应生成 1 个集合, 实际: %d", len(fg.collections))
+	}
+
+	// 模拟该文件从 NAS 被删除
+	delete(fs.files, docPath)
+	fs.dirs[root+"/赵六/飞书/云文档"] = nil
+
+	// 第二轮：反向对账，检测到 NAS 文件已删除，应自动同步删除 FastGPT Collection
+	if err := task.Run(context.Background()); err != nil {
+		t.Fatalf("Run 2 失败: %v", err)
+	}
+
+	if len(fg.collections) != 0 {
+		t.Fatalf("NAS 文件删除后，FastGPT 中的集合应被同步清理，实际残留: %v", fg.collections)
+	}
+
+	// 台账也应被清理
+	fi, _ := st.GetFileIndex("赵六", "feishu", docPath)
+	if fi != nil {
+		t.Fatalf("台账记录应被清理，实际仍存在: %+v", fi)
+	}
+}
+
+
 

@@ -260,6 +260,36 @@ FROM file_index WHERE person=? AND source=? AND nas_path=?`, person, source, nas
 	return e, nil
 }
 
+// ListFileIndexByPersonAndSource 列出某人某来源的所有已推送台账记录（用于 NAS 删除后的反向对账）。
+func (s *Store) ListFileIndexByPersonAndSource(person, source string) ([]FileIndexEntry, error) {
+	rows, err := s.db.Query(`
+SELECT person, source, nas_path, category, collection_id, frozen, checksum, updated_at
+FROM file_index WHERE person=? AND source=?`, person, source)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []FileIndexEntry
+	for rows.Next() {
+		var e FileIndexEntry
+		var frozen int
+		if err := rows.Scan(&e.Person, &e.Source, &e.NasPath, &e.Category, &e.CollectionID,
+			&frozen, &e.Checksum, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		e.Frozen = frozen == 1
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// DeleteFileIndex 删除某条文件索引台账。
+func (s *Store) DeleteFileIndex(person, source, nasPath string) error {
+	_, err := s.db.Exec(`DELETE FROM file_index WHERE person=? AND source=? AND nas_path=?`, person, source, nasPath)
+	return err
+}
+
 // ===== 连接器游标 =====
 
 // GetCheckpoint 读取连接器游标；不存在返回空字符串（不报错，等价从头开始）。
@@ -359,6 +389,25 @@ type DocState struct {
 // ListDocStates 列出所有历史已同步的飞书文档记录。
 func (s *Store) ListDocStates() ([]DocState, error) {
 	rows, err := s.db.Query(`SELECT token, edit_time, title, owner_id FROM feishu_doc_state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []DocState
+	for rows.Next() {
+		var d DocState
+		if err := rows.Scan(&d.Token, &d.EditTime, &d.Title, &d.OwnerID); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// ListDocStatesByUser 列出属于某个特定用户的历史已同步飞书文档记录（用于单人作用域差集比对）。
+func (s *Store) ListDocStatesByUser(ownerID string) ([]DocState, error) {
+	rows, err := s.db.Query(`SELECT token, edit_time, title, owner_id FROM feishu_doc_state WHERE owner_id=?`, ownerID)
 	if err != nil {
 		return nil, err
 	}

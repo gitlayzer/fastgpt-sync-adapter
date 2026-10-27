@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,9 +25,10 @@ type Config struct {
 	AppSecret string   `yaml:"app_secret"`
 	Mode      string   `yaml:"mode"`    // tenant / user / both
 	Folders   []string `yaml:"folders"` // tenant 模式遍历的共享文件夹 token 列表
-	// WikiSpaceIDs 额外遍历的知识库空间 ID。用于「我的文档库」这类
-	// wiki/v2/spaces 不返回、但按 ID 可以正常列节点的空间。
+	// WikiSpaceIDs 额外遍历的知识库空间 ID（纯数字）。
+	// 个人“我的文档库”已通过 my_library 自动发现，此处仅作手动补充。
 	WikiSpaceIDs []string `yaml:"wiki_space_ids"`
+	SearchKeys   []string `yaml:"search_keys"` // 显式指定的共享文档搜索关键词（留空则不触发搜索，避免抓入公共模板）
 }
 
 // API 抽象（便于测试替换；feishuapi.Client 适配实现）。
@@ -41,6 +43,7 @@ type API interface {
 
 	// 知识库（wiki）：飞书新版「我的文档库」只能从这里列出来
 	ListWikiSpaces(token string) ([]feishuapi.WikiSpace, error)
+	GetMyLibrarySpace(userToken string) (*feishuapi.WikiSpace, error)
 	WalkWikiSpace(token, spaceID string, maxDepth int, fn func(feishuapi.WikiSpace, feishuapi.WikiNode)) error
 
 	// 导出云文档源文件（docx/sheet/bitable → .docx/.xlsx）。
@@ -141,11 +144,12 @@ func docToRecord(f feishuapi.DriveFile, viewerID string) model.Record {
 		Attachments: []model.Attachment{{
 			Name:   attachmentName(f),
 			FileID: attachmentFileID(f),
+			UserID: viewerID, // 记录持有该文档权限的具体员工，下载时精确定向取 Token
 		}},
 	}
 }
 
-// attachmentFileID 附件标识：file 类型走 drive 下载；docx/doc 走 raw_content。
+// attachmentFileID 附件标识：file 类型走 drive 下载；docx/doc/sheet/bitable/slides 走导出。
 func attachmentFileID(f feishuapi.DriveFile) string {
 	switch f.Type {
 	case "file":
@@ -154,38 +158,58 @@ func attachmentFileID(f feishuapi.DriveFile) string {
 		return "docx:" + f.Token
 	case "doc":
 		return "doc:" + f.Token
+	case "sheet":
+		return "sheet:" + f.Token
+	case "bitable":
+		return "bitable:" + f.Token
+	case "slides":
+		return "slides:" + f.Token
 	}
 	return f.Type + ":" + f.Token
 }
 
-// attachmentName 附件名（文档补 .md 后缀；上传类文件用原名）。
 // attachmentName 归档文件名。
-// 按「导出后的源文件」确定后缀，而不是原节点类型：
-//   docx/doc  → .docx   （导出接口产出 Word 文件，不是纯文本）
-//   sheet     → .xlsx   （导出接口产出 Excel 文件）
-//   bitable   → .xlsx
-//   file      → 保留原文件名（用户上传的文件，一字不改）
+// 格式规范：<文件名主体>_<8位Token短码>.<扩展名>
+//   docx/doc      → .docx
+//   sheet/bitable → .xlsx
+//   slides        → .pptx
+//   file          → 保留原后缀
+// 末尾拼入 8 位唯一 Token，彻底杜绝同名覆盖与连锁误删死穴。
 func attachmentName(f feishuapi.DriveFile) string {
 	name := f.Name
 	if name == "" {
 		name = f.Token
 	}
-	// 去掉可能已存在的后缀，统一按导出格式重加
 	base := name
-	if i := strings.LastIndex(base, "."); i > 0 {
-		base = base[:i]
+	ext := path.Ext(base)
+	if ext != "" {
+		base = strings.TrimSuffix(base, ext)
 	}
+
+	targetExt := ext
 	switch f.Type {
 	case "docx", "doc":
-		if !strings.HasSuffix(strings.ToLower(name), ".docx") {
-			name = base + ".docx"
-		}
+		targetExt = ".docx"
 	case "sheet", "bitable":
-		if !strings.HasSuffix(strings.ToLower(name), ".xlsx") {
-			name = base + ".xlsx"
-		}
+		targetExt = ".xlsx"
+	case "slides":
+		targetExt = ".pptx"
 	}
-	return name
+
+	shortToken := f.Token
+	if len(shortToken) > 8 {
+		shortToken = shortToken[len(shortToken)-8:]
+	}
+	if shortToken != "" {
+		return fmt.Sprintf("%s_%s%s", sanitizeFilename(base), shortToken, targetExt)
+	}
+	return sanitizeFilename(base) + targetExt
+}
+
+func sanitizeFilename(s string) string {
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	return strings.TrimSpace(s)
 }
 
 // Fetch 产出变化的文档（pending 为空时先全量扫描一遍）。
@@ -233,106 +257,112 @@ func (c *Connector) scan(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().Unix()
-			for _, g := range grants {
-				if g.Status != "authorized" || g.AccessToken == "" {
-					log.Printf("[feishu] 用户 %s 未处于已授权状态（status=%s），跳过", g.ExternalUserID, g.Status)
-					continue
-				}
-				if g.ExpireAt <= now {
-					log.Printf("[feishu] 用户 %s 授权已过期（已于 %s 到期），跳过待刷新",
-						g.ExternalUserID, time.Unix(g.ExpireAt, 0).Format("2006-01-02 15:04:05"))
-					continue
-				}
-			// a) 云空间（drive）：老式文件夹结构。
-			// 注意：新版飞书把「归我所有/与我共享」也归到这里，但要求 token 带
-			// space:document:retrieve；只有 drive:drive 时接口 code=0 却返回空列表，
-			// 非常容易被误判成「用户没有文档」。数量为 0 时打出提示。
-			root, err := c.api.RootFolderMeta(g.AccessToken)
-			if err != nil {
-				log.Printf("[feishu] 拿 %s 根目录失败: %v", g.ExternalUserID, err)
-			} else {
-				driveN := 0
-				err = c.api.WalkFolder(g.AccessToken, root, 10, func(f feishuapi.DriveFile) {
-					driveN++
-					c.collect(docToRecord(f, g.ExternalUserID), seen)
-				})
-				if err != nil {
-					log.Printf("[feishu] 遍历 %s 云空间失败: %v", g.ExternalUserID, err)
-				} else if driveN == 0 {
-					// 空列表有两种可能：真没文档，或 token 缺 space:document:retrieve
-					// （后者接口仍是 code=0，只是不返回数据）。提示重新授权排查。
-					log.Printf("[feishu] %s 云空间：0 个条目（若确认有文档，检查 token 是否含 "+
-						"space:document:retrieve，缺该 scope 时接口不报错但返回空）", g.ExternalUserID)
-				} else {
-					log.Printf("[feishu] %s 云空间：%d 个条目", g.ExternalUserID, driveN)
-				}
-			}
-
-			// b) 团队知识库：wiki/v2/spaces 返回的空间
-			spaceIDs := append([]string{}, c.cfg.WikiSpaceIDs...)
-			spaces, err := c.api.ListWikiSpaces(g.AccessToken)
-			if err != nil {
-				// 缺 wiki:wiki:readonly 时这里会报 99991679，提示需要重新授权
-				log.Printf("[feishu] 列 %s 知识库失败（可能缺 wiki:wiki:readonly，需重新授权）: %v",
-					g.ExternalUserID, err)
-			} else {
-				for _, sp := range spaces {
-					spaceIDs = append(spaceIDs, sp.SpaceID)
-				}
-			}
-
-			// ListWikiSpaces 不返回「我的文档库」（官方明确说明），
-			// 这类空间只能通过配置 wiki_space_ids 显式指定，再按 ID 列节点。
-			total := 0
-			seenSpace := map[string]bool{}
-			for _, sid := range spaceIDs {
-				if sid == "" || seenSpace[sid] {
-					continue
-				}
-				seenSpace[sid] = true
-				n := 0
-				err := c.api.WalkWikiSpace(g.AccessToken, sid, 10, func(_ feishuapi.WikiSpace, node feishuapi.WikiNode) {
-					if rec, ok := wikiNodeToRecord(node, g.ExternalUserID); ok {
-						n++
-						c.collect(rec, seen)
-					}
-				})
-				if err != nil {
-					log.Printf("[feishu] 遍历知识库 %s 失败: %v", sid, err)
-					continue
-				}
-				total += n
-				if n > 0 {
-					log.Printf("[feishu] 知识库 %s：%d 篇", sid, n)
-				}
-			}
-				log.Printf("[feishu] %s 知识库：%d 个空间，%d 篇文档", g.ExternalUserID, len(seenSpace), total)
-
-				// c) 搜索与我共享及散落文档（覆盖他人所有但共享给当前 Viewer 的文档）
-				searchKeys := []string{"1", "2", "a", "e", "文档", "合同", "方案", "表"}
-				searchCount := 0
-				for _, key := range searchKeys {
-					entities, err := c.api.SearchDocs(g.AccessToken, key, 0, 50)
-					if err != nil {
+				for _, g := range grants {
+					if g.Status != "authorized" || g.AccessToken == "" {
+						log.Printf("[feishu] 用户 %s 未处于已授权状态（status=%s），跳过", g.ExternalUserID, g.Status)
 						continue
 					}
-					for _, d := range entities {
-						if d.Token == "" {
-							continue
-						}
-						f := feishuapi.DriveFile{
-							Token:   d.Token,
-							Name:    d.Title,
-							Type:    d.Type,
-							OwnerID: d.OwnerID,
-						}
-						// docToRecord 自动将 [OwnerID, ViewerID] 全写入 OwnerIDs
+					if g.ExpireAt <= now {
+						log.Printf("[feishu] 用户 %s 授权已过期（已于 %s 到期），跳过待刷新",
+							g.ExternalUserID, time.Unix(g.ExpireAt, 0).Format("2006-01-02 15:04:05"))
+						continue
+					}
+
+				userSeen := map[string]bool{}
+				userScanFailed := false
+
+				// a) 云空间（drive）：老式文件夹结构。
+				root, err := c.api.RootFolderMeta(g.AccessToken)
+				if err != nil {
+					log.Printf("[feishu] 拿 %s 根目录失败: %v", g.ExternalUserID, err)
+					userScanFailed = true
+				} else {
+					driveN := 0
+					err = c.api.WalkFolder(g.AccessToken, root, 10, func(f feishuapi.DriveFile) {
+						driveN++
+						userSeen[f.Token] = true
 						c.collect(docToRecord(f, g.ExternalUserID), seen)
-						searchCount++
+					})
+					if err != nil {
+						log.Printf("[feishu] 遍历 %s 云空间失败: %v", g.ExternalUserID, err)
+						userScanFailed = true
+					} else if driveN == 0 {
+						log.Printf("[feishu] %s 云空间：0 个条目", g.ExternalUserID)
+					} else {
+						log.Printf("[feishu] %s 云空间：%d 个条目", g.ExternalUserID, driveN)
 					}
 				}
-				if searchCount > 0 {
-					log.Printf("[feishu] %s 与我共享及搜索扫描命中 %d 篇条目", g.ExternalUserID, searchCount)
+
+				// b) 团队知识库空间 + 个人“我的文档库”自动发现
+				spaceIDs := append([]string{}, c.cfg.WikiSpaceIDs...)
+				if myLib, err := c.api.GetMyLibrarySpace(g.AccessToken); err == nil && myLib != nil && myLib.SpaceID != "" {
+					spaceIDs = append(spaceIDs, myLib.SpaceID)
+				}
+				spaces, err := c.api.ListWikiSpaces(g.AccessToken)
+				if err != nil {
+					log.Printf("[feishu] 列 %s 知识库失败: %v", g.ExternalUserID, err)
+					userScanFailed = true
+				} else {
+					for _, sp := range spaces {
+						spaceIDs = append(spaceIDs, sp.SpaceID)
+					}
+				}
+
+				total := 0
+				seenSpace := map[string]bool{}
+				for _, sid := range spaceIDs {
+					if sid == "" || seenSpace[sid] {
+						continue
+					}
+					seenSpace[sid] = true
+					n := 0
+					err := c.api.WalkWikiSpace(g.AccessToken, sid, 10, func(_ feishuapi.WikiSpace, node feishuapi.WikiNode) {
+						if rec, ok := wikiNodeToRecord(node, g.ExternalUserID); ok {
+							n++
+							userSeen[node.ObjToken] = true
+							c.collect(rec, seen)
+						}
+					})
+					if err != nil {
+						log.Printf("[feishu] 遍历知识库 %s 失败: %v", sid, err)
+						userScanFailed = true
+						continue
+					}
+					total += n
+					if n > 0 {
+						log.Printf("[feishu] 知识库 %s：%d 篇", sid, n)
+					}
+				}
+				if total > 0 {
+					log.Printf("[feishu] %s 知识库：%d 个空间，%d 篇文档", g.ExternalUserID, len(seenSpace), total)
+				}
+
+				// c) 显式搜索关键字扩展（如配置了业务关键词，且自动过滤系统公共模板）
+				if len(c.cfg.SearchKeys) > 0 {
+					searchCount := 0
+					for _, key := range c.cfg.SearchKeys {
+						entities, err := c.api.SearchDocs(g.AccessToken, key, 0, 50)
+						if err != nil {
+							continue
+						}
+						for _, d := range entities {
+							if d.Token == "" || d.OwnerID == "" {
+								continue // 过滤无所有者的公共系统模板
+							}
+							f := feishuapi.DriveFile{
+								Token:   d.Token,
+								Name:    d.Title,
+								Type:    d.Type,
+								OwnerID: d.OwnerID,
+							}
+							userSeen[d.Token] = true
+							c.collect(docToRecord(f, g.ExternalUserID), seen)
+							searchCount++
+						}
+					}
+					if searchCount > 0 {
+						log.Printf("[feishu] %s 业务关键字搜索命中 %d 篇条目", g.ExternalUserID, searchCount)
+					}
 				}
 
 				// d) 智能纪要/妙记扫描
@@ -356,6 +386,7 @@ func (c *Connector) scan(ctx context.Context) error {
 							Attachments: []model.Attachment{{
 								Name:   title + ".md",
 								FileID: "minutes:" + m.MinuteToken,
+								UserID: g.ExternalUserID,
 							}},
 						}
 						c.collect(rec, seen)
@@ -384,6 +415,7 @@ func (c *Connector) scan(ctx context.Context) error {
 								Name:   ma.Name,
 								FileID: "mail:" + msg.MessageID + ":" + ma.ID,
 								Size:   ma.Size,
+								UserID: g.ExternalUserID,
 							})
 						}
 						if len(recordAtts) > 0 {
@@ -404,31 +436,49 @@ func (c *Connector) scan(ctx context.Context) error {
 						log.Printf("[feishu] %s 扫描到 %d 封含附件邮件", g.ExternalUserID, mailCount)
 					}
 				}
-			}
-		}
 
-		// 差集检测：在全量扫描结束后，检查历史已同步但在本轮消失的文档（飞书端已删除或权限收回）
-		if c.store != nil && len(seen) > 0 {
-			historyDocs, err := c.store.ListDocStates()
-			if err == nil {
-				for _, d := range historyDocs {
-					if !seen[d.Token] {
-						log.Printf("[feishu] 检测到云端文档已删除/移出: %s (%s)", d.Title, d.Token)
-						delRec := model.Record{
-							Source:   "feishu",
-							Kind:     "delete",
-							ID:       d.Token,
-							SenderID: d.OwnerID,
-							OwnerIDs: []string{d.OwnerID},
-							Attachments: []model.Attachment{{
-								Name: d.Title,
-							}},
-						}
-						c.pending = append(c.pending, delRec)
-						c.pendingMeta[d.Token] = pendingDoc{
-							title:    d.Title,
-							ownerID:  d.OwnerID,
-							isDelete: true,
+				// 差集检测：单人作用域 + 严格失败熔断（杜绝跨用户误删与网络抖动批量抹除）
+				if c.store != nil {
+					if userScanFailed {
+						log.Printf("[feishu] 用户 %s 扫描过程存在接口错误，触发熔断保护，暂停该用户本轮删除同步", g.ExternalUserID)
+					} else if len(userSeen) > 0 {
+						userDocs, err := c.store.ListDocStatesByUser(g.ExternalUserID)
+						if err == nil && len(userDocs) > 0 {
+							missingCount := 0
+							for _, d := range userDocs {
+								if !userSeen[d.Token] {
+									missingCount++
+								}
+							}
+							// 熔断保护：单次扫描缺失比例超过 50%（且历史文档 > 5），防止接口异常大面积误删
+							if len(userDocs) > 5 && missingCount > len(userDocs)/2 {
+								log.Printf("[feishu] 警告：用户 %s 缺失文档比例过高 (%d/%d)，触发熔断防误删保护，跳过本轮删除",
+									g.ExternalUserID, missingCount, len(userDocs))
+							} else {
+								for _, d := range userDocs {
+									if !userSeen[d.Token] {
+										log.Printf("[feishu] 检测到用户 %s 云端文档已删除/移出: %s (%s)", g.ExternalUserID, d.Title, d.Token)
+										delRec := model.Record{
+											Source:   "feishu",
+											Kind:     "delete",
+											ID:       d.Token,
+											SenderID: d.OwnerID,
+											OwnerIDs: []string{d.OwnerID, g.ExternalUserID},
+											Attachments: []model.Attachment{{
+												Name:   d.Title,
+												FileID: d.Token,
+												UserID: g.ExternalUserID,
+											}},
+										}
+										c.pending = append(c.pending, delRec)
+										c.pendingMeta[d.Token] = pendingDoc{
+											title:    d.Title,
+											ownerID:  d.OwnerID,
+											isDelete: true,
+										}
+									}
+								}
+							}
 						}
 					}
 				}
@@ -451,7 +501,7 @@ func (c *Connector) scan(ctx context.Context) error {
 // 原则：一律取「源文件」而非转换后的文本，避免丢内容。
 func wikiNodeToRecord(n feishuapi.WikiNode, viewerID string) (model.Record, bool) {
 	switch n.ObjType {
-	case "file", "docx", "doc", "sheet", "bitable":
+	case "file", "docx", "doc", "sheet", "bitable", "slides":
 	default:
 		return model.Record{}, false
 	}
@@ -459,25 +509,32 @@ func wikiNodeToRecord(n feishuapi.WikiNode, viewerID string) (model.Record, bool
 	if token == "" {
 		return model.Record{}, false
 	}
+	editTime := n.ObjEditTime
+	if editTime == "" {
+		editTime = n.NodeEditTime
+	}
+	if editTime == "" {
+		editTime = n.ObjCreateTime
+	}
+	if editTime == "" {
+		editTime = n.NodeCreateTime
+	}
 	f := feishuapi.DriveFile{
 		Token:        token,
 		Name:         n.Title,
 		Type:         n.ObjType,
-		ModifiedTime: n.NodeEditTime,
+		ModifiedTime: editTime,
 	}
-	if f.ModifiedTime == "" {
-		f.ModifiedTime = n.NodeCreateTime
+	// wiki 节点优先取 owner，次选 creator；仍为空时以当前授权查看人兜底
+	ownerID := n.Owner
+	if ownerID == "" {
+		ownerID = n.Creator
 	}
-		// wiki 节点优先取 owner，次选 creator；仍为空时以当前授权查看人兜底
-		ownerID := n.Owner
-		if ownerID == "" {
-			ownerID = n.Creator
-		}
-		if ownerID == "" {
-			ownerID = viewerID
-		}
-		f.OwnerID = ownerID
-		return docToRecord(f, viewerID), true
+	if ownerID == "" {
+		ownerID = viewerID
+	}
+	f.OwnerID = ownerID
+	return docToRecord(f, viewerID), true
 }
 
 // collect 变更检测 + 入队（同 token 只入一次）。
@@ -545,15 +602,24 @@ func attachmentNameOf(rec model.Record) string {
 func (c *Connector) FetchAttachment(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
 	c.throttle()
 	scheme, token, _ := strings.Cut(a.FileID, ":")
-	tok := c.userToken()
+	// 定向取 Token：优先使用该附件扫描/属主用户的 Token，消除首人 Token 冒用
+	tok := ""
+	if a.UserID != "" && c.store != nil {
+		if g, err := c.store.GetOAuthGrant("feishu", a.UserID); err == nil && g.Status == "authorized" && g.ExpireAt > time.Now().Unix() {
+			tok = g.AccessToken
+		}
+	}
 	if tok == "" {
-		tok = c.tenantToken // 兜底：没有用户授权时用应用身份
+		tok = c.userToken() // 兜底：取第一个有效用户 Token
+	}
+	if tok == "" {
+		tok = c.tenantToken
 	}
 
 	switch scheme {
 	case "file":
 		return c.api.DownloadFile(tok, token)
-	case "docx", "doc", "sheet", "bitable":
+	case "docx", "doc", "sheet", "bitable", "slides":
 		// 导出是异步的（创建→轮询→下载），期间要响应取消
 		type res struct {
 			rc  io.ReadCloser

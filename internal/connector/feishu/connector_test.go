@@ -81,6 +81,10 @@ func (m *mockAPI) ListWikiSpaces(token string) ([]feishuapi.WikiSpace, error) {
 	return m.wikiSpaces[token], nil
 }
 
+func (m *mockAPI) GetMyLibrarySpace(userToken string) (*feishuapi.WikiSpace, error) {
+	return nil, nil
+}
+
 func (m *mockAPI) WalkWikiSpace(token, spaceID string, maxDepth int, fn func(feishuapi.WikiSpace, feishuapi.WikiNode)) error {
 	for _, n := range m.wikiNodes[spaceID] {
 		fn(feishuapi.WikiSpace{SpaceID: spaceID}, n)
@@ -150,15 +154,15 @@ func TestTenantScanAndChangeDetection(t *testing.T) {
 	for i, r := range recs {
 		byID[r.ID] = i
 	}
-	docRec := recs[byID["docx1"]]
-	// docx 走导出，归档名是 .docx（源文件），不是 .md 纯文本
-	if docRec.Attachments[0].FileID != "docx:docx1" || docRec.Attachments[0].Name != "产品方案.docx" {
-		t.Fatalf("docx 附件映射不对: %+v", docRec.Attachments[0])
-	}
-	fileRec := recs[byID["f1"]]
-	if fileRec.Attachments[0].FileID != "file:f1" || fileRec.Attachments[0].Name != "采购合同.pdf" {
-		t.Fatalf("file 附件映射不对: %+v", fileRec.Attachments[0])
-	}
+		docRec := recs[byID["docx1"]]
+		// docx 走导出，归档名是 .docx（源文件），末尾带唯一 token 避免同名覆盖
+		if docRec.Attachments[0].FileID != "docx:docx1" || docRec.Attachments[0].Name != "产品方案_docx1.docx" {
+			t.Fatalf("docx 附件映射不对: %+v", docRec.Attachments[0])
+		}
+		fileRec := recs[byID["f1"]]
+		if fileRec.Attachments[0].FileID != "file:f1" || fileRec.Attachments[0].Name != "采购合同_f1.pdf" {
+			t.Fatalf("file 附件映射不对: %+v", fileRec.Attachments[0])
+		}
 
 	// 附件拉取
 	rc, err := c.FetchAttachment(context.Background(), &docRec.Attachments[0])
@@ -273,14 +277,14 @@ func TestUserModeWikiOnly(t *testing.T) {
 	if byID["doccn1"].Attachments[0].FileID != "docx:doccn1" {
 		t.Fatalf("docx 附件标识错误: %s", byID["doccn1"].Attachments[0].FileID)
 	}
-	// sheet 归档名应为 .xlsx（导出格式），不是原扩展名
-	if got := byID["sht1"].Attachments[0].Name; got != "员工名册.xlsx" {
-		t.Fatalf("sheet 归档名应为 员工名册.xlsx，实际 %q", got)
-	}
-	// file 保持原名不动
-	if got := byID["pdf1"].Attachments[0].Name; got != "迁移文档.pdf" {
-		t.Fatalf("file 归档名应保持原样，实际 %q", got)
-	}
+		// sheet 归档名应为 .xlsx 且带唯一 token 短码防同名覆盖
+		if got := byID["sht1"].Attachments[0].Name; got != "员工名册_sht1.xlsx" {
+			t.Fatalf("sheet 归档名应为 员工名册_sht1.xlsx，实际 %q", got)
+		}
+		// file 应带唯一 token 短码防同名覆盖
+		if got := byID["pdf1"].Attachments[0].Name; got != "迁移文档_pdf1.pdf" {
+			t.Fatalf("file 归档名应为 迁移文档_pdf1.pdf，实际 %q", got)
+		}
 
 		// 第二轮应无新增（Ack 之后 doc_state 才记录）
 		for _, r := range recs {
@@ -432,7 +436,7 @@ func TestSharedWithMeSearchAndOwnerViewerStored(t *testing.T) {
 		},
 	}
 
-	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	c := NewWithAPI(Config{Mode: "user", SearchKeys: []string{"任务"}}, st, api)
 	if err := c.Init(context.Background()); err != nil {
 		t.Fatal(err)
 	}
