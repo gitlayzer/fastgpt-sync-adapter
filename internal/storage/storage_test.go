@@ -102,3 +102,68 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("db 文件不存在: %v", err)
 	}
 }
+
+func TestMigrateExistingTableWithoutKind(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	// 手动创建旧版表结构（缺少 kind 列）
+	sRaw, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// 重建旧表结构（无 kind 字段）
+	if _, err := sRaw.db.Exec(`
+DROP TABLE IF EXISTS feishu_doc_copy;
+CREATE TABLE feishu_doc_copy (
+  token      TEXT NOT NULL,
+  person_id  TEXT NOT NULL,
+  via        TEXT NOT NULL DEFAULT '',
+  edit_time  INTEGER NOT NULL DEFAULT 0,
+  file_name  TEXT NOT NULL DEFAULT '',
+  owner_id   TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (token, person_id)
+);
+INSERT INTO feishu_doc_state (token, edit_time, title, owner_id, updated_at)
+VALUES ('old_doc_1', 12345, '旧文档.docx', 'ou_test', 100);
+`); err != nil {
+		t.Fatalf("准备旧结构: %v", err)
+	}
+	sRaw.Close()
+
+	// 重新打开：应自动执行 ALTER TABLE 补充 kind 列并完成回填
+	sMigrated, err := Open(path)
+	if err != nil {
+		t.Fatalf("迁移重开失败: %v", err)
+	}
+	defer sMigrated.Close()
+
+	copies, err := sMigrated.ListCopiesByPerson("ou_test")
+	if err != nil {
+		t.Fatalf("ListCopiesByPerson: %v", err)
+	}
+	if len(copies) != 1 || copies[0].Token != "old_doc_1" {
+		t.Fatalf("期望回填 1 条记录，实际: %+v", copies)
+	}
+
+	// 验证 UpsertCopy 写入带 kind 字段正常
+	if err := sMigrated.UpsertCopy(DocCopy{
+		Token: "min_1", PersonID: "ou_test", Via: "owner",
+		EditTime: 123456, FileName: "会议纪要.md", OwnerID: "ou_test", Kind: "minutes",
+	}); err != nil {
+		t.Fatalf("UpsertCopy with kind: %v", err)
+	}
+
+	updated, err := sMigrated.ListCopiesByPerson("ou_test")
+	if err != nil || len(updated) != 2 {
+		t.Fatalf("更新后应有 2 条记录，实际: %v len=%d", err, len(updated))
+	}
+	var foundMinutes bool
+	for _, c := range updated {
+		if c.Token == "min_1" && c.Kind == "minutes" {
+			foundMinutes = true
+		}
+	}
+	if !foundMinutes {
+		t.Fatalf("未找到 kind=minutes 的副本: %+v", updated)
+	}
+}

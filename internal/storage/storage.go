@@ -150,6 +150,12 @@ CREATE TABLE IF NOT EXISTS feishu_doc_members (
 	if err != nil {
 		return fmt.Errorf("建表迁移: %w", err)
 	}
+	// 兼容已有表升级：若旧版本已创建 feishu_doc_copy 但缺少 kind 列，补充该字段
+	if !s.hasColumn("feishu_doc_copy", "kind") {
+		if _, err := s.db.Exec(`ALTER TABLE feishu_doc_copy ADD COLUMN kind TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("补充 feishu_doc_copy.kind 列: %w", err)
+		}
+	}
 	// 从旧版升级：副本表为空时，用 feishu_doc_state 给所有者回填一份副本记录（只做一次），
 	// 这样升级前已同步、升级后在飞书被删的文档也能被删除判断覆盖到。
 	if _, err := s.db.Exec(`
@@ -161,6 +167,23 @@ WHERE owner_id != '' AND title != '' AND NOT EXISTS (SELECT 1 FROM feishu_doc_co
 		return fmt.Errorf("回填飞书副本状态: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) hasColumn(table, col string) bool {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err == nil && name == col {
+			return true
+		}
+	}
+	return false
 }
 
 var ErrNotFound = errors.New("记录不存在")

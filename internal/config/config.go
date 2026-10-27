@@ -104,9 +104,11 @@ type FeishuConnectorConfig struct {
 	// space_id 用一次 wiki/v2/spaces/get_node?token=<文档URL里的token> 反查即可：
 	// 返回里的 space_id 字段就是。
 	WikiSpaceIDs []string `yaml:"wiki_space_ids"`
-	// CollabRefresh 文档协作者列表刷新周期（默认 6h）。加减协作者不改变文档修改时间，只能定期查。
-	CollabRefresh Duration `yaml:"collab_refresh_interval"`
-}
+		// CollabRefresh 文档协作者列表刷新周期（默认 6h）。加减协作者不改变文档修改时间，只能定期查。
+		CollabRefresh Duration `yaml:"collab_refresh_interval"`
+		// SearchKeys 显式指定的共享文档搜索关键词列表（留空则不触发搜索，避免抓入公共模板）
+		SearchKeys []string `yaml:"search_keys"`
+	}
 
 // StorageConfig SQLite 存储配置。
 type StorageConfig struct {
