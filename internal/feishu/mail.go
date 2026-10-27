@@ -5,35 +5,39 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
-// MailMessage 邮件摘要。
+// MailMessage 邮件信息。
 type MailMessage struct {
-	MessageID      string `json:"message_id"`
-	Subject        string `json:"subject"`
-	HasAttachments bool   `json:"has_attachments"`
-	CreatedTime    int64  `json:"created_time"` // 毫秒
+	MessageID   string           `json:"message_id"`
+	Subject     string           `json:"subject"`
+	HeadFrom    string           `json:"head_from"`
+	CreatedTime int64            `json:"created_time"` // 毫秒
+	Attachments []MailAttachment `json:"attachments"`
 }
 
 // MailAttachment 邮件附件元数据。
 type MailAttachment struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Size int64  `json:"size"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	IsInline bool   `json:"is_inline"`
 }
 
-// ListMailboxMessages 列出用户收件箱邮件（用户未开通飞书邮箱时自动平滑跳过，不报错）。
-func (c *Client) ListMailboxMessages(userToken string, pageSize int) ([]MailMessage, error) {
-	if pageSize <= 0 {
-		pageSize = 50
+// ListMailboxMessages 列出用户收件箱邮件 ID 列表（每次最多 20 封；用户未开通飞书邮箱时自动平滑跳过）。
+func (c *Client) ListMailboxMessages(userToken string, pageSize int) ([]string, error) {
+	if pageSize <= 0 || pageSize > 20 {
+		pageSize = 20
 	}
 	u := fmt.Sprintf("%s/mail/v1/user_mailboxes/me/messages?page_size=%d", baseURL, pageSize)
 	var out struct {
 		apiResp
 		Data struct {
-			HasMore bool          `json:"has_more"`
-			Items   []MailMessage `json:"items"`
+			HasMore   bool     `json:"has_more"`
+			PageToken string   `json:"page_token"`
+			Items     []string `json:"items"`
 		} `json:"data"`
 	}
 	if err := c.getWithToken(u, userToken, &out); err != nil {
@@ -47,19 +51,47 @@ func (c *Client) ListMailboxMessages(userToken string, pageSize int) ([]MailMess
 	return out.Data.Items, nil
 }
 
-// ListMailAttachments 获取某封邮件的所有附件清单。
-func (c *Client) ListMailAttachments(userToken, messageID string) ([]MailAttachment, error) {
+// GetMailMessage 获取某封邮件的详情与附件清单。
+func (c *Client) GetMailMessage(userToken, messageID string) (*MailMessage, error) {
 	u := fmt.Sprintf("%s/mail/v1/user_mailboxes/me/messages/%s", baseURL, messageID)
 	var out struct {
 		apiResp
 		Data struct {
-			Attachments []MailAttachment `json:"attachments"`
+			Message struct {
+				ID           string `json:"id"`
+				Subject      string `json:"subject"`
+				HeadFrom     string `json:"head_from"`
+				InternalDate string `json:"internal_date"`
+				Attachments  []struct {
+					ID             string `json:"id"`
+					Filename       string `json:"filename"`
+					Size           int64  `json:"size"`
+					AttachmentType int    `json:"attachment_type"`
+					IsInline       bool   `json:"is_inline"`
+				} `json:"attachments"`
+			} `json:"message"`
 		} `json:"data"`
 	}
 	if err := c.getWithToken(u, userToken, &out); err != nil {
 		return nil, err
 	}
-	return out.Data.Attachments, nil
+	m := out.Data.Message
+	ts, _ := strconv.ParseInt(m.InternalDate, 10, 64)
+	res := &MailMessage{
+		MessageID:   m.ID,
+		Subject:     m.Subject,
+		HeadFrom:    m.HeadFrom,
+		CreatedTime: ts,
+	}
+	for _, a := range m.Attachments {
+		res.Attachments = append(res.Attachments, MailAttachment{
+			ID:       a.ID,
+			Name:     a.Filename,
+			Size:     a.Size,
+			IsInline: a.IsInline,
+		})
+	}
+	return res, nil
 }
 
 // DownloadMailAttachment 从附件专属下载链接拉取文件流。
@@ -72,15 +104,33 @@ func (c *Client) DownloadMailAttachment(userToken, messageID, attachmentID strin
 	var out struct {
 		apiResp
 		Data struct {
-			DownloadURLs map[string]string `json:"download_urls"`
+			DownloadURLs []struct {
+				AttachmentID string `json:"attachment_id"`
+				DownloadURL  string `json:"download_url"`
+			} `json:"download_urls"`
+			FailedIDs     []string          `json:"failed_ids"`
+			FailedReasons map[string]string `json:"failed_reasons"`
 		} `json:"data"`
 	}
 	if err := c.getWithToken(u, userToken, &out); err != nil {
 		return nil, fmt.Errorf("获取附件下载链接: %w", err)
 	}
 
-	dlURL, ok := out.Data.DownloadURLs[attachmentID]
-	if !ok || dlURL == "" {
+	for _, failedID := range out.Data.FailedIDs {
+		if failedID == attachmentID {
+			reason := out.Data.FailedReasons[attachmentID]
+			return nil, fmt.Errorf("附件 %s 获取下载链接失败: %s", attachmentID, reason)
+		}
+	}
+
+	dlURL := ""
+	for _, item := range out.Data.DownloadURLs {
+		if item.AttachmentID == attachmentID {
+			dlURL = item.DownloadURL
+			break
+		}
+	}
+	if dlURL == "" {
 		return nil, fmt.Errorf("未获取到附件 %s 的下载链接", attachmentID)
 	}
 

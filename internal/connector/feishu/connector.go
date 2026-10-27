@@ -63,8 +63,8 @@ type API interface {
 	DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error)
 
 	// 邮箱邮件与附件接口
-	ListMailboxMessages(userToken string, pageSize int) ([]feishuapi.MailMessage, error)
-	ListMailAttachments(userToken, messageID string) ([]feishuapi.MailAttachment, error)
+	ListMailboxMessages(userToken string, pageSize int) ([]string, error)
+	GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error)
 	DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error)
 }
 
@@ -417,51 +417,57 @@ func (c *Connector) scan(ctx context.Context) error {
 					log.Printf("[feishu] %s 扫描到 %d 篇智能纪要/妙记", g.ExternalUserID, len(minutesList))
 				}
 
-				// e) 邮箱邮件附件扫描（只取最近 50 封：列表不完整，不参与删除判断）
-				mailMsgs, err := c.api.ListMailboxMessages(g.AccessToken, 50)
-				if err == nil && len(mailMsgs) > 0 {
-					mailCount := 0
-					for _, msg := range mailMsgs {
-						if !msg.HasAttachments || msg.MessageID == "" {
-							continue
-						}
-						atts, err := c.api.ListMailAttachments(g.AccessToken, msg.MessageID)
-						if err != nil || len(atts) == 0 {
-							continue
-						}
-						var recordAtts []model.Attachment
-						usedNames := map[string]int{} // 同一封邮件里的同名附件再加序号
-						for _, ma := range atts {
-							if ma.ID == "" || ma.Name == "" {
+					// e) 邮箱邮件附件扫描（每次最多取 20 封，超出飞书上限会被拒绝；列表不参与删除判断）
+					msgIDs, err := c.api.ListMailboxMessages(g.AccessToken, 20)
+					if err != nil {
+						log.Printf("[feishu] 获取用户 %s 邮箱邮件列表失败: %v", g.ExternalUserID, err)
+					} else if len(msgIDs) > 0 {
+						mailCount := 0
+						for _, msgID := range msgIDs {
+							if msgID == "" {
 								continue
 							}
-							// 附件名后加 messageID 短码，避免不同邮件的同名附件互相覆盖
-							shortID := msg.MessageID
-							if len(shortID) > 8 {
-								shortID = shortID[len(shortID)-8:]
+							msg, err := c.api.GetMailMessage(g.AccessToken, msgID)
+							if err != nil {
+								log.Printf("[feishu] 获取邮件 %s 详情失败: %v", msgID, err)
+								continue
 							}
-							ext := path.Ext(ma.Name)
-							attName := sanitizeFilename(strings.TrimSuffix(ma.Name, ext)) + "_" + shortID
-							if usedNames[attName]++; usedNames[attName] > 1 {
-								attName = fmt.Sprintf("%s_%d", attName, usedNames[attName])
+							if msg == nil || len(msg.Attachments) == 0 {
+								continue
 							}
-							recordAtts = append(recordAtts, model.Attachment{
-								Name:   attName + ext,
-								FileID: "mail:" + msg.MessageID + ":" + ma.ID,
-								Size:   ma.Size,
-								UserID: g.ExternalUserID,
-							})
-						}
-						if len(recordAtts) > 0 {
-							rec := model.Record{
-								Source:      "feishu",
-								Kind:        "mail",
-								ID:          "mail_" + msg.MessageID,
-								Timestamp:   msg.CreatedTime,
-								OwnerIDs:    []string{g.ExternalUserID},
-								SenderID:    g.ExternalUserID,
-								Attachments: recordAtts,
+							var recordAtts []model.Attachment
+							usedNames := map[string]int{} // 同一封邮件里的同名附件再加序号
+							for _, ma := range msg.Attachments {
+								if ma.ID == "" || ma.Name == "" || ma.IsInline {
+									continue
+								}
+								// 附件名后加 messageID 短码，避免不同邮件的同名附件互相覆盖
+								shortID := msg.MessageID
+								if len(shortID) > 8 {
+									shortID = shortID[len(shortID)-8:]
+								}
+								ext := path.Ext(ma.Name)
+								attName := sanitizeFilename(strings.TrimSuffix(ma.Name, ext)) + "_" + shortID
+								if usedNames[attName]++; usedNames[attName] > 1 {
+									attName = fmt.Sprintf("%s_%d", attName, usedNames[attName])
+								}
+								recordAtts = append(recordAtts, model.Attachment{
+									Name:   attName + ext,
+									FileID: "mail:" + msg.MessageID + ":" + ma.ID,
+									Size:   ma.Size,
+									UserID: g.ExternalUserID,
+								})
 							}
+							if len(recordAtts) > 0 {
+								rec := model.Record{
+									Source:      "feishu",
+									Kind:        "mail",
+									ID:          "mail_" + msg.MessageID,
+									Timestamp:   msg.CreatedTime,
+									OwnerIDs:    []string{g.ExternalUserID},
+									SenderID:    g.ExternalUserID,
+									Attachments: recordAtts,
+								}
 							c.collect(st, rec, g.ExternalUserID)
 							mailCount++
 						}

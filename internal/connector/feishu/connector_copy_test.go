@@ -16,8 +16,8 @@ import (
 // copyAPI 在 mockAPI 基础上可注入：邮件/妙记、我的文档库、知识库遍历失败。
 type copyAPI struct {
 	*mockAPI
-	mails    []feishuapi.MailMessage
-	mailAtts []feishuapi.MailAttachment
+	mailIDs  []string
+	mailMap  map[string]*feishuapi.MailMessage
 	minutes  []feishuapi.MinuteItem
 	minErr   error
 	myLib    map[string]string // userToken -> 我的文档库 space_id
@@ -26,14 +26,22 @@ type copyAPI struct {
 }
 
 func newCopyAPI() *copyAPI {
-	return &copyAPI{mockAPI: newMockAPI(), myLib: map[string]string{}, walkErr: map[string]bool{}}
+	return &copyAPI{
+		mockAPI:  newMockAPI(),
+		mailMap:  map[string]*feishuapi.MailMessage{},
+		myLib:    map[string]string{},
+		walkErr:  map[string]bool{},
+	}
 }
 
-func (m *copyAPI) ListMailboxMessages(string, int) ([]feishuapi.MailMessage, error) {
-	return m.mails, nil
+func (m *copyAPI) ListMailboxMessages(string, int) ([]string, error) {
+	return m.mailIDs, nil
 }
-func (m *copyAPI) ListMailAttachments(string, string) ([]feishuapi.MailAttachment, error) {
-	return m.mailAtts, nil
+func (m *copyAPI) GetMailMessage(tok, msgID string) (*feishuapi.MailMessage, error) {
+	if m.mailMap != nil {
+		return m.mailMap[msgID], nil
+	}
+	return nil, nil
 }
 func (m *copyAPI) SearchMinutes(string) ([]feishuapi.MinuteItem, error) { return m.minutes, m.minErr }
 func (m *copyAPI) GetMyLibrarySpace(tok string) (*feishuapi.WikiSpace, error) {
@@ -127,8 +135,12 @@ func TestCopyMailAndMinutesNoFlapping(t *testing.T) {
 	api := newCopyAPI()
 	api.roots["ut0"] = "rootA"
 	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "文档1", "ou_a", "100"), doc("d2", "文档2", "ou_a", "100"), doc("d3", "文档3", "ou_a", "100")}
-	api.mails = []feishuapi.MailMessage{{MessageID: "m1", HasAttachments: true, CreatedTime: 1700000000000}}
-	api.mailAtts = []feishuapi.MailAttachment{{ID: "a1", Name: "合同.pdf"}}
+	api.mailIDs = []string{"m1"}
+	api.mailMap["m1"] = &feishuapi.MailMessage{
+		MessageID:   "m1",
+		CreatedTime: 1700000000000,
+		Attachments: []feishuapi.MailAttachment{{ID: "a1", Name: "合同.pdf"}},
+	}
 	api.minutes = []feishuapi.MinuteItem{{MinuteToken: "min1", Title: "周会", OwnerID: "ou_a", CreateTime: 1700000000000}}
 	c := newUserConn(t, st, api, Config{})
 
@@ -140,7 +152,7 @@ func TestCopyMailAndMinutesNoFlapping(t *testing.T) {
 			t.Fatalf("第 %d 轮内容未变应无产出，实际 %v", i, kinds(got))
 		}
 	}
-	api.minutes, api.mails = nil, nil
+	api.minutes, api.mailIDs, api.mailMap = nil, nil, nil
 	got := round(t, c)
 	if len(got) != 1 || got[0].ID != "del_min1_ou_a" {
 		t.Fatalf("妙记消失应只删妙记、邮件消失不删，实际 %v", kinds(got))
@@ -405,8 +417,12 @@ func TestCopyMailSameNameAttachments(t *testing.T) {
 	st := copyStore(t, "ou_a")
 	api := newCopyAPI()
 	api.roots["ut0"] = "rootA"
-	api.mails = []feishuapi.MailMessage{{MessageID: "msg_abcdefgh123", HasAttachments: true, CreatedTime: 1700000000000}}
-	api.mailAtts = []feishuapi.MailAttachment{{ID: "a1", Name: "合同.pdf"}, {ID: "a2", Name: "合同.pdf"}}
+	api.mailIDs = []string{"msg_abcdefgh123"}
+	api.mailMap["msg_abcdefgh123"] = &feishuapi.MailMessage{
+		MessageID:   "msg_abcdefgh123",
+		CreatedTime: 1700000000000,
+		Attachments: []feishuapi.MailAttachment{{ID: "a1", Name: "合同.pdf"}, {ID: "a2", Name: "合同.pdf"}},
+	}
 	c := newUserConn(t, st, api, Config{})
 	got := round(t, c)
 	if len(got) != 1 || len(got[0].Attachments) != 2 {

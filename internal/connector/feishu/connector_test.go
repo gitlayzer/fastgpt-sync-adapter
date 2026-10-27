@@ -122,11 +122,11 @@ func (m *mockAPI) DownloadMinutesTranscript(userToken, minuteToken string) (io.R
 	return io.NopCloser(strings.NewReader("逐字稿发言内容")), nil
 }
 
-func (m *mockAPI) ListMailboxMessages(userToken string, pageSize int) ([]feishuapi.MailMessage, error) {
+func (m *mockAPI) ListMailboxMessages(userToken string, pageSize int) ([]string, error) {
 	return nil, nil
 }
 
-func (m *mockAPI) ListMailAttachments(userToken, messageID string) ([]feishuapi.MailAttachment, error) {
+func (m *mockAPI) GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error) {
 	return nil, nil
 }
 
@@ -477,9 +477,9 @@ func TestSharedWithMeSearchAndOwnerViewerStored(t *testing.T) {
 
 type mockMinutesAndMailAPI struct {
 	*mockAPI
-	minutes  []feishuapi.MinuteItem
-	mails    []feishuapi.MailMessage
-	mailAtts []feishuapi.MailAttachment
+	minutes []feishuapi.MinuteItem
+	mailIDs []string
+	mailMap map[string]*feishuapi.MailMessage
 }
 
 func (m *mockMinutesAndMailAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error) {
@@ -490,12 +490,15 @@ func (m *mockMinutesAndMailAPI) DownloadMinutesTranscript(userToken, minuteToken
 	return io.NopCloser(strings.NewReader("宋文帅：今天讨论项目方案\n张建丰：收到")), nil
 }
 
-func (m *mockMinutesAndMailAPI) ListMailboxMessages(userToken string, pageSize int) ([]feishuapi.MailMessage, error) {
-	return m.mails, nil
+func (m *mockMinutesAndMailAPI) ListMailboxMessages(userToken string, pageSize int) ([]string, error) {
+	return m.mailIDs, nil
 }
 
-func (m *mockMinutesAndMailAPI) ListMailAttachments(userToken, messageID string) ([]feishuapi.MailAttachment, error) {
-	return m.mailAtts, nil
+func (m *mockMinutesAndMailAPI) GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error) {
+	if m.mailMap != nil {
+		return m.mailMap[messageID], nil
+	}
+	return nil, nil
 }
 
 func (m *mockMinutesAndMailAPI) DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error) {
@@ -568,11 +571,16 @@ func TestMailAttachmentsSync(t *testing.T) {
 
 	api := &mockMinutesAndMailAPI{
 		mockAPI: baseAPI,
-		mails: []feishuapi.MailMessage{
-			{MessageID: "msg_m1", Subject: "采购合同确认", HasAttachments: true, CreatedTime: 1700000000000},
-		},
-		mailAtts: []feishuapi.MailAttachment{
-			{ID: "att_1", Name: "采购合同.pdf", Size: 1024},
+		mailIDs: []string{"msg_m1"},
+		mailMap: map[string]*feishuapi.MailMessage{
+			"msg_m1": {
+				MessageID:   "msg_m1",
+				Subject:     "采购合同确认",
+				CreatedTime: 1700000000000,
+				Attachments: []feishuapi.MailAttachment{
+					{ID: "att_1", Name: "采购合同.pdf", Size: 1024},
+				},
+			},
 		},
 	}
 
