@@ -656,10 +656,10 @@ func (c *Connector) discoverShared(userToken, viewer string, creators []string) 
 		}
 		for _, it := range items {
 			typ := strings.ToLower(it.DocType)
-			if it.Token == "" || !sharedSearchTypes[typ] || it.OwnerID == viewer {
+			if it.Token == "" || !sharedSearchTypes[typ] {
 				continue
 			}
-			if err := c.store.UpsertSharedRoot(storage.SharedRoot{ViewerID: viewer, Token: it.Token, DocType: typ, OwnerID: it.OwnerID}); err != nil {
+			if err := c.store.UpsertSharedRoot(storage.SharedRoot{ViewerID: viewer, Token: it.Token, DocType: typ}); err != nil {
 				log.Printf("[feishu] 记录 %s 的共享 %s 失败: %v", viewer, it.Token, err)
 				continue
 			}

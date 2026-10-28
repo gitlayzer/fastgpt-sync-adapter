@@ -14,6 +14,7 @@ import (
 type sharedAPI struct {
 	*mockAPI
 	docs      []feishuapi.DocWikiResult
+	created   map[string]int64             // token → 创建时间（秒），模拟按创建时间过滤
 	metas     map[string]feishuapi.DocMeta // token → 元数据（查得到）
 	failed    map[string]int               // token → 失败码
 	metaErr   error
@@ -24,7 +25,7 @@ type sharedAPI struct {
 
 func newSharedAPI() *sharedAPI {
 	return &sharedAPI{mockAPI: newMockAPI(), metas: map[string]feishuapi.DocMeta{},
-		failed: map[string]int{}, invalid: map[string]bool{}, searchCap: 200}
+		failed: map[string]int{}, invalid: map[string]bool{}, created: map[string]int64{}, searchCap: 200}
 }
 
 func (m *sharedAPI) SearchDocWiki(tok string, ids []string, start, end int64, pageToken string) ([]feishuapi.DocWikiResult, string, error) {
@@ -38,7 +39,7 @@ func (m *sharedAPI) SearchDocWiki(tok string, ids []string, start, end int64, pa
 	}
 	var hit []feishuapi.DocWikiResult
 	for _, d := range m.docs {
-		if want[d.OwnerID] && (start == 0 && end == 0 || d.CreateTime >= start && d.CreateTime <= end) {
+		if ct := m.created[d.Token]; want[d.OwnerID] && (start == 0 && end == 0 || ct >= start && ct <= end) {
 			hit = append(hit, d)
 		}
 	}
@@ -85,9 +86,9 @@ func sharedSetup(t *testing.T) (*storage.Store, *sharedAPI) {
 	api := newSharedAPI()
 	api.roots["ut0"] = "root_a"
 	api.docs = []feishuapi.DocWikiResult{
-		{Token: "fld", DocType: "FOLDER", OwnerID: "ou_b", CreateTime: 100},
-		{Token: "d1", DocType: "DOCX", OwnerID: "ou_b", CreateTime: 100},
-		{Token: "wk", DocType: "WIKI", OwnerID: "ou_b", CreateTime: 100},
+		{Token: "fld", DocType: "FOLDER", OwnerID: "ou_b"},
+		{Token: "d1", DocType: "DOCX", OwnerID: "ou_b"},
+		{Token: "wk", DocType: "WIKI", OwnerID: "ou_b"},
 	}
 	api.metas["fld"] = feishuapi.DocMeta{DocToken: "fld", DocType: "folder", OwnerID: "ou_b"}
 	api.metas["d1"] = feishuapi.DocMeta{DocToken: "d1", DocType: "docx", Title: "单篇", OwnerID: "ou_b", LatestModifyTime: "100"}
@@ -194,7 +195,8 @@ func TestSharedSearchSplitsAtCap(t *testing.T) {
 	api.docs = nil
 	for i := 0; i < 450; i++ {
 		tok := fmt.Sprint("s", i)
-		api.docs = append(api.docs, feishuapi.DocWikiResult{Token: tok, DocType: "DOCX", OwnerID: "ou_b", CreateTime: int64(1000 + i*1000)})
+		api.docs = append(api.docs, feishuapi.DocWikiResult{Token: tok, DocType: "DOCX", OwnerID: "ou_b"})
+		api.created[tok] = int64(1000 + i*1000)
 		api.metas[tok] = feishuapi.DocMeta{DocToken: tok, DocType: "docx", Title: tok, OwnerID: "ou_b", LatestModifyTime: "100"}
 	}
 	c := newUserConn(t, st, api, Config{})

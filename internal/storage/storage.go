@@ -151,8 +151,6 @@ CREATE TABLE IF NOT EXISTS feishu_shared_root (
   viewer_id  TEXT NOT NULL,
   token      TEXT NOT NULL,
   doc_type   TEXT NOT NULL DEFAULT '',
-  owner_id   TEXT NOT NULL DEFAULT '',
-  found_at   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (viewer_id, token)
 );`)
 	if err != nil {
@@ -596,12 +594,11 @@ type SharedRoot struct {
 	ViewerID string
 	Token    string
 	DocType  string // folder/docx/sheet/...（小写，与 drive 类型一致）
-	OwnerID  string
 }
 
 // ListSharedRoots 列出某员工已发现的共享文件夹/文档。
 func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
-	rows, err := s.db.Query(`SELECT viewer_id, token, doc_type, owner_id FROM feishu_shared_root WHERE viewer_id=?`, viewerID)
+	rows, err := s.db.Query(`SELECT viewer_id, token, doc_type FROM feishu_shared_root WHERE viewer_id=?`, viewerID)
 	if err != nil {
 		return nil, err
 	}
@@ -609,7 +606,7 @@ func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
 	var out []SharedRoot
 	for rows.Next() {
 		var r SharedRoot
-		if err := rows.Scan(&r.ViewerID, &r.Token, &r.DocType, &r.OwnerID); err != nil {
+		if err := rows.Scan(&r.ViewerID, &r.Token, &r.DocType); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -617,12 +614,12 @@ func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
 	return out, rows.Err()
 }
 
-// UpsertSharedRoot 记录一次发现（已存在时只更新类型和所有者）。
+// UpsertSharedRoot 记录一次发现（已存在时只更新类型）。
 func (s *Store) UpsertSharedRoot(r SharedRoot) error {
 	_, err := s.db.Exec(`
-INSERT INTO feishu_shared_root (viewer_id, token, doc_type, owner_id, found_at) VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(viewer_id, token) DO UPDATE SET doc_type=excluded.doc_type, owner_id=excluded.owner_id`,
-		r.ViewerID, r.Token, r.DocType, r.OwnerID, time.Now().Unix())
+INSERT INTO feishu_shared_root (viewer_id, token, doc_type) VALUES (?, ?, ?)
+ON CONFLICT(viewer_id, token) DO UPDATE SET doc_type=excluded.doc_type`,
+		r.ViewerID, r.Token, r.DocType)
 	return err
 }
 

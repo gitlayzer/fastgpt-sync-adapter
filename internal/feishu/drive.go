@@ -55,7 +55,7 @@ func (c *Client) get(path, token string, query url.Values, out any) error {
 			continue
 		}
 		if ar.Code != 0 {
-			lastErr = &APIError{Code: ar.Code, Msg: ar.Msg}
+			lastErr = fmt.Errorf("飞书错误 code=%d msg=%s", ar.Code, ar.Msg)
 			if retryableCode(ar.Code) {
 				continue
 			}
@@ -258,11 +258,9 @@ func (c *Client) ListPermissionMembers(userToken, token, docType string) ([]Perm
 
 // DocWikiResult 云文档搜索（search/v2/doc_wiki/search）返回的一条结果。
 type DocWikiResult struct {
-	Token      string `json:"token"`
-	DocType    string `json:"doc_types"` // FOLDER/DOCX/DOC/SHEET/BITABLE/FILE/SLIDES/MINDNOTE 等（大写）
-	OwnerID    string `json:"owner_id"`
-	CreateTime int64  `json:"create_time"`
-	URL        string `json:"url"`
+	Token   string `json:"token"`
+	DocType string `json:"doc_types"` // FOLDER/DOCX/DOC/SHEET/BITABLE/FILE/SLIDES/MINDNOTE 等（大写）
+	OwnerID string `json:"owner_id"`
 }
 
 // SearchDocWiki 按创建人搜索调用者能看到的云文档，返回一页（page_size 20）。
