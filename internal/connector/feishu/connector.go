@@ -289,13 +289,13 @@ func (c *Connector) scan(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().Unix()
-		// 每隔 SharedDiscover 搜一次别人共享给员工的文件夹/文档；“创建人”只取没授权的员工
-		// （授权了的所有者，他的共享文件夹已由协作者列表覆盖）。
+		// 每隔 SharedDiscover 搜一次别人共享给员工的文件夹/文档；“创建人”取名单里的全部员工
+		// （授权了的所有者也要搜：协作者列表只含个人，分享给群/部门的拿不到）。
 		discover := now-c.lastDiscover >= int64(c.sharedDiscoverEvery()/time.Second)
 		var creators []string
 		if discover {
 			c.lastDiscover = now
-			creators = c.unauthorizedCreators(grants)
+			creators = c.rosterCreators()
 		}
 				for _, g := range grants {
 					if g.Status != "authorized" || g.AccessToken == "" {
@@ -603,7 +603,7 @@ const collabRefreshDefault = 6 * time.Hour
 
 const (
 	// sharedDiscoverDefault 共享文件夹搜索发现的默认周期（cfg.SharedDiscover 为 0 时使用）。
-	// 一轮约“授权员工数 × 没授权人数 / 20”次搜索。
+	// 一轮约“授权员工数 × 名单人数 / 20”次搜索。
 	sharedDiscoverDefault = time.Hour
 	searchBatch           = 20                     // creator_ids 一次最多 20 个
 	searchSplitAt         = 180                    // 单次搜索最多返回约 200 条且不报错，达到这个数就按创建时间拆开
@@ -628,34 +628,28 @@ func (c *Connector) sharedDiscoverEvery() time.Duration {
 	return sharedDiscoverDefault
 }
 
-// unauthorizedCreators 人名映射表里没有授权的员工（作为搜索的“创建人”）。
-func (c *Connector) unauthorizedCreators(grants []storage.OAuthGrant) []string {
+// rosterCreators 人名映射表里的全部员工（作为搜索的“创建人”）。
+func (c *Connector) rosterCreators() []string {
 	ids, err := c.store.ListFeishuUserIDs()
 	if err != nil {
 		log.Printf("[feishu] 读员工名单失败（本轮不搜索共享文件夹）: %v", err)
 		return nil
 	}
-	authorized := map[string]bool{}
-	for _, g := range grants {
-		if g.Status == "authorized" {
-			authorized[g.ExternalUserID] = true
-		}
-	}
-	var out []string
-	for _, id := range ids {
-		if !authorized[id] {
-			out = append(out, id)
-		}
-	}
-	return out
+	return ids
 }
 
-// discoverShared 用员工自己的身份，按“创建人 = 没授权的员工”搜索他能看到的文件夹/文档，记进共享表。
+// discoverShared 用员工自己的身份，按“创建人 = 名单里的其他员工”搜索他能看到的文件夹/文档，记进共享表。
 // 只增不删：搜不到不代表看不到（结果可能被截断），看不到了由 scanSharedRoots 判断。
 func (c *Connector) discoverShared(userToken, viewer string, creators []string) {
+	var others []string
+	for _, id := range creators {
+		if id != viewer {
+			others = append(others, id)
+		}
+	}
 	n := 0
-	for i := 0; i < len(creators); i += searchBatch {
-		items, err := c.searchCreators(userToken, creators[i:min(i+searchBatch, len(creators))], 0, 0)
+	for i := 0; i < len(others); i += searchBatch {
+		items, err := c.searchCreators(userToken, others[i:min(i+searchBatch, len(others))], 0, 0)
 		if err != nil {
 			log.Printf("[feishu] %s 搜索共享文件夹失败（沿用已发现的）: %v", viewer, err)
 			continue

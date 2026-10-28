@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	feishuapi "github.com/gitlayzer/fastgpt-sync-adapter/internal/feishu"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/storage"
@@ -165,6 +166,25 @@ func TestSharedSearchSkipsInvalidOpenID(t *testing.T) {
 	round(t, c)
 	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 2 {
 		t.Fatalf("应跳过无效 open_id 后搜到 B 的共享，实际 %+v", roots)
+	}
+}
+
+// 所有者已授权、文件夹只分享给了群：协作者列表里只有群，要靠搜索拿到；搜索名单不含本人。
+func TestSharedFolderOfAuthorizedOwnerViaGroup(t *testing.T) {
+	st, api := sharedSetup(t)
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_b", AccessToken: "ut_b", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+	api.roots["ut_b"] = "root_b"
+	api.members = map[string][]feishuapi.PermissionMember{"fld": {{MemberType: "openchat", MemberID: "oc_group"}}}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if got := copyPersons(t, st, "f1"); fmt.Sprint(got) != "[ou_a ou_b]" {
+		t.Fatalf("A 应通过搜索拿到 B 分享给群的文件夹，实际 %v", got)
+	}
+	if roots, _ := st.ListSharedRoots("ou_b"); len(roots) != 0 {
+		t.Fatalf("B 不应搜到自己的文档，实际 %+v", roots)
 	}
 }
 
