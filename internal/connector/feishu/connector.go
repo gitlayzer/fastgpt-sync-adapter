@@ -89,7 +89,7 @@ type Connector struct {
 	pendingMeta map[string]pendingDoc // 待 Ack 的文档元数据（id → 状态）
 	lastDl      atomic.Int64          // 上次下载时间（纳秒），限流用
 	lastSearch  atomic.Int64          // 上次搜索时间（纳秒），限流用
-	lastDiscover int64                // 上次搜索发现共享文件夹的时间（秒）
+	discoveredAt map[string]int64     // 员工 → 上次完整搜索共享文件夹的时间（秒）
 }
 
 func New(cfg Config, store *storage.Store) *Connector {
@@ -289,14 +289,12 @@ func (c *Connector) scan(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().Unix()
-		// 每隔 SharedDiscover 搜一次别人共享给员工的文件夹；“创建人”取名单里的全部员工
+		// 每个员工每隔 SharedDiscover 搜一次别人共享给他的文件夹；“创建人”取名单里的全部员工
 		// （授权了的所有者也要搜：协作者列表只含个人，分享给群/部门的拿不到）。
-		discover := now-c.lastDiscover >= int64(c.sharedDiscoverEvery()/time.Second)
+		// 按员工计时、搜完整才计时：授权失效或搜索失败的员工，重新授权/恢复后下一轮就搜。
+		discoverEvery := int64(c.sharedDiscoverEvery() / time.Second)
 		var creators []string
-		if discover {
-			c.lastDiscover = now
-			creators = c.rosterCreators()
-		}
+		rosterLoaded := false
 				for _, g := range grants {
 					if g.Status != "authorized" || g.AccessToken == "" {
 						log.Printf("[feishu] 用户 %s 未处于已授权状态（status=%s），跳过", g.ExternalUserID, g.Status)
@@ -392,8 +390,16 @@ func (c *Connector) scan(ctx context.Context) error {
 				}
 
 				// b2) 别人共享给本人、本人云盘树下列不到的文件夹（所有者没授权、或分享给群/部门时只能这样拿到）。
-				if discover && len(creators) > 0 {
-					c.discoverShared(g.AccessToken, g.ExternalUserID, creators)
+				if now-c.discoveredAt[g.ExternalUserID] >= discoverEvery {
+					if !rosterLoaded {
+						creators, rosterLoaded = c.rosterCreators(), true
+					}
+					if c.discoverShared(g.AccessToken, g.ExternalUserID, creators) {
+						if c.discoveredAt == nil {
+							c.discoveredAt = map[string]int64{}
+						}
+						c.discoveredAt[g.ExternalUserID] = now
+					}
 				}
 				if !c.scanSharedRoots(g.AccessToken, g.ExternalUserID, see) {
 					userScanFailed = true
@@ -607,7 +613,8 @@ const (
 	sharedDiscoverDefault = time.Hour
 	searchBatch           = 20                     // creator_ids 一次最多 20 个
 	searchSplitAt         = 180                    // 单次搜索最多返回约 200 条且不报错，达到这个数就按创建时间拆开
-	codeInvalidOpenID     = 99992351               // 搜索名单里有无效 open_id，整次报错
+	codeOpenIDNotExist    = 99992351               // 搜索名单里有不存在的 open_id，整次报错
+	codeOpenIDCrossApp    = 99992361               // 搜索名单里有别的应用的 open_id，整次报错
 	codeMetaNoPerm        = 970003                 // 批量查文档元数据：无权限
 	codeMetaDeleted       = 970005                 // 批量查文档元数据：已删除
 )
@@ -620,6 +627,11 @@ func (c *Connector) sharedDiscoverEvery() time.Duration {
 		return c.cfg.SharedDiscover
 	}
 	return sharedDiscoverDefault
+}
+
+// isBadCreatorID 搜索因名单里某个 open_id 不可用而整次失败（不存在、或属于别的应用）。
+func isBadCreatorID(code int) bool {
+	return code == codeOpenIDNotExist || code == codeOpenIDCrossApp
 }
 
 // rosterCreators 人名映射表里的全部员工（作为搜索的“创建人”）。
@@ -635,19 +647,23 @@ func (c *Connector) rosterCreators() []string {
 // discoverShared 用员工自己的身份，按“创建人 = 名单里的其他员工”搜索他能看到的文件夹，记进共享表。
 // 搜索结果里的单篇文档不要：只解决“共享文件夹找不到”。
 // 只增不删：搜不到不代表看不到（结果可能被截断），看不到了由 scanSharedRoots 判断。
-func (c *Connector) discoverShared(userToken, viewer string, creators []string) {
+// 全部批次都搜完才返回 true；某批失败就停下（不再继续消耗搜索次数），下一轮整体重搜。
+func (c *Connector) discoverShared(userToken, viewer string, creators []string) bool {
 	var others []string
 	for _, id := range creators {
 		if id != viewer {
 			others = append(others, id)
 		}
 	}
+	if len(others) == 0 {
+		return false // 名单为空或读失败：下一轮再看
+	}
 	n := 0
 	for i := 0; i < len(others); i += searchBatch {
 		items, err := c.searchCreators(userToken, others[i:min(i+searchBatch, len(others))], 0, 0)
 		if err != nil {
-			log.Printf("[feishu] %s 搜索共享文件夹失败（沿用已发现的）: %v", viewer, err)
-			continue
+			log.Printf("[feishu] %s 搜索共享文件夹失败（沿用已发现的，下一轮重搜）: %v", viewer, err)
+			return false
 		}
 		for _, it := range items {
 			if it.Token == "" || it.DocType != "FOLDER" {
@@ -661,9 +677,10 @@ func (c *Connector) discoverShared(userToken, viewer string, creators []string) 
 		}
 	}
 	log.Printf("[feishu] %s 搜索共享文件夹：%d 个", viewer, n)
+	return true
 }
 
-// searchCreators 翻完所有页。名单里有无效 open_id 时对半拆开重搜，找出它并跳过；
+// searchCreators 翻完所有页。名单里有不可用的 open_id（不存在/别的应用）时对半拆开重搜，找出它并跳过；
 // 结果达到上限时按创建时间对半拆开重搜。
 func (c *Connector) searchCreators(userToken string, ids []string, start, end int64) ([]feishuapi.DocWikiResult, error) {
 	var all []feishuapi.DocWikiResult
@@ -673,11 +690,11 @@ func (c *Connector) searchCreators(userToken string, ids []string, start, end in
 		items, next, err := c.api.SearchDocWiki(userToken, ids, start, end, pageToken)
 		if err != nil {
 			var apiErr *feishuapi.APIError
-			if !errors.As(err, &apiErr) || apiErr.Code != codeInvalidOpenID {
+			if !errors.As(err, &apiErr) || !isBadCreatorID(apiErr.Code) {
 				return nil, err
 			}
 			if len(ids) == 1 {
-				log.Printf("[feishu] 创建人 %s 不是有效的 open_id，跳过", ids[0])
+				log.Printf("[feishu] 创建人 %s 的 open_id 不可用（code=%d，不存在或不属于本应用），跳过", ids[0], apiErr.Code)
 				return nil, nil
 			}
 			half := len(ids) / 2
@@ -737,13 +754,13 @@ func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Rec
 		}
 		metas, failed, err := c.api.BatchQueryMetas(userToken, docs)
 		if err != nil {
-			log.Printf("[feishu] 查 %s 的共享文件夹失败: %v", viewer, err)
+			log.Printf("[feishu] 查 %s 的共享文件夹失败（本轮暂停此人的删除同步）: %v", viewer, err)
 			ok = false
 			continue
 		}
 		for _, f := range failed {
 			if f.Code != codeMetaNoPerm && f.Code != codeMetaDeleted {
-				log.Printf("[feishu] 查 %s 的共享 %s 失败 code=%d", viewer, f.Token, f.Code)
+				log.Printf("[feishu] 查 %s 的共享文件夹 %s 失败 code=%d（本轮暂停此人的删除同步）", viewer, f.Token, f.Code)
 				ok = false
 				continue
 			}
@@ -758,7 +775,7 @@ func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Rec
 				see(docToRecord(f, viewer), f.Type)
 			})
 			if err != nil {
-				log.Printf("[feishu] 遍历 %s 的共享文件夹 %s 失败: %v", viewer, m.DocToken, err)
+				log.Printf("[feishu] 遍历 %s 的共享文件夹 %s 失败（本轮暂停此人的删除同步）: %v", viewer, m.DocToken, err)
 				ok = false
 			}
 		}

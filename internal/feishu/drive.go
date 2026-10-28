@@ -264,8 +264,8 @@ type DocWikiResult struct {
 }
 
 // SearchDocWiki 按创建人搜索调用者能看到的云文档，返回一页（page_size 20）。
-// creatorIDs 最多 20 个，名单里有一个 open_id 无效整次报错（code 99992351）。
-// createStart/createEnd 都为 0 时不限创建时间。
+// creatorIDs 最多 20 个，名单里有一个 open_id 不存在（99992351）或属于别的应用（99992361）整次报错。
+// createStart/createEnd 都为 0 时不限创建时间；单位是秒（官方 SDK search/v2 DocFilter.CreateTime：“秒级时间戳”）。
 // 注意：单次搜索最多返回约 200 条，超出部分不报错、has_more=false，调用方需按创建时间拆分。
 func (c *Client) SearchDocWiki(userToken string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]DocWikiResult, string, error) {
 	filter := map[string]any{"creator_ids": creatorIDs}

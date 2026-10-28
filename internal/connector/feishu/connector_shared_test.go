@@ -18,22 +18,28 @@ type sharedAPI struct {
 	metas     map[string]feishuapi.DocMeta // token → 元数据（查得到）
 	failed    map[string]int               // token → 失败码
 	metaErr   error
-	invalid   map[string]bool // 无效的 open_id
+	invalid   map[string]int  // 不可用的 open_id → 搜索返回的错误码
+	searchErr error           // 搜索直接报错（非名单问题）
+	searchBy  map[string]int  // userToken → 搜索次数
 	searchCap int             // 单次搜索最多返回条数（模拟 200 上限）
 	searches  int
 }
 
 func newSharedAPI() *sharedAPI {
 	return &sharedAPI{mockAPI: newMockAPI(), metas: map[string]feishuapi.DocMeta{},
-		failed: map[string]int{}, invalid: map[string]bool{}, created: map[string]int64{}, searchCap: 200}
+		failed: map[string]int{}, invalid: map[string]int{}, created: map[string]int64{}, searchBy: map[string]int{}, searchCap: 200}
 }
 
 func (m *sharedAPI) SearchDocWiki(tok string, ids []string, start, end int64, pageToken string) ([]feishuapi.DocWikiResult, string, error) {
 	m.searches++
+	m.searchBy[tok]++
+	if m.searchErr != nil {
+		return nil, "", m.searchErr
+	}
 	want := map[string]bool{}
 	for _, id := range ids {
-		if m.invalid[id] {
-			return nil, "", &feishuapi.APIError{Code: codeInvalidOpenID, Msg: "not a valid {open_id}"}
+		if code := m.invalid[id]; code != 0 {
+			return nil, "", &feishuapi.APIError{Code: code, Msg: "bad open_id"}
 		}
 		want[id] = true
 	}
@@ -160,7 +166,7 @@ func TestSharedSearchSkipsInvalidOpenID(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		st.UpsertIdentity(&storage.Identity{WeComUserID: fmt.Sprint("wx", i), FeishuUserID: fmt.Sprint("ou_x", i)})
 	}
-	api.invalid["ou_x3"] = true
+	api.invalid["ou_x3"] = codeOpenIDNotExist
 	c := newUserConn(t, st, api, Config{})
 	round(t, c)
 	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 1 {
@@ -184,6 +190,76 @@ func TestSharedFolderOfAuthorizedOwnerViaGroup(t *testing.T) {
 	}
 	if roots, _ := st.ListSharedRoots("ou_b"); len(roots) != 0 {
 		t.Fatalf("B 不应搜到自己的文档，实际 %+v", roots)
+	}
+}
+
+// 名单里混入别的应用的 open_id（99992361，评审实测）：同样拆开重搜跳过它，其余人的共享文件夹照常发现。
+func TestSharedSearchSkipsCrossAppOpenID(t *testing.T) {
+	st, api := sharedSetup(t)
+	for i := 0; i < 25; i++ { // 名单 27 人，B 和坏 ID 分在不同批
+		st.UpsertIdentity(&storage.Identity{WeComUserID: fmt.Sprint("wx", i), FeishuUserID: fmt.Sprint("ou_x", i)})
+	}
+	api.invalid["ou_x0"] = codeOpenIDCrossApp
+	api.invalid["ou_x20"] = codeOpenIDCrossApp
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 1 || roots[0].Token != "fld" {
+		t.Fatalf("应跳过跨应用 open_id 后搜到 B 的共享文件夹，实际 %+v", roots)
+	}
+	searches := api.searches
+	round(t, c)
+	if api.searches != searches {
+		t.Fatalf("跳过坏 ID 后算搜索完整，未到周期不应再搜：%d → %d", searches, api.searches)
+	}
+}
+
+// 首轮员工授权已过期（没人被搜）：重新授权后下一轮立即搜索，不用等一个周期。
+func TestSharedDiscoverAfterReauthorize(t *testing.T) {
+	st, api := sharedSetup(t)
+	g, _ := st.GetOAuthGrant("feishu", "ou_a")
+	g.ExpireAt = time.Now().Unix() - 10
+	st.UpsertOAuthGrant(g)
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if api.searches != 0 {
+		t.Fatalf("授权过期时不应搜索，实际 %d 次", api.searches)
+	}
+	g.ExpireAt = time.Now().Unix() + 3600
+	st.UpsertOAuthGrant(g)
+	round(t, c)
+	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 1 {
+		t.Fatalf("重新授权后下一轮应立即搜到共享文件夹，实际 %+v", roots)
+	}
+}
+
+// 搜索失败：这个员工本轮停下（不再搜剩下的批次），不算搜完，下一轮重搜；新授权的员工不受别人计时影响。
+func TestSharedDiscoverRetryAndPerViewer(t *testing.T) {
+	st, api := sharedSetup(t)
+	for i := 0; i < 45; i++ { // 名单 47 人：A 要搜 3 批
+		st.UpsertIdentity(&storage.Identity{WeComUserID: fmt.Sprint("wx", i), FeishuUserID: fmt.Sprint("ou_x", i)})
+	}
+	api.searchErr = errors.New("飞书错误 code=1277001 msg=rate limit exceeded")
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if api.searches != 1 {
+		t.Fatalf("第一批失败就应停下，实际搜索 %d 次", api.searches)
+	}
+	api.searchErr = nil
+	round(t, c)
+	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 1 {
+		t.Fatalf("下一轮应重搜并找到，实际 %+v", roots)
+	}
+
+	// A 刚搜完；C 这时才授权：C 下一轮就搜，A 不重搜
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_x5", AccessToken: "ut_c", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+	api.roots["ut_c"] = "root_c"
+	before := api.searchBy["ut0"]
+	round(t, c)
+	if api.searchBy["ut_c"] == 0 || api.searchBy["ut0"] != before {
+		t.Fatalf("应只搜新授权的 C：C %d 次，A %d → %d", api.searchBy["ut_c"], before, api.searchBy["ut0"])
 	}
 }
 
