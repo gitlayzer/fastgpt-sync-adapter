@@ -80,9 +80,12 @@ func (c *Client) GetMailMessage(userToken, messageID string) (*MailMessage, erro
 		apiResp
 		Data struct {
 			Message struct {
-				ID           string `json:"id"`
+				MessageID    string `json:"message_id"` // 字段名以官方 SDK 为准：message_id，不是 id
 				Subject      string `json:"subject"`
-				HeadFrom     string `json:"head_from"`
+				HeadFrom     struct {
+					MailAddress string `json:"mail_address"`
+					Name        string `json:"name"`
+				} `json:"head_from"` // 发件人是对象 {mail_address, name}，不是字符串
 				InternalDate string `json:"internal_date"`
 				Attachments  []struct {
 					ID             string `json:"id"`
@@ -100,9 +103,9 @@ func (c *Client) GetMailMessage(userToken, messageID string) (*MailMessage, erro
 	m := out.Data.Message
 	ts, _ := strconv.ParseInt(m.InternalDate, 10, 64)
 	res := &MailMessage{
-		MessageID:   m.ID,
+		MessageID:   m.MessageID,
 		Subject:     m.Subject,
-		HeadFrom:    m.HeadFrom,
+		HeadFrom:    m.HeadFrom.MailAddress,
 		CreatedTime: ts,
 	}
 	for _, a := range m.Attachments {
@@ -130,8 +133,11 @@ func (c *Client) DownloadMailAttachment(userToken, messageID, attachmentID strin
 				AttachmentID string `json:"attachment_id"`
 				DownloadURL  string `json:"download_url"`
 			} `json:"download_urls"`
-			FailedIDs     []string          `json:"failed_ids"`
-			FailedReasons map[string]string `json:"failed_reasons"`
+			FailedIDs     []string `json:"failed_ids"`
+			FailedReasons []struct {
+				AttachmentID string `json:"attachment_id"`
+				Reason       string `json:"reason"`
+			} `json:"failed_reasons"` // 官方 SDK 定义为数组，不是映射
 		} `json:"data"`
 	}
 	if err := c.getWithToken(u, userToken, &out); err != nil {
@@ -140,7 +146,13 @@ func (c *Client) DownloadMailAttachment(userToken, messageID, attachmentID strin
 
 	for _, failedID := range out.Data.FailedIDs {
 		if failedID == attachmentID {
-			reason := out.Data.FailedReasons[attachmentID]
+			reason := ""
+			for _, fr := range out.Data.FailedReasons {
+				if fr.AttachmentID == attachmentID {
+					reason = fr.Reason
+					break
+				}
+			}
 			return nil, fmt.Errorf("附件 %s 获取下载链接失败: %s", attachmentID, reason)
 		}
 	}

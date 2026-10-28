@@ -61,3 +61,18 @@ func TestListFolderChildrenMissingPageToken(t *testing.T) {
 		t.Fatalf("缺翻页标记时应在第 1 次请求后就停下，实际请求了 %d 次", n)
 	}
 }
+
+// 协作者列表：接口返回字段是 items（实测与官方 SDK 一致）。
+func TestListPermissionMembersItems(t *testing.T) {
+	c := New("cli_test", "secret")
+	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {
+		return `{"code":0,"data":{"items":[{"member_type":"openid","member_id":"ou_a","perm":"full_access"},{"member_type":"openid","member_id":"ou_b","perm":"view"}]}}`
+	})}
+	items, err := c.ListPermissionMembers("ut", "doc1", "docx")
+	if err != nil {
+		t.Fatalf("ListPermissionMembers: %v", err)
+	}
+	if len(items) != 2 || items[1].MemberID != "ou_b" {
+		t.Fatalf("应解析出 2 个协作者，实际 %+v", items)
+	}
+}

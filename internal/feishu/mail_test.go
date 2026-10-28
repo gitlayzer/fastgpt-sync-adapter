@@ -63,9 +63,9 @@ func TestGetMailMessage(t *testing.T) {
 			"code": 0,
 			"data": {
 				"message": {
-					"id": "msg_123",
+					"message_id": "msg_123",
 					"subject": "重要采购合同",
-					"head_from": "供应商 <vendor@example.com>",
+					"head_from": {"mail_address": "vendor@example.com", "name": "供应商"},
 					"internal_date": "1700000000000",
 					"attachments": [
 						{"id": "att_1", "filename": "合同.pdf", "size": 10240, "is_inline": false},
@@ -82,6 +82,9 @@ func TestGetMailMessage(t *testing.T) {
 	}
 	if msg.MessageID != "msg_123" || msg.Subject != "重要采购合同" || msg.CreatedTime != 1700000000000 {
 		t.Fatalf("邮件详情解析错误: %+v", msg)
+	}
+	if msg.HeadFrom != "vendor@example.com" {
+		t.Fatalf("发件人解析错误: %q", msg.HeadFrom)
 	}
 	if len(msg.Attachments) != 2 {
 		t.Fatalf("附件数量错误: %d", len(msg.Attachments))
@@ -105,7 +108,7 @@ func TestDownloadMailAttachment(t *testing.T) {
 						{"attachment_id": "att_1", "download_url": "https://open.feishu.cn/fake_dl_1"}
 					],
 					"failed_ids": [],
-					"failed_reasons": {}
+					"failed_reasons": []
 				}
 			}`
 		}
@@ -123,5 +126,17 @@ func TestDownloadMailAttachment(t *testing.T) {
 	data, _ := io.ReadAll(rc)
 	if string(data) != "FILE_CONTENT_BYTES" {
 		t.Fatalf("下载内容不符: %q", string(data))
+	}
+}
+
+// 附件取链接失败：按 failed_reasons 数组找到对应原因放进报错（结构以官方 SDK 为准）。
+func TestDownloadMailAttachmentFailedReason(t *testing.T) {
+	c := New("cli_test", "secret")
+	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {
+		return `{"code":0,"data":{"download_urls":[],"failed_ids":["att_1"],"failed_reasons":[{"attachment_id":"att_1","reason":"attachment expired"}]}}`
+	})}
+	_, err := c.DownloadMailAttachment("ut", "msg_123", "att_1")
+	if err == nil || !strings.Contains(err.Error(), "attachment expired") {
+		t.Fatalf("应返回带失败原因的错误，实际: %v", err)
 	}
 }
