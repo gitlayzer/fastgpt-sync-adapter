@@ -118,6 +118,14 @@ func (m *mockAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error
 	return nil, nil
 }
 
+func (m *mockAPI) SearchDocWiki(string, []string, int64, int64, string) ([]feishuapi.DocWikiResult, string, error) {
+	return nil, "", nil
+}
+
+func (m *mockAPI) BatchQueryMetas(string, [][2]string) ([]feishuapi.DocMeta, []feishuapi.DocMetaFailed, error) {
+	return nil, nil, nil
+}
+
 func (m *mockAPI) DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("逐字稿发言内容")), nil
 }
