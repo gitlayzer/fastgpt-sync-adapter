@@ -90,37 +90,36 @@ func sharedSetup(t *testing.T) (*storage.Store, *sharedAPI) {
 		{Token: "d1", DocType: "DOCX", OwnerID: "ou_b"},
 		{Token: "wk", DocType: "WIKI", OwnerID: "ou_b"},
 	}
-	api.metas["fld"] = feishuapi.DocMeta{DocToken: "fld", DocType: "folder", OwnerID: "ou_b"}
-	api.metas["d1"] = feishuapi.DocMeta{DocToken: "d1", DocType: "docx", Title: "单篇", OwnerID: "ou_b", LatestModifyTime: "100"}
+	api.metas["fld"] = feishuapi.DocMeta{DocToken: "fld"}
 	api.folders["fld"] = []feishuapi.DriveFile{doc("f1", "文件夹里", "ou_b", "100")}
 	return st, api
 }
 
-// 所有者没授权：搜索发现后，A 拿到文件夹里的文档和单篇共享文档；之后文件夹里新增、修改不等下次搜索。
+// 所有者没授权：搜索发现后，A 拿到文件夹里的文档（单篇共享文档、知识库不记）；之后文件夹里新增、修改不等下次搜索。
 func TestSharedFolderFoundBySearch(t *testing.T) {
 	st, api := sharedSetup(t)
 	c := newUserConn(t, st, api, Config{})
 
 	round(t, c)
-	for _, tok := range []string{"f1", "d1"} {
-		if got := copyPersons(t, st, tok); fmt.Sprint(got) != "[ou_a ou_b]" {
-			t.Fatalf("%s 副本应给 A 和所有者 B，实际 %v", tok, got)
-		}
+	if got := copyPersons(t, st, "f1"); fmt.Sprint(got) != "[ou_a ou_b]" {
+		t.Fatalf("f1 副本应给 A 和所有者 B，实际 %v", got)
 	}
-	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 2 {
-		t.Fatalf("共享表应只记文件夹和文档（不记知识库），实际 %+v", roots)
+	if got := copyPersons(t, st, "d1"); len(got) != 0 {
+		t.Fatalf("单篇共享文档不应存，实际 %v", got)
+	}
+	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 1 || roots[0].Token != "fld" {
+		t.Fatalf("共享表应只记文件夹，实际 %+v", roots)
 	}
 	searches := api.searches
 
-	// 文件夹里新增 f2、修改 d1：下一轮就同步，不再搜索
-	api.folders["fld"] = append(api.folders["fld"], doc("f2", "新文件", "ou_b", "200"))
-	api.metas["d1"] = feishuapi.DocMeta{DocToken: "d1", DocType: "docx", Title: "单篇", OwnerID: "ou_b", LatestModifyTime: "300"}
+	// 文件夹里新增 f2、修改 f1：下一轮就同步，不再搜索
+	api.folders["fld"] = []feishuapi.DriveFile{doc("f1", "文件夹里", "ou_b", "300"), doc("f2", "新文件", "ou_b", "200")}
 	recs := round(t, c)
 	if api.searches != searches {
 		t.Fatalf("未到搜索周期不应再搜索：%d → %d", searches, api.searches)
 	}
-	if fmt.Sprint(kinds(recs)) != "[docx:d1 docx:f2]" {
-		t.Fatalf("应写入新增的 f2 和改过的 d1，实际 %v", kinds(recs))
+	if fmt.Sprint(kinds(recs)) != "[docx:f1 docx:f2]" {
+		t.Fatalf("应写入改过的 f1 和新增的 f2，实际 %v", kinds(recs))
 	}
 }
 
@@ -131,9 +130,8 @@ func TestSharedFolderRevoked(t *testing.T) {
 	round(t, c)
 
 	api.failed["fld"] = codeMetaNoPerm
-	api.failed["d1"] = codeMetaDeleted
 	recs := round(t, c)
-	if fmt.Sprint(kinds(recs)) != "[delete:del_d1_ou_a delete:del_d1_ou_b delete:del_f1_ou_a delete:del_f1_ou_b]" {
+	if fmt.Sprint(kinds(recs)) != "[delete:del_f1_ou_a delete:del_f1_ou_b]" {
 		t.Fatalf("应删除 A 和所有者的副本，实际 %v", kinds(recs))
 	}
 	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 0 {
@@ -151,7 +149,7 @@ func TestSharedMetaErrorKeepsCopies(t *testing.T) {
 	if recs := round(t, c); len(recs) != 0 {
 		t.Fatalf("接口报错时不应产出删除，实际 %v", kinds(recs))
 	}
-	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 2 {
+	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 1 {
 		t.Fatalf("共享表应保持不变，实际 %+v", roots)
 	}
 }
@@ -165,8 +163,8 @@ func TestSharedSearchSkipsInvalidOpenID(t *testing.T) {
 	api.invalid["ou_x3"] = true
 	c := newUserConn(t, st, api, Config{})
 	round(t, c)
-	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 2 {
-		t.Fatalf("应跳过无效 open_id 后搜到 B 的共享，实际 %+v", roots)
+	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 1 {
+		t.Fatalf("应跳过无效 open_id 后搜到 B 的共享文件夹，实际 %+v", roots)
 	}
 }
 
@@ -195,9 +193,9 @@ func TestSharedSearchSplitsAtCap(t *testing.T) {
 	api.docs = nil
 	for i := 0; i < 450; i++ {
 		tok := fmt.Sprint("s", i)
-		api.docs = append(api.docs, feishuapi.DocWikiResult{Token: tok, DocType: "DOCX", OwnerID: "ou_b"})
+		api.docs = append(api.docs, feishuapi.DocWikiResult{Token: tok, DocType: "FOLDER", OwnerID: "ou_b"})
 		api.created[tok] = int64(1000 + i*1000)
-		api.metas[tok] = feishuapi.DocMeta{DocToken: tok, DocType: "docx", Title: tok, OwnerID: "ou_b", LatestModifyTime: "100"}
+		api.metas[tok] = feishuapi.DocMeta{DocToken: tok}
 	}
 	c := newUserConn(t, st, api, Config{})
 	round(t, c)

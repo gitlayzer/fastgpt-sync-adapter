@@ -150,7 +150,6 @@ CREATE TABLE IF NOT EXISTS feishu_doc_members (
 CREATE TABLE IF NOT EXISTS feishu_shared_root (
   viewer_id  TEXT NOT NULL,
   token      TEXT NOT NULL,
-  doc_type   TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (viewer_id, token)
 );`)
 	if err != nil {
@@ -587,18 +586,17 @@ ON CONFLICT(token) DO UPDATE SET checked_at=excluded.checked_at, members=exclude
 	return err
 }
 
-// ===== 别人共享给员工的文件夹/文档（搜索发现，每轮用员工身份列出）=====
+// ===== 别人共享给员工的文件夹（搜索发现，每轮用员工身份列出）=====
 
-// SharedRoot 员工能看到、但不在他云盘树下的一个共享文件夹或文档。
+// SharedRoot 员工能看到、但不在他云盘树下的一个共享文件夹。
 type SharedRoot struct {
 	ViewerID string
 	Token    string
-	DocType  string // folder/docx/sheet/...（小写，与 drive 类型一致）
 }
 
-// ListSharedRoots 列出某员工已发现的共享文件夹/文档。
+// ListSharedRoots 列出某员工已发现的共享文件夹。
 func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
-	rows, err := s.db.Query(`SELECT viewer_id, token, doc_type FROM feishu_shared_root WHERE viewer_id=?`, viewerID)
+	rows, err := s.db.Query(`SELECT viewer_id, token FROM feishu_shared_root WHERE viewer_id=?`, viewerID)
 	if err != nil {
 		return nil, err
 	}
@@ -606,7 +604,7 @@ func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
 	var out []SharedRoot
 	for rows.Next() {
 		var r SharedRoot
-		if err := rows.Scan(&r.ViewerID, &r.Token, &r.DocType); err != nil {
+		if err := rows.Scan(&r.ViewerID, &r.Token); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -614,12 +612,9 @@ func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
 	return out, rows.Err()
 }
 
-// UpsertSharedRoot 记录一次发现（已存在时只更新类型）。
+// UpsertSharedRoot 记录一次发现（已记录过的不重复写）。
 func (s *Store) UpsertSharedRoot(r SharedRoot) error {
-	_, err := s.db.Exec(`
-INSERT INTO feishu_shared_root (viewer_id, token, doc_type) VALUES (?, ?, ?)
-ON CONFLICT(viewer_id, token) DO UPDATE SET doc_type=excluded.doc_type`,
-		r.ViewerID, r.Token, r.DocType)
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO feishu_shared_root (viewer_id, token) VALUES (?, ?)`, r.ViewerID, r.Token)
 	return err
 }
 

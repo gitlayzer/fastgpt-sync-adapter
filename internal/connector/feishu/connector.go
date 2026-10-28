@@ -31,7 +31,7 @@ type Config struct {
 	SearchKeys   []string `yaml:"search_keys"` // 显式指定的共享文档搜索关键词（留空则不触发搜索，避免抓入公共模板）
 	// CollabRefresh 协作者列表刷新周期（0 = 默认 6h）。加减协作者不改文档修改时间，只能定期查。
 	CollabRefresh time.Duration `yaml:"collab_refresh_interval"`
-	// SharedDiscover 按“创建人”搜索别人共享给员工的文件夹/文档的周期（0 = 默认 1h）。
+	// SharedDiscover 按“创建人”搜索别人共享给员工的文件夹的周期（0 = 默认 1h）。
 	SharedDiscover time.Duration `yaml:"shared_discover_interval"`
 }
 
@@ -61,7 +61,7 @@ type API interface {
 	// 文档协作者列表（所有者 token 可查）
 	ListPermissionMembers(userToken, token, docType string) ([]feishuapi.PermissionMember, error)
 
-	// 按创建人搜索调用者能看到的云文档（一页），以及批量查文档元数据（发现别人共享给员工的文件夹/文档）
+	// 按创建人搜索调用者能看到的云文档（一页），以及批量查文档元数据（发现别人共享给员工的文件夹）
 	SearchDocWiki(userToken string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]feishuapi.DocWikiResult, string, error)
 	BatchQueryMetas(userToken string, docs [][2]string) ([]feishuapi.DocMeta, []feishuapi.DocMetaFailed, error)
 
@@ -289,7 +289,7 @@ func (c *Connector) scan(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().Unix()
-		// 每隔 SharedDiscover 搜一次别人共享给员工的文件夹/文档；“创建人”取名单里的全部员工
+		// 每隔 SharedDiscover 搜一次别人共享给员工的文件夹；“创建人”取名单里的全部员工
 		// （授权了的所有者也要搜：协作者列表只含个人，分享给群/部门的拿不到）。
 		discover := now-c.lastDiscover >= int64(c.sharedDiscoverEvery()/time.Second)
 		var creators []string
@@ -391,7 +391,7 @@ func (c *Connector) scan(ctx context.Context) error {
 					log.Printf("[feishu] %s 知识库：%d 个空间，%d 篇文档", g.ExternalUserID, len(seenSpace), total)
 				}
 
-				// b2) 别人共享给本人、本人云盘树下列不到的文件夹/文档（所有者没授权时只能这样拿到）。
+				// b2) 别人共享给本人、本人云盘树下列不到的文件夹（所有者没授权、或分享给群/部门时只能这样拿到）。
 				if discover && len(creators) > 0 {
 					c.discoverShared(g.AccessToken, g.ExternalUserID, creators)
 				}
@@ -615,12 +615,6 @@ const (
 // searchMinInterval 云文档搜索限速（接口限 100 次/分钟）；测试里置 0。
 var searchMinInterval = 650 * time.Millisecond
 
-// sharedSearchTypes 搜索结果里要的类型（与 drive 遍历的类型一致），其他（如知识库）不要。
-var sharedSearchTypes = map[string]bool{
-	"folder": true, "doc": true, "docx": true, "sheet": true, "bitable": true,
-	"file": true, "slides": true, "mindnote": true,
-}
-
 func (c *Connector) sharedDiscoverEvery() time.Duration {
 	if c.cfg.SharedDiscover > 0 {
 		return c.cfg.SharedDiscover
@@ -638,7 +632,8 @@ func (c *Connector) rosterCreators() []string {
 	return ids
 }
 
-// discoverShared 用员工自己的身份，按“创建人 = 名单里的其他员工”搜索他能看到的文件夹/文档，记进共享表。
+// discoverShared 用员工自己的身份，按“创建人 = 名单里的其他员工”搜索他能看到的文件夹，记进共享表。
+// 搜索结果里的单篇文档不要：只解决“共享文件夹找不到”。
 // 只增不删：搜不到不代表看不到（结果可能被截断），看不到了由 scanSharedRoots 判断。
 func (c *Connector) discoverShared(userToken, viewer string, creators []string) {
 	var others []string
@@ -655,18 +650,17 @@ func (c *Connector) discoverShared(userToken, viewer string, creators []string) 
 			continue
 		}
 		for _, it := range items {
-			typ := strings.ToLower(it.DocType)
-			if it.Token == "" || !sharedSearchTypes[typ] {
+			if it.Token == "" || it.DocType != "FOLDER" {
 				continue
 			}
-			if err := c.store.UpsertSharedRoot(storage.SharedRoot{ViewerID: viewer, Token: it.Token, DocType: typ}); err != nil {
+			if err := c.store.UpsertSharedRoot(storage.SharedRoot{ViewerID: viewer, Token: it.Token}); err != nil {
 				log.Printf("[feishu] 记录 %s 的共享 %s 失败: %v", viewer, it.Token, err)
 				continue
 			}
 			n++
 		}
 	}
-	log.Printf("[feishu] %s 搜索共享文件夹/文档：%d 个", viewer, n)
+	log.Printf("[feishu] %s 搜索共享文件夹：%d 个", viewer, n)
 }
 
 // searchCreators 翻完所有页。名单里有无效 open_id 时对半拆开重搜，找出它并跳过；
@@ -725,7 +719,7 @@ func (c *Connector) searchCreators(userToken string, ids []string, start, end in
 	return append(a, b...), nil
 }
 
-// scanSharedRoots 每轮用员工身份查一遍已发现的共享文件夹/文档，交给 see 汇总（和他云盘里的文档一样处理）。
+// scanSharedRoots 每轮用员工身份查一遍已发现的共享文件夹，列出里面的文档交给 see 汇总（和他云盘里的文档一样处理）。
 // 看不到了（无权限/已删除）就移出共享表，本轮不算他能看到，由删除逻辑删掉他那份；
 // 其他错误返回 false，按扫描失败处理（本轮不删）。
 func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Record, string)) bool {
@@ -739,11 +733,11 @@ func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Rec
 	for i := 0; i < len(roots); i += 200 { // 批量查元数据一次最多 200 个
 		var docs [][2]string
 		for _, r := range roots[i:min(i+200, len(roots))] {
-			docs = append(docs, [2]string{r.Token, r.DocType})
+			docs = append(docs, [2]string{r.Token, "folder"})
 		}
 		metas, failed, err := c.api.BatchQueryMetas(userToken, docs)
 		if err != nil {
-			log.Printf("[feishu] 查 %s 的共享文件夹/文档失败: %v", viewer, err)
+			log.Printf("[feishu] 查 %s 的共享文件夹失败: %v", viewer, err)
 			ok = false
 			continue
 		}
@@ -759,26 +753,18 @@ func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Rec
 			}
 		}
 		for _, m := range metas {
-			if m.DocType == "folder" {
-				err := c.api.WalkFolder(userToken, m.DocToken, 10, func(f feishuapi.DriveFile) {
-					n++
-					see(docToRecord(f, viewer), f.Type)
-				})
-				if err != nil {
-					log.Printf("[feishu] 遍历 %s 的共享文件夹 %s 失败: %v", viewer, m.DocToken, err)
-					ok = false
-				}
-				continue
+			err := c.api.WalkFolder(userToken, m.DocToken, 10, func(f feishuapi.DriveFile) {
+				n++
+				see(docToRecord(f, viewer), f.Type)
+			})
+			if err != nil {
+				log.Printf("[feishu] 遍历 %s 的共享文件夹 %s 失败: %v", viewer, m.DocToken, err)
+				ok = false
 			}
-			n++
-			see(docToRecord(feishuapi.DriveFile{
-				Token: m.DocToken, Name: m.Title, Type: m.DocType, OwnerID: m.OwnerID,
-				ModifiedTime: m.LatestModifyTime, URL: m.URL,
-			}, viewer), m.DocType)
 		}
 	}
 	if len(roots) > 0 {
-		log.Printf("[feishu] %s 共享文件夹/文档：%d 个，含 %d 个条目", viewer, len(roots), n)
+		log.Printf("[feishu] %s 共享文件夹：%d 个，含 %d 个条目", viewer, len(roots), n)
 	}
 	return ok
 }

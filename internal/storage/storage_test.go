@@ -191,14 +191,14 @@ func TestMigrateAddsSharedRootTable(t *testing.T) {
 	if cs, err := s.ListCopiesByPerson("ou_a"); err != nil || len(cs) != 1 {
 		t.Fatalf("旧数据应保留: %v %+v", err, cs)
 	}
-	if err := s.UpsertSharedRoot(SharedRoot{ViewerID: "ou_a", Token: "fld", DocType: "folder"}); err != nil {
+	if err := s.UpsertSharedRoot(SharedRoot{ViewerID: "ou_a", Token: "fld"}); err != nil {
 		t.Fatalf("UpsertSharedRoot: %v", err)
 	}
-	if err := s.UpsertSharedRoot(SharedRoot{ViewerID: "ou_a", Token: "fld", DocType: "folder"}); err != nil {
+	if err := s.UpsertSharedRoot(SharedRoot{ViewerID: "ou_a", Token: "fld"}); err != nil {
 		t.Fatalf("重复 UpsertSharedRoot: %v", err)
 	}
 	roots, err := s.ListSharedRoots("ou_a")
-	if err != nil || len(roots) != 1 || roots[0].Token != "fld" || roots[0].DocType != "folder" {
+	if err != nil || len(roots) != 1 || roots[0].Token != "fld" {
 		t.Fatalf("ListSharedRoots: %v %+v", err, roots)
 	}
 	if err := s.DeleteSharedRoot("ou_a", "fld"); err != nil {

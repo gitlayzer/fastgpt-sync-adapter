@@ -300,14 +300,9 @@ func (c *Client) SearchDocWiki(userToken string, creatorIDs []string, createStar
 	return items, next, nil
 }
 
-// DocMeta 文档元数据（drive/v1/metas/batch_query）。
+// DocMeta 文档元数据（drive/v1/metas/batch_query），这里只用来确认调用者还能看到。
 type DocMeta struct {
-	DocToken         string `json:"doc_token"`
-	DocType          string `json:"doc_type"`
-	Title            string `json:"title"`
-	OwnerID          string `json:"owner_id"`
-	LatestModifyTime string `json:"latest_modify_time"` // 秒级时间戳字符串
-	URL              string `json:"url"`
+	DocToken string `json:"doc_token"`
 }
 
 // DocMetaFailed 查询失败的文档（实测：970003 无权限，970005 已删除）。
@@ -330,7 +325,7 @@ func (c *Client) BatchQueryMetas(userToken string, docs [][2]string) ([]DocMeta,
 			FailedList []DocMetaFailed `json:"failed_list"`
 		} `json:"data"`
 	}
-	body := map[string]any{"request_docs": reqDocs, "with_url": true}
+	body := map[string]any{"request_docs": reqDocs}
 	if err := c.postJSON(baseURL+"/drive/v1/metas/batch_query", body, userToken, &out); err != nil {
 		return nil, nil, err
 	}
