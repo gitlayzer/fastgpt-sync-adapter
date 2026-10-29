@@ -239,6 +239,9 @@ func (c *Client) TenantAccessToken() (string, error) {
 // auth:user.id:read           识别授权人身份
 // mail:user_mailbox.message:readonly  读取邮箱邮件列表
 // mail:user_mailbox.message.body:read 获取邮件正文及附件下载链接
+// mail:user_mailbox.message.subject:read 邮件主题（缺它时详情不返回 subject）
+// mail:user_mailbox.message.address:read 发件人、收件人、抄送、密送
+// mail:user_mailbox.folder:read 列邮箱文件夹（扫用户自建文件夹用）
 // minutes:minutes             妙记文件基础权限
 // minutes:minutes.search:read 妙记全量检索列表
 // minutes:minutes.transcript:export   导出妙记转写文字/逐字稿
@@ -247,6 +250,7 @@ const RequiredScopes = "offline_access drive:drive drive:export:readonly wiki:wi
 	"docx:document:readonly space:document:retrieve contact:user.employee_id:readonly " +
 	"search:docs:read auth:user.id:read " +
 	"mail:user_mailbox.message:readonly mail:user_mailbox.message.body:read " +
+	"mail:user_mailbox.message.subject:read mail:user_mailbox.message.address:read mail:user_mailbox.folder:read " +
 	"minutes:minutes minutes:minutes.search:read minutes:minutes.transcript:export " +
 	"vc:note:read"
 

@@ -243,3 +243,58 @@ INSERT INTO feishu_shared_root (viewer_id, token) VALUES ('ou_a', 'old_fld');`);
 		t.Fatalf("旧记录应为 folder、新记录为 docx，实际 %+v", got)
 	}
 }
+
+// 旧库没有 feishu_mail_folder 表：重开时自动建表；没有记录返回 0，写入后可读回、重复写会更新。
+func TestMailFolderScannedAt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE feishu_mail_folder`); err != nil {
+		t.Fatalf("准备旧结构: %v", err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("迁移重开失败: %v", err)
+	}
+	defer s.Close()
+	if ts := s.MailFolderScannedAt("ou_a", "INBOX"); ts != 0 {
+		t.Fatalf("没有记录应返回 0，实际 %d", ts)
+	}
+	if err := s.SetMailFolderScannedAt("ou_a", "INBOX", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMailFolderScannedAt("ou_a", "INBOX", 200); err != nil {
+		t.Fatal(err)
+	}
+	if ts := s.MailFolderScannedAt("ou_a", "INBOX"); ts != 200 {
+		t.Fatalf("应读回最后一次写入的 200，实际 %d", ts)
+	}
+	if ts := s.MailFolderScannedAt("ou_b", "INBOX"); ts != 0 {
+		t.Fatalf("其他员工不受影响，实际 %d", ts)
+	}
+}
+
+// 已处理邮件表：按 message_id 和 RFC 邮件 ID 都能查到；空的 RFC 邮件 ID 不算命中。
+func TestMailSeen(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	if err := s.AddMailSeen("ou_a", "m1", "<x@mail>"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddMailSeen("ou_a", "m2", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !s.MailSeen("ou_a", "m1") || !s.MailSeen("ou_a", "m2") || s.MailSeen("ou_b", "m1") {
+		t.Fatal("按 message_id 查询不符")
+	}
+	if !s.MailSeenSMTP("ou_a", "<x@mail>") || s.MailSeenSMTP("ou_b", "<x@mail>") || s.MailSeenSMTP("ou_a", "") {
+		t.Fatal("按 RFC 邮件 ID 查询不符")
+	}
+}
