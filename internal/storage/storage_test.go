@@ -208,3 +208,38 @@ func TestMigrateAddsSharedRootTable(t *testing.T) {
 		t.Fatalf("删除后应为空: %+v", roots)
 	}
 }
+
+// 旧库（共享表没有 doc_type 列，只记文件夹）重新打开：补上列，已有记录视为文件夹，新记录能写智能纪要。
+func TestMigrateSharedRootDocType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE feishu_shared_root;
+CREATE TABLE feishu_shared_root (viewer_id TEXT NOT NULL, token TEXT NOT NULL, PRIMARY KEY (viewer_id, token));
+INSERT INTO feishu_shared_root (viewer_id, token) VALUES ('ou_a', 'old_fld');`); err != nil {
+		t.Fatalf("准备旧结构: %v", err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("迁移重开失败: %v", err)
+	}
+	defer s.Close()
+	if err := s.UpsertSharedRoot(SharedRoot{ViewerID: "ou_a", Token: "note1", DocType: "docx"}); err != nil {
+		t.Fatalf("UpsertSharedRoot: %v", err)
+	}
+	roots, err := s.ListSharedRoots("ou_a")
+	if err != nil || len(roots) != 2 {
+		t.Fatalf("ListSharedRoots: %v %+v", err, roots)
+	}
+	got := map[string]string{}
+	for _, r := range roots {
+		got[r.Token] = r.DocType
+	}
+	if got["old_fld"] != "folder" || got["note1"] != "docx" {
+		t.Fatalf("旧记录应为 folder、新记录为 docx，实际 %+v", got)
+	}
+}

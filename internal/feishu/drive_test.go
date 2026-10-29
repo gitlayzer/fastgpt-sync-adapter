@@ -76,3 +76,18 @@ func TestListPermissionMembersItems(t *testing.T) {
 		t.Fatalf("应解析出 2 个协作者，实际 %+v", items)
 	}
 }
+
+// 搜索结果的标题取自 title_highlighted，去掉 <h></h> 高亮标签（判断“智能纪要：”开头要用）。
+func TestSearchDocWikiTitle(t *testing.T) {
+	c := New("cli_test", "secret")
+	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {
+		return `{"code":0,"data":{"has_more":false,"res_units":[{"title_highlighted":"<h>智能纪要</h>：周会 2026年5月15日","result_meta":{"token":"sn1","doc_types":"DOCX","owner_id":"ou_b"}}]}}`
+	})}
+	items, _, err := c.SearchDocWiki("ut", "智能纪要", nil, 0, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Title != "智能纪要：周会 2026年5月15日" || items[0].DocType != "DOCX" {
+		t.Fatalf("标题应去掉高亮标签，实际 %+v", items)
+	}
+}

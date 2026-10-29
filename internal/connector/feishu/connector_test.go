@@ -118,7 +118,7 @@ func (m *mockAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error
 	return nil, nil
 }
 
-func (m *mockAPI) SearchDocWiki(string, []string, int64, int64, string) ([]feishuapi.DocWikiResult, string, error) {
+func (m *mockAPI) SearchDocWiki(string, string, []string, int64, int64, string) ([]feishuapi.DocWikiResult, string, error) {
 	return nil, "", nil
 }
 
