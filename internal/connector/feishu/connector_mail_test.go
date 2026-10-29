@@ -111,7 +111,7 @@ func TestMailBodyOnlyMessage(t *testing.T) {
 	rc.Close()
 	body := string(data)
 	for _, want := range []string{"<title>周报 a/b</title>", "老板 &lt;boss@x.com&gt;", "A &lt;a@x.com&gt;", "2023-11-15 06:13:20",
-		"<pre>见附件 &lt;b&gt;不是标签&lt;/b&gt;</pre>", "script-src 'none'"} {
+		"<pre>见附件 &lt;b&gt;不是标签&lt;/b&gt;</pre>", "default-src 'none'; img-src data:;"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("正文缺少 %q:\n%s", want, body)
 		}

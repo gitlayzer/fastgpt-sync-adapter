@@ -124,8 +124,8 @@ func (c *Client) GetMailMessage(userToken, messageID string) (*MailMessage, erro
 		apiResp
 		Data struct {
 			Message struct {
-				MessageID    string `json:"message_id"` // 字段名以官方 SDK 为准：message_id，不是 id
-				Subject      string `json:"subject"`
+				MessageID    string        `json:"message_id"` // 字段名以官方 SDK 为准：message_id，不是 id
+				Subject      string        `json:"subject"`
 				SMTPID       string        `json:"smtp_message_id"`
 				HeadFrom     MailAddress   `json:"head_from"` // 发件人是对象 {mail_address, name}，不是字符串
 				To           []MailAddress `json:"to"`

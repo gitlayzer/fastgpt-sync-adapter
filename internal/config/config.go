@@ -5,6 +5,8 @@ package config
 
 import (
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -46,7 +48,7 @@ type Config struct {
 	Engine EngineConfig `yaml:"engine"`
 
 	Connectors struct {
-		WeCom WeComConnectorConfig `yaml:"wecom"`
+		WeCom  WeComConnectorConfig  `yaml:"wecom"`
 		Feishu FeishuConnectorConfig `yaml:"feishu"`
 	} `yaml:"connectors"`
 
@@ -104,15 +106,15 @@ type FeishuConnectorConfig struct {
 	// space_id 用一次 wiki/v2/spaces/get_node?token=<文档URL里的token> 反查即可：
 	// 返回里的 space_id 字段就是。
 	WikiSpaceIDs []string `yaml:"wiki_space_ids"`
-		// CollabRefresh 文档协作者列表刷新周期（默认 6h）。加减协作者不改变文档修改时间，只能定期查。
-		CollabRefresh Duration `yaml:"collab_refresh_interval"`
-		// SharedDiscover 搜索别人共享给员工的文件夹的周期（默认 1h）。所有者没授权、或分享给群/部门时只能靠搜索发现。
-		SharedDiscover Duration `yaml:"shared_discover_interval"`
-		// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（默认 100）。邮件详情接口限 100 次/分钟，首次补历史邮件会分多轮完成。
-		MailMaxPerRound int `yaml:"mail_max_per_round"`
-		// SearchKeys 显式指定的共享文档搜索关键词列表（留空则不触发搜索，避免抓入公共模板）
-		SearchKeys []string `yaml:"search_keys"`
-	}
+	// CollabRefresh 文档协作者列表刷新周期（默认 6h）。加减协作者不改变文档修改时间，只能定期查。
+	CollabRefresh Duration `yaml:"collab_refresh_interval"`
+	// SharedDiscover 搜索别人共享给员工的文件夹的周期（默认 1h）。所有者没授权、或分享给群/部门时只能靠搜索发现。
+	SharedDiscover Duration `yaml:"shared_discover_interval"`
+	// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（默认 100）。邮件详情接口限 100 次/分钟，首次补历史邮件会分多轮完成。
+	MailMaxPerRound int `yaml:"mail_max_per_round"`
+	// SearchKeys 显式指定的共享文档搜索关键词列表（留空则不触发搜索，避免抓入公共模板）
+	SearchKeys []string `yaml:"search_keys"`
+}
 
 // StorageConfig SQLite 存储配置。
 type StorageConfig struct {
@@ -143,18 +145,18 @@ type IdentityConfig struct {
 		// RefreshInterval 同步间隔（默认 1h）
 		RefreshInterval Duration `yaml:"refresh_interval"`
 		// 字段名可配，表格改列名时不用改代码
-		FieldWeComID   string `yaml:"field_wecom_id"`
-		FieldWeComName string `yaml:"field_wecom_name"`
+		FieldWeComID    string `yaml:"field_wecom_id"`
+		FieldWeComName  string `yaml:"field_wecom_name"`
 		FieldFeishuUser string `yaml:"field_feishu_user"`
-		FieldOpenID    string `yaml:"field_openid"`
+		FieldOpenID     string `yaml:"field_openid"`
 	} `yaml:"bitable"`
 }
 
 // FastGPTSinkConfig FastGPT 推送 sink 配置（方案 A：按人建库主动推）。
 type FastGPTSinkConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	BaseURL  string `yaml:"base_url"` // https://cloud.fastgpt.cn
-	APIKey   string `yaml:"api_key"`
+	Enabled  bool     `yaml:"enabled"`
+	BaseURL  string   `yaml:"base_url"` // https://cloud.fastgpt.cn
+	APIKey   string   `yaml:"api_key"`
 	Interval Duration `yaml:"interval"` // 推送巡检间隔
 }
 
@@ -167,18 +169,35 @@ type UserDirsConfig struct {
 
 // NASSinkConfig NAS Sink 配置节（归档出口：消息体+附件原样落盘）。
 type NASSinkConfig struct {
-	Enabled  bool `yaml:"enabled"`
-	UserDirs UserDirsConfig `yaml:"user_dirs"`
+	Enabled        bool           `yaml:"enabled"`
+	UserDirs       UserDirsConfig `yaml:"user_dirs"`
 	nassink.Config `yaml:",inline"`
 }
 
 // ServerConfig FastGPT API 文件库 HTTP 服务配置（集成在 daemon 进程中）。
+// 员工侧鉴权改用 api_tokens 表里的员工专属 token（见 internal/tokenauth），
+// 这里只保留管理员通道与下载链接签名相关配置。
 type ServerConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	Addr        string `yaml:"addr"`         // 监听地址，默认 :8080
-	Token       string `yaml:"token"`        // FastGPT Bearer 鉴权 token，默认 dev-token
 	ExternalURL string `yaml:"external_url"` // 对外可访问地址（经反代/隧道时必填）
+
+	AdminToken  string   `yaml:"admin_token"`  // 管理员全量 token；留空=关闭管理员通道
+	AdminAllow  []string `yaml:"admin_allow"`  // 管理员来源网段（CIDR）；留空=仅回环与私网
+	SignSecret  string   `yaml:"sign_secret"`  // 下载链接签名密钥；留空=每次启动随机生成
+	LinkTTL     Duration `yaml:"link_ttl"`     // 下载链接有效期，默认 10m
+	TokenGrace  Duration `yaml:"token_grace"`  // 轮换时旧 token 宽限期，默认 24h
+	PendingFile string   `yaml:"pending_file"` // 待交付 token 清单路径，默认 ./secrets/pending-tokens.csv
 }
+
+// 默认值。
+const (
+	defaultLinkTTL     = 10 * time.Minute
+	defaultTokenGrace  = 24 * time.Hour
+	defaultPendingFile = "./secrets/pending-tokens.csv"
+	// minSecretLen 管理员 token / 签名密钥的最小长度（字节）。
+	minSecretLen = 32
+)
 
 // Load 从 YAML 配置文件加载并校验。
 func Load(path string) (*Config, error) {
@@ -186,6 +205,20 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件 %s: %w", path, err)
 	}
+	// 旧配置兼容：server.token 已废弃（改用员工专属 token + 管理员 token），
+	// 这里单独探测一次，只打印警告不报错。
+	var legacy struct {
+		Server struct {
+			Token *string `yaml:"token"`
+		} `yaml:"server"`
+	}
+	if err := yaml.Unmarshal(data, &legacy); err != nil {
+		return nil, fmt.Errorf("解析配置文件: %w", err)
+	}
+	if legacy.Server.Token != nil {
+		log.Printf("[警告] server.token 已废弃，改用员工专属 token；管理员请配 server.admin_token")
+	}
+
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件: %w", err)
@@ -213,6 +246,7 @@ func (c *Config) NormalizePaths(baseDir string) {
 	toAbs(&c.Engine.StateFile)
 	toAbs(&c.Storage.DBFile)
 	toAbs(&c.Identity.LocalFile)
+	toAbs(&c.Server.PendingFile)
 	if c.Connectors.WeCom.Enabled {
 		toAbs(&c.Connectors.WeCom.WeCom.RSAPrivateKeyFile)
 		toAbs(&c.Connectors.WeCom.WeCom.SDKLibPath)
@@ -230,8 +264,32 @@ func (c *Config) Validate() error {
 	if c.Server.Addr == "" {
 		c.Server.Addr = ":8080"
 	}
-	if c.Server.Token == "" {
-		c.Server.Token = "dev-token"
+	if c.Server.LinkTTL.D() <= 0 {
+		c.Server.LinkTTL = Duration(defaultLinkTTL)
+	}
+	if c.Server.TokenGrace.D() <= 0 {
+		c.Server.TokenGrace = Duration(defaultTokenGrace)
+	}
+	if c.Server.PendingFile == "" {
+		c.Server.PendingFile = defaultPendingFile
+	}
+
+	// 管理员通道（留空 = 关闭）。长度不足 32 字节直接报错，避免弱密钥上线。
+	if c.Server.AdminToken != "" && len(c.Server.AdminToken) < minSecretLen {
+		return fmt.Errorf("server.admin_token 长度不足 %d 字节（建议 openssl rand -base64 32）", minSecretLen)
+	}
+	for i, entry := range c.Server.AdminAllow {
+		cidr := strings.TrimSpace(entry)
+		if cidr == "" {
+			return fmt.Errorf("server.admin_allow 含空项")
+		}
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("server.admin_allow 项 %q 不是合法 CIDR: %w", entry, err)
+		}
+		c.Server.AdminAllow[i] = cidr
+	}
+	if c.Server.SignSecret != "" && len(c.Server.SignSecret) < minSecretLen {
+		return fmt.Errorf("server.sign_secret 长度不足 %d 字节（建议 openssl rand -base64 32）", minSecretLen)
 	}
 
 	// 企微连接器

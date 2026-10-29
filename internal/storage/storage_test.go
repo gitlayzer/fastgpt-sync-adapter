@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/apitoken"
 )
 
 func TestStoreRoundTrip(t *testing.T) {
@@ -241,6 +243,119 @@ INSERT INTO feishu_shared_root (viewer_id, token) VALUES ('ou_a', 'old_fld');`);
 	}
 	if got["old_fld"] != "folder" || got["note1"] != "docx" {
 		t.Fatalf("旧记录应为 folder、新记录为 docx，实际 %+v", got)
+	}
+}
+
+// 员工 API token 全生命周期：签发 / 轮换（宽限期）/ 过期 / 吊销 / 列表。
+func TestAPITokenLifecycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	const person = "zhangsan"
+	// 空 personID 应报错，不落库
+	if _, err := s.IssueAPIToken("  "); err == nil {
+		t.Fatal("空 personID 签发应报错")
+	}
+	if _, err := s.RotateAPIToken("", time.Hour); err == nil {
+		t.Fatal("空 personID 轮换应报错")
+	}
+
+	// Issue → Lookup 命中
+	tok1, err := s.IssueAPIToken(person)
+	if err != nil {
+		t.Fatalf("IssueAPIToken: %v", err)
+	}
+	got, ok, err := s.LookupAPIToken(tok1)
+	if err != nil || !ok || got != person {
+		t.Fatalf("LookupAPIToken(tok1) = %q,%v,%v", got, ok, err)
+	}
+	if has, err := s.HasActiveAPIToken(person); err != nil || !has {
+		t.Fatalf("HasActiveAPIToken = %v,%v", has, err)
+	}
+	// 错误明文不命中
+	if _, ok, err := s.LookupAPIToken(tok1 + "x"); err != nil || ok {
+		t.Fatalf("错误明文不应命中: %v,%v", ok, err)
+	}
+
+	// Rotate(grace=1h)：新旧都命中
+	tok2, err := s.RotateAPIToken(person, time.Hour)
+	if err != nil {
+		t.Fatalf("RotateAPIToken: %v", err)
+	}
+	if tok2 == tok1 {
+		t.Fatal("轮换后明文应不同")
+	}
+	// 只有旧 token 带宽限期，新 token 不过期
+	var newExp int64
+	if err := s.db.QueryRow(`SELECT expires_at FROM api_tokens WHERE token_hash=?`,
+		apitoken.Hash(tok2)).Scan(&newExp); err != nil || newExp != 0 {
+		t.Fatalf("新 token 不应设过期时间: %d,%v", newExp, err)
+	}
+	for name, tk := range map[string]string{"新": tok2, "旧(宽限期)": tok1} {
+		if got, ok, err := s.LookupAPIToken(tk); err != nil || !ok || got != person {
+			t.Fatalf("%s token 应命中: %q,%v,%v", name, got, ok, err)
+		}
+	}
+
+	// 把旧 token 的 expires_at 改成过去 → 旧的不命中、新的命中
+	if _, err := s.db.Exec(`UPDATE api_tokens SET expires_at=? WHERE token_hash=?`,
+		time.Now().Add(-time.Minute).Unix(), apitoken.Hash(tok1)); err != nil {
+		t.Fatalf("手动改旧 token 过期时间: %v", err)
+	}
+	if _, ok, err := s.LookupAPIToken(tok1); err != nil || ok {
+		t.Fatalf("过期 token 不应命中: %v,%v", ok, err)
+	}
+	if got, ok, err := s.LookupAPIToken(tok2); err != nil || !ok || got != person {
+		t.Fatalf("新 token 仍应命中: %q,%v,%v", got, ok, err)
+	}
+
+	// ListAPITokens：两条，且不含明文
+	list, err := s.ListAPITokens()
+	if err != nil {
+		t.Fatalf("ListAPITokens: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("应有两枚 token，实际 %d: %+v", len(list), list)
+	}
+	for _, tk := range list {
+		if tk.Display == "" || tk.Display == tok1 || tk.Display == tok2 {
+			t.Fatalf("Display 不应为空或等于明文: %+v", tk)
+		}
+		if tk.PersonID != person || tk.CreatedAt == 0 {
+			t.Fatalf("token 记录不符: %+v", tk)
+		}
+		if tk.Status != "active" {
+			t.Fatalf("这两枚都应为 active: %+v", tk)
+		}
+	}
+
+	// Revoke → 两个都不命中，HasActive=false
+	n, err := s.RevokeAPITokens(person)
+	if err != nil {
+		t.Fatalf("RevokeAPITokens: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("应吊销 2 条，实际 %d", n)
+	}
+	for _, tk := range []string{tok1, tok2} {
+		if _, ok, err := s.LookupAPIToken(tk); err != nil || ok {
+			t.Fatalf("吊销后不应命中: %v,%v", ok, err)
+		}
+	}
+	if has, err := s.HasActiveAPIToken(person); err != nil || has {
+		t.Fatalf("吊销后 HasActive 应为 false: %v,%v", has, err)
+	}
+	// 其他员工不受影响
+	other, err := s.IssueAPIToken("lisi")
+	if err != nil {
+		t.Fatalf("IssueAPIToken(lisi): %v", err)
+	}
+	if got, ok, err := s.LookupAPIToken(other); err != nil || !ok || got != "lisi" {
+		t.Fatalf("他人 token 应命中: %q,%v,%v", got, ok, err)
 	}
 }
 

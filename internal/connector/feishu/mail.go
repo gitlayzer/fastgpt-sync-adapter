@@ -300,7 +300,8 @@ func (c *Connector) mailBody(userToken, msgID string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(renderMailHTML(msg, inline))), nil
 }
 
-// renderMailHTML 拼出正文文件。邮件原正文是外部内容，加 CSP 禁止脚本，避免在浏览器里打开时执行。
+// renderMailHTML 拼出正文文件。邮件原正文是外部内容，加 CSP：禁止脚本，也不加载任何外部资源
+// （外部图片常是已读追踪像素），只放行已嵌入的 data: 图片和内联样式。
 func renderMailHTML(msg *feishuapi.MailMessage, inline map[string]string) []byte {
 	subject := msg.Subject
 	if strings.TrimSpace(subject) == "" {
@@ -308,7 +309,7 @@ func renderMailHTML(msg *feishuapi.MailMessage, inline map[string]string) []byte
 	}
 	var b strings.Builder
 	b.WriteString("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n")
-	b.WriteString("<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'none'\">\n")
+	b.WriteString("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\">\n")
 	b.WriteString("<title>" + html.EscapeString(subject) + "</title></head><body>\n<table>\n")
 	row := func(k, v string) {
 		if v != "" {
