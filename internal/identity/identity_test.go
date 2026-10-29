@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gitlayzer/fastgpt-sync-adapter/internal/storage"
 	feishuapi "github.com/gitlayzer/fastgpt-sync-adapter/internal/feishu"
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/storage"
 )
 
 func TestLocalResolver(t *testing.T) {
@@ -61,6 +61,72 @@ func TestLocalResolver(t *testing.T) {
 	}
 }
 
+// TestLocalResolverLoadsOnConstruct 构造即加载：飞书共享文件夹发现等模块直接读 identities 表，
+// 不能等到第一次 Resolve 调用才把映射文件写入。
+func TestLocalResolverLoadsOnConstruct(t *testing.T) {
+	t.Run("映射文件存在", func(t *testing.T) {
+		dir := t.TempDir()
+		mapFile := filepath.Join(dir, "identity_map.json")
+
+		data, _ := json.Marshal([]Mapping{
+			{WeComUserID: "u1", FeishuUserID: "ou_x", PersonName: "张三"},
+		})
+		if err := os.WriteFile(mapFile, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		st, err := storage.Open(filepath.Join(dir, "t.db"))
+		if err != nil {
+			t.Fatalf("storage.Open: %v", err)
+		}
+		defer st.Close()
+
+		// 只构造，不调用任何 Resolve 方法
+		_ = NewLocalResolver(mapFile, st)
+
+		ids, err := st.ListFeishuUserIDs()
+		if err != nil {
+			t.Fatalf("ListFeishuUserIDs: %v", err)
+		}
+		found := false
+		for _, id := range ids {
+			if id == "ou_x" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("构造后 identities 表应含 ou_x, 得到 %v", ids)
+		}
+	})
+
+	t.Run("映射文件不存在", func(t *testing.T) {
+		dir := t.TempDir()
+		mapFile := filepath.Join(dir, "missing.json")
+
+		st, err := storage.Open(filepath.Join(dir, "t.db"))
+		if err != nil {
+			t.Fatalf("storage.Open: %v", err)
+		}
+		defer st.Close()
+
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("文件不存在时构造不应 panic: %v", rec)
+			}
+		}()
+		_ = NewLocalResolver(mapFile, st)
+
+		ids, err := st.ListFeishuUserIDs()
+		if err != nil {
+			t.Fatalf("ListFeishuUserIDs: %v", err)
+		}
+		if len(ids) != 0 {
+			t.Fatalf("无映射文件时应为空, 得到 %v", ids)
+		}
+	})
+}
+
 type fakeBitableSource struct {
 	recs []map[string]any
 }
@@ -87,15 +153,15 @@ func TestBitableResolver(t *testing.T) {
 			// 1. 企微 + 飞书用户：显式 open_id 优先于人员对象
 			{
 				"企业微信UserID": "zhangsan",
-				"企业微信姓名":   "张三",
-				"飞书人员":     []any{map[string]any{"id": "ou_bitable_app_zhangsan"}},
+				"企业微信姓名":     "张三",
+				"飞书人员":       []any{map[string]any{"id": "ou_bitable_app_zhangsan"}},
 				"飞书open_id":  "ou_sync_app_zhangsan",
 			},
 			// 2. 纯飞书用户：企微为空，应以 feishu:open_id 存入并保留名字
 			{
 				"企业微信UserID": "",
-				"企业微信姓名":   "纯飞书员工",
-				"飞书人员":     []any{map[string]any{"id": "ou_feishu_only"}},
+				"企业微信姓名":     "纯飞书员工",
+				"飞书人员":       []any{map[string]any{"id": "ou_feishu_only"}},
 				"飞书open_id":  "",
 			},
 		},

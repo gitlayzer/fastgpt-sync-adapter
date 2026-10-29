@@ -43,8 +43,12 @@ type LocalResolver struct {
 	modTime  time.Time
 }
 
+// NewLocalResolver 构造本地兜底解析器。
+// 构造时立即加载一次：其他模块（如飞书共享文件夹发现）会直接读 identities 表，不能等到第一次解析调用。
 func NewLocalResolver(file string, store *storage.Store) *LocalResolver {
-	return &LocalResolver{file: file, store: store}
+	r := &LocalResolver{file: file, store: store}
+	r.maybeReload()
+	return r
 }
 
 // maybeReload 文件存在且 mtime 变化时重载进 SQLite 缓存。
@@ -126,10 +130,10 @@ type BitableConfig struct {
 	TableID  string        // 数据表 id
 	Refresh  time.Duration // 同步间隔（0 表示默认 1 小时）
 	// 字段名（可配，避免表格改列名后代码失效）
-	FieldWeComID   string // 企微 userid 列
-	FieldWeComName string // 企微姓名列（含英文名前缀）
+	FieldWeComID    string // 企微 userid 列
+	FieldWeComName  string // 企微姓名列（含英文名前缀）
 	FieldFeishuUser string // 飞书人员列（用户对象）
-	FieldOpenID    string // 飞书 open_id 列（冗余列，人员列为空时兜底）
+	FieldOpenID     string // 飞书 open_id 列（冗余列，人员列为空时兜底）
 }
 
 // ApplyDefaults 填默认字段名（与现网表格一致）。
@@ -199,36 +203,36 @@ func (r *BitableResolver) syncLocked() (int, error) {
 		return 0, fmt.Errorf("查询记录: %w", err)
 	}
 	n := 0
-		for _, rec := range recs {
-			f := rec.Fields
-			wecomID := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComID]))
-			name := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComName]))
-			// 优先使用显式指定的飞书 open_id 文本字段（适配读表格与文档同步为不同应用的情况）
-			openID := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldOpenID]))
-			if openID == "" {
-				openID, _ = feishuapi.FieldUser(f[r.cfg.FieldFeishuUser])
-			}
-			if wecomID == "" && openID == "" {
-				continue
-			}
-			if wecomID == "" {
-				wecomID = "feishu:" + openID
-			}
-			if name == "" {
-				if !strings.HasPrefix(wecomID, "feishu:") {
-					name = wecomID // 姓名为空时退回 userid，至少不产生空目录
-				} else {
-					name = openID
-				}
-			}
-			if err := r.store.UpsertIdentity(&storage.Identity{
-				WeComUserID:  wecomID,
-				FeishuUserID: openID,
-				PersonName:   name,
-			}); err == nil {
-				n++
+	for _, rec := range recs {
+		f := rec.Fields
+		wecomID := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComID]))
+		name := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldWeComName]))
+		// 优先使用显式指定的飞书 open_id 文本字段（适配读表格与文档同步为不同应用的情况）
+		openID := strings.TrimSpace(feishuapi.FieldText(f[r.cfg.FieldOpenID]))
+		if openID == "" {
+			openID, _ = feishuapi.FieldUser(f[r.cfg.FieldFeishuUser])
+		}
+		if wecomID == "" && openID == "" {
+			continue
+		}
+		if wecomID == "" {
+			wecomID = "feishu:" + openID
+		}
+		if name == "" {
+			if !strings.HasPrefix(wecomID, "feishu:") {
+				name = wecomID // 姓名为空时退回 userid，至少不产生空目录
+			} else {
+				name = openID
 			}
 		}
+		if err := r.store.UpsertIdentity(&storage.Identity{
+			WeComUserID:  wecomID,
+			FeishuUserID: openID,
+			PersonName:   name,
+		}); err == nil {
+			n++
+		}
+	}
 	if n == 0 && len(recs) > 0 {
 		return 0, fmt.Errorf("解析出 0 条映射（检查字段名配置是否正确）")
 	}

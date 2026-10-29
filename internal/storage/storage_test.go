@@ -208,3 +208,44 @@ func TestMigrateAddsSharedRootTable(t *testing.T) {
 		t.Fatalf("删除后应为空: %+v", roots)
 	}
 }
+
+// 死信表：同一 (source, record_id) 只保留一条，重复写入更新 record/last_error。
+func TestDeadLetter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dead.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.AddDeadLetter("wecom", "msg-1", []byte(`{"id":"msg-1"}`), "第一次失败"); err != nil {
+		t.Fatalf("AddDeadLetter: %v", err)
+	}
+	if err := s.AddDeadLetter("wecom", "msg-1", []byte(`{"id":"msg-1","v":2}`), "第二次失败"); err != nil {
+		t.Fatalf("AddDeadLetter 更新: %v", err)
+	}
+	if n, err := s.CountDeadLetters("wecom"); err != nil || n != 1 {
+		t.Fatalf("同一条重复写入后应仍为 1 条: n=%d err=%v", n, err)
+	}
+	var record, lastErr string
+	if err := s.db.QueryRow(`SELECT record, last_error FROM dead_letter WHERE source=? AND record_id=?`,
+		"wecom", "msg-1").Scan(&record, &lastErr); err != nil {
+		t.Fatalf("回读死信: %v", err)
+	}
+	if lastErr != "第二次失败" {
+		t.Fatalf("last_error 应为第二次的值: %q", lastErr)
+	}
+	if record != `{"id":"msg-1","v":2}` {
+		t.Fatalf("record 应被更新: %q", record)
+	}
+
+	if err := s.AddDeadLetter("wecom", "msg-2", []byte(`{"id":"msg-2"}`), "失败"); err != nil {
+		t.Fatalf("AddDeadLetter msg-2: %v", err)
+	}
+	if n, _ := s.CountDeadLetters("wecom"); n != 2 {
+		t.Fatalf("应有 2 条死信: %d", n)
+	}
+	if n, _ := s.CountDeadLetters("feishu"); n != 0 {
+		t.Fatalf("其它 source 应为 0 条: %d", n)
+	}
+}

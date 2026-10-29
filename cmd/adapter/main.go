@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -23,6 +24,7 @@ import (
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/fastgpt"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/feishu"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/identity"
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/model"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/nasstore"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/server"
 	fastgmtsink "github.com/gitlayzer/fastgpt-sync-adapter/internal/sink/fastgpt"
@@ -136,6 +138,12 @@ func main() {
 			Interval:   cfg.Connectors.WeCom.Interval.D(),
 			BatchLimit: cfg.Connectors.WeCom.BatchLimit,
 			RunOnStart: cfg.Engine.RunOnStart,
+			// 企微以 seq 为游标，推进后无法重拉：批内有失败就整批重试，重试耗尽后转死信再推进。
+			HoldCursorOnFailure: true,
+			DeadLetter: func(r model.Record, err error) error {
+				b, _ := json.Marshal(r)
+				return st.AddDeadLetter(r.Source, r.ID, b, err.Error())
+			},
 		})
 		log.Printf("[OK] 企微连接器已注册（间隔 %s，批 %d）", cfg.Connectors.WeCom.Interval.D(), cfg.Connectors.WeCom.BatchLimit)
 	}
