@@ -167,3 +167,44 @@ VALUES ('old_doc_1', 12345, '旧文档.docx', 'ou_test', 100);
 		t.Fatalf("未找到 kind=minutes 的副本: %+v", updated)
 	}
 }
+
+// 旧库（没有 feishu_shared_root 表）重新打开后能正常读写共享表。
+func TestMigrateAddsSharedRootTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE feishu_shared_root`); err != nil {
+		t.Fatalf("准备旧结构: %v", err)
+	}
+	if err := s.UpsertCopy(DocCopy{Token: "old_doc", PersonID: "ou_a", Via: "owner", FileName: "旧.docx"}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("迁移重开失败: %v", err)
+	}
+	defer s.Close()
+	if cs, err := s.ListCopiesByPerson("ou_a"); err != nil || len(cs) != 1 {
+		t.Fatalf("旧数据应保留: %v %+v", err, cs)
+	}
+	if err := s.UpsertSharedRoot(SharedRoot{ViewerID: "ou_a", Token: "fld"}); err != nil {
+		t.Fatalf("UpsertSharedRoot: %v", err)
+	}
+	if err := s.UpsertSharedRoot(SharedRoot{ViewerID: "ou_a", Token: "fld"}); err != nil {
+		t.Fatalf("重复 UpsertSharedRoot: %v", err)
+	}
+	roots, err := s.ListSharedRoots("ou_a")
+	if err != nil || len(roots) != 1 || roots[0].Token != "fld" {
+		t.Fatalf("ListSharedRoots: %v %+v", err, roots)
+	}
+	if err := s.DeleteSharedRoot("ou_a", "fld"); err != nil {
+		t.Fatal(err)
+	}
+	if roots, _ := s.ListSharedRoots("ou_a"); len(roots) != 0 {
+		t.Fatalf("删除后应为空: %+v", roots)
+	}
+}

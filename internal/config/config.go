@@ -106,6 +106,8 @@ type FeishuConnectorConfig struct {
 	WikiSpaceIDs []string `yaml:"wiki_space_ids"`
 		// CollabRefresh 文档协作者列表刷新周期（默认 6h）。加减协作者不改变文档修改时间，只能定期查。
 		CollabRefresh Duration `yaml:"collab_refresh_interval"`
+		// SharedDiscover 搜索别人共享给员工的文件夹的周期（默认 1h）。所有者没授权、或分享给群/部门时只能靠搜索发现。
+		SharedDiscover Duration `yaml:"shared_discover_interval"`
 		// SearchKeys 显式指定的共享文档搜索关键词列表（留空则不触发搜索，避免抓入公共模板）
 		SearchKeys []string `yaml:"search_keys"`
 	}

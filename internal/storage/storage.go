@@ -146,6 +146,11 @@ CREATE TABLE IF NOT EXISTS feishu_doc_members (
   token      TEXT PRIMARY KEY,
   checked_at INTEGER NOT NULL DEFAULT 0,
   members    TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS feishu_shared_root (
+  viewer_id  TEXT NOT NULL,
+  token      TEXT NOT NULL,
+  PRIMARY KEY (viewer_id, token)
 );`)
 	if err != nil {
 		return fmt.Errorf("建表迁移: %w", err)
@@ -579,4 +584,60 @@ INSERT INTO feishu_doc_members (token, checked_at, members) VALUES (?, ?, ?)
 ON CONFLICT(token) DO UPDATE SET checked_at=excluded.checked_at, members=excluded.members`,
 		token, ts, strings.Join(members, ","))
 	return err
+}
+
+// ===== 别人共享给员工的文件夹（搜索发现，每轮用员工身份列出）=====
+
+// SharedRoot 员工能看到、但不在他云盘树下的一个共享文件夹。
+type SharedRoot struct {
+	ViewerID string
+	Token    string
+}
+
+// ListSharedRoots 列出某员工已发现的共享文件夹。
+func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
+	rows, err := s.db.Query(`SELECT viewer_id, token FROM feishu_shared_root WHERE viewer_id=?`, viewerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SharedRoot
+	for rows.Next() {
+		var r SharedRoot
+		if err := rows.Scan(&r.ViewerID, &r.Token); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UpsertSharedRoot 记录一次发现（已记录过的不重复写）。
+func (s *Store) UpsertSharedRoot(r SharedRoot) error {
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO feishu_shared_root (viewer_id, token) VALUES (?, ?)`, r.ViewerID, r.Token)
+	return err
+}
+
+// DeleteSharedRoot 员工已看不到（无权限或已删除）时移除。
+func (s *Store) DeleteSharedRoot(viewerID, token string) error {
+	_, err := s.db.Exec(`DELETE FROM feishu_shared_root WHERE viewer_id=? AND token=?`, viewerID, token)
+	return err
+}
+
+// ListFeishuUserIDs 人名映射表里全部员工的飞书 open_id（去重、去空）。
+func (s *Store) ListFeishuUserIDs() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT feishu_user_id FROM identities WHERE feishu_user_id != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }

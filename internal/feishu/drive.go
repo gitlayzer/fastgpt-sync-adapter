@@ -255,3 +255,79 @@ func (c *Client) ListPermissionMembers(userToken, token, docType string) ([]Perm
 	}
 	return out.Data.Items, nil
 }
+
+// DocWikiResult 云文档搜索（search/v2/doc_wiki/search）返回的一条结果。
+type DocWikiResult struct {
+	Token   string `json:"token"`
+	DocType string `json:"doc_types"` // FOLDER/DOCX/DOC/SHEET/BITABLE/FILE/SLIDES/MINDNOTE 等（大写）
+	OwnerID string `json:"owner_id"`
+}
+
+// SearchDocWiki 按创建人搜索调用者能看到的云文档，返回一页（page_size 20）。
+// creatorIDs 最多 20 个，名单里有一个 open_id 不存在（99992351）或属于别的应用（99992361）整次报错。
+// createStart/createEnd 都为 0 时不限创建时间；单位是秒（官方 SDK search/v2 DocFilter.CreateTime：“秒级时间戳”）。
+// 注意：单次搜索最多返回约 200 条，超出部分不报错、has_more=false，调用方需按创建时间拆分。
+func (c *Client) SearchDocWiki(userToken string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]DocWikiResult, string, error) {
+	filter := map[string]any{"creator_ids": creatorIDs}
+	if createStart > 0 || createEnd > 0 {
+		filter["create_time"] = map[string]int64{"start": createStart, "end": createEnd}
+	}
+	body := map[string]any{"query": "", "doc_filter": filter, "page_size": 20}
+	if pageToken != "" {
+		body["page_token"] = pageToken
+	}
+	var out struct {
+		apiResp
+		Data struct {
+			HasMore   bool   `json:"has_more"`
+			PageToken string `json:"page_token"`
+			ResUnits  []struct {
+				ResultMeta DocWikiResult `json:"result_meta"`
+			} `json:"res_units"`
+		} `json:"data"`
+	}
+	if err := c.postJSON(baseURL+"/search/v2/doc_wiki/search", body, userToken, &out); err != nil {
+		return nil, "", err
+	}
+	items := make([]DocWikiResult, 0, len(out.Data.ResUnits))
+	for _, u := range out.Data.ResUnits {
+		items = append(items, u.ResultMeta)
+	}
+	next := ""
+	if out.Data.HasMore {
+		next = out.Data.PageToken
+	}
+	return items, next, nil
+}
+
+// DocMeta 文档元数据（drive/v1/metas/batch_query），这里只用来确认调用者还能看到。
+type DocMeta struct {
+	DocToken string `json:"doc_token"`
+}
+
+// DocMetaFailed 查询失败的文档（实测：970003 无权限，970005 已删除）。
+type DocMetaFailed struct {
+	Token string `json:"token"`
+	Code  int    `json:"code"`
+}
+
+// BatchQueryMetas 批量查询文档元数据，docs 为 [token, 类型] 列表，一次不超过 200 个。
+// 调用者没有权限或文档已删除时不报错，放在 failed 里返回。
+func (c *Client) BatchQueryMetas(userToken string, docs [][2]string) ([]DocMeta, []DocMetaFailed, error) {
+	reqDocs := make([]map[string]string, 0, len(docs))
+	for _, d := range docs {
+		reqDocs = append(reqDocs, map[string]string{"doc_token": d[0], "doc_type": d[1]})
+	}
+	var out struct {
+		apiResp
+		Data struct {
+			Metas      []DocMeta       `json:"metas"`
+			FailedList []DocMetaFailed `json:"failed_list"`
+		} `json:"data"`
+	}
+	body := map[string]any{"request_docs": reqDocs}
+	if err := c.postJSON(baseURL+"/drive/v1/metas/batch_query", body, userToken, &out); err != nil {
+		return nil, nil, err
+	}
+	return out.Data.Metas, out.Data.FailedList, nil
+}
