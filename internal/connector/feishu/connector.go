@@ -12,6 +12,7 @@ import (
 	"log"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,8 @@ type Config struct {
 	CollabRefresh time.Duration `yaml:"collab_refresh_interval"`
 	// SharedDiscover 按“创建人”搜索别人共享给员工的文件夹的周期（0 = 默认 1h）。
 	SharedDiscover time.Duration `yaml:"shared_discover_interval"`
+	// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（0 = 默认 100）。
+	MailMaxPerRound int `yaml:"mail_max_per_round"`
 }
 
 // API 抽象（便于测试替换；feishuapi.Client 适配实现）。
@@ -70,7 +73,8 @@ type API interface {
 	DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error)
 
 	// 邮箱邮件与附件接口
-	ListMailboxMessages(userToken string, pageSize int) ([]string, error)
+	ListMailFolders(userToken string) ([]feishuapi.MailFolder, error)
+	ListMailboxMessages(userToken, folderID, pageToken string) ([]string, string, bool, error)
 	GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error)
 	DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error)
 }
@@ -90,6 +94,12 @@ type Connector struct {
 	lastDl      atomic.Int64          // 上次下载时间（纳秒），限流用
 	lastSearch  atomic.Int64          // 上次搜索时间（纳秒），限流用
 	discoveredAt map[string]int64     // 员工 → 上次完整搜索共享文件夹的时间（秒）
+	lastMailList atomic.Int64         // 上次列邮件的时间（纳秒），限流用
+	lastMailGet atomic.Int64          // 上次取邮件详情的时间（纳秒），限流用
+	lastMailURL atomic.Int64          // 上次取邮件附件下载链接的时间（纳秒），限流用
+	mailMu      sync.Mutex
+	mailCache   map[string]*feishuapi.MailMessage // 扫描时取到的邮件详情，生成正文时复用，用完即删
+	mailPending map[string]*mailAck               // 待 Ack 的邮件记录 → 要记为已处理的邮件拷贝
 }
 
 func New(cfg Config, store *storage.Store) *Connector {
@@ -466,66 +476,8 @@ func (c *Connector) scan(ctx context.Context) error {
 					log.Printf("[feishu] %s 扫描到 %d 篇智能纪要/妙记", g.ExternalUserID, len(minutesList))
 				}
 
-					// e) 邮箱邮件附件扫描（每次最多取 20 封，超出飞书上限会被拒绝；列表不参与删除判断）
-					msgIDs, err := c.api.ListMailboxMessages(g.AccessToken, 20)
-					if err != nil {
-						log.Printf("[feishu] 获取用户 %s 邮箱邮件列表失败: %v", g.ExternalUserID, err)
-					} else if len(msgIDs) > 0 {
-						mailCount := 0
-						for _, msgID := range msgIDs {
-							if msgID == "" {
-								continue
-							}
-							msg, err := c.api.GetMailMessage(g.AccessToken, msgID)
-							if err != nil {
-								log.Printf("[feishu] 获取邮件 %s 详情失败: %v", msgID, err)
-								continue
-							}
-							if msg == nil || len(msg.Attachments) == 0 {
-								continue
-							}
-							var recordAtts []model.Attachment
-							usedNames := map[string]int{} // 同一封邮件里的同名附件再加序号
-							for _, ma := range msg.Attachments {
-								if ma.ID == "" || ma.Name == "" || ma.IsInline {
-									continue
-								}
-								// 附件名后加 messageID 短码，避免不同邮件的同名附件互相覆盖。
-								// 邮件 ID 统一用列表给的 msgID，不依赖详情响应里的字段
-								shortID := msgID
-								if len(shortID) > 8 {
-									shortID = shortID[len(shortID)-8:]
-								}
-								ext := path.Ext(ma.Name)
-								attName := sanitizeFilename(strings.TrimSuffix(ma.Name, ext)) + "_" + shortID
-								if usedNames[attName]++; usedNames[attName] > 1 {
-									attName = fmt.Sprintf("%s_%d", attName, usedNames[attName])
-								}
-								recordAtts = append(recordAtts, model.Attachment{
-									Name:   attName + ext,
-									FileID: "mail:" + msgID + ":" + ma.ID,
-									Size:   ma.Size,
-									UserID: g.ExternalUserID,
-								})
-							}
-							if len(recordAtts) > 0 {
-								rec := model.Record{
-									Source:      "feishu",
-									Kind:        "mail",
-									ID:          "mail_" + msgID,
-									Timestamp:   msg.CreatedTime,
-									OwnerIDs:    []string{g.ExternalUserID},
-									SenderID:    g.ExternalUserID,
-									Attachments: recordAtts,
-								}
-							c.collect(st, rec, g.ExternalUserID)
-							mailCount++
-						}
-					}
-					if mailCount > 0 {
-						log.Printf("[feishu] %s 扫描到 %d 封含附件邮件", g.ExternalUserID, mailCount)
-					}
-				}
+				// e) 邮箱：正文和附件都存。逐个文件夹翻页，已存过的跳过，没存过的取详情产出记录（不参与删除判断）。
+				c.scanMail(st, g.AccessToken, g.ExternalUserID, now)
 
 				// f) 本人是所有者的文档：按周期刷新协作者列表，把协作者加进“能看到的人”。
 				// 加减协作者不会改变文档修改时间（实测），所以不能只在文档变化时查。
@@ -1137,6 +1089,12 @@ func (c *Connector) Ack(recordID string) error {
 		return nil
 	}
 	for p, via := range meta.persons {
+		// 邮件先记“已处理”再记副本：中途失败时不会出现“有副本、没记已处理”而反复取详情
+		if meta.kind == "mail" {
+			if err := c.ackMail(recordID, p); err != nil {
+				return err
+			}
+		}
 		if err := c.store.UpsertCopy(storage.DocCopy{
 			Token: meta.token, PersonID: p, Via: via,
 			EditTime: meta.editTime, FileName: meta.title, OwnerID: meta.ownerID, Kind: meta.kind,
@@ -1228,7 +1186,11 @@ func (c *Connector) FetchAttachment(ctx context.Context, a *model.Attachment) (i
 		if len(parts) != 2 {
 			return nil, fmt.Errorf("非法邮件附件标识: %s", token)
 		}
+		pace(&c.lastMailURL, mailURLMinInterval)
 		return c.api.DownloadMailAttachment(tok, parts[0], parts[1])
+	case "mailbody":
+		// fileID 格式为 mailbody:<messageID>
+		return c.mailBody(tok, token)
 	}
 	return nil, fmt.Errorf("暂不支持的文档类型: %s", scheme)
 }

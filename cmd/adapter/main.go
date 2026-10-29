@@ -152,6 +152,7 @@ func main() {
 			AppID: fc.AppID, AppSecret: fc.AppSecret, Mode: fc.Mode, Folders: fc.Folders,
 			WikiSpaceIDs: fc.WikiSpaceIDs, CollabRefresh: fc.CollabRefresh.D(),
 			SharedDiscover: fc.SharedDiscover.D(),
+			MailMaxPerRound: fc.MailMaxPerRound,
 			SearchKeys: fc.SearchKeys,
 		}, st)
 		eng.AddConnector(engine.ConnectorJob{

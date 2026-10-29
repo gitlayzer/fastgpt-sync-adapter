@@ -34,8 +34,11 @@ func newCopyAPI() *copyAPI {
 	}
 }
 
-func (m *copyAPI) ListMailboxMessages(string, int) ([]string, error) {
-	return m.mailIDs, nil
+func (m *copyAPI) ListMailboxMessages(_, folderID, _ string) ([]string, string, bool, error) {
+	if folderID != "INBOX" {
+		return nil, "", false, nil
+	}
+	return m.mailIDs, "", false, nil
 }
 func (m *copyAPI) GetMailMessage(tok, msgID string) (*feishuapi.MailMessage, error) {
 	if m.mailMap != nil {
@@ -425,10 +428,10 @@ func TestCopyMailSameNameAttachments(t *testing.T) {
 	}
 	c := newUserConn(t, st, api, Config{})
 	got := round(t, c)
-	if len(got) != 1 || len(got[0].Attachments) != 2 {
-		t.Fatalf("应产出 1 封邮件 2 个附件，实际 %+v", got)
+	if len(got) != 1 || len(got[0].Attachments) != 3 {
+		t.Fatalf("应产出 1 封邮件 2 个附件 + 正文，实际 %+v", got)
 	}
-	if a, b := got[0].Attachments[0].Name, got[0].Attachments[1].Name; a != "合同_defgh123.pdf" || b != "合同_defgh123_2.pdf" {
+	if a, b := got[0].Attachments[1].Name, got[0].Attachments[2].Name; a != "合同_defgh123.pdf" || b != "合同_defgh123_2.pdf" {
 		t.Fatalf("同名附件应区分，实际 %q %q", a, b)
 	}
 }
@@ -520,7 +523,7 @@ func TestCopyMailUsesListMessageID(t *testing.T) {
 	if len(got) != 1 || got[0].ID != "mail_msg_abcdefgh123" {
 		t.Fatalf("记录 ID 应为 mail_msg_abcdefgh123，实际 %v", kinds(got))
 	}
-	a := got[0].Attachments[0]
+	a := got[0].Attachments[1]
 	if a.FileID != "mail:msg_abcdefgh123:a1" || a.Name != "合同_defgh123.pdf" {
 		t.Fatalf("附件标识/文件名应带列表里的邮件 ID，实际 %q %q", a.FileID, a.Name)
 	}
