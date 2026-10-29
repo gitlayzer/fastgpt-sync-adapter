@@ -110,6 +110,8 @@ type FeishuConnectorConfig struct {
 	CollabRefresh Duration `yaml:"collab_refresh_interval"`
 	// SharedDiscover 搜索别人共享给员工的文件夹的周期（默认 1h）。所有者没授权、或分享给群/部门时只能靠搜索发现。
 	SharedDiscover Duration `yaml:"shared_discover_interval"`
+	// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（默认 100）。邮件详情接口限 100 次/分钟，首次补历史邮件会分多轮完成。
+	MailMaxPerRound int `yaml:"mail_max_per_round"`
 	// SearchKeys 显式指定的共享文档搜索关键词列表（留空则不触发搜索，避免抓入公共模板）
 	SearchKeys []string `yaml:"search_keys"`
 }

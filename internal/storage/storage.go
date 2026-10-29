@@ -155,6 +155,19 @@ CREATE TABLE IF NOT EXISTS feishu_shared_root (
   doc_type   TEXT NOT NULL DEFAULT 'folder',
   PRIMARY KEY (viewer_id, token)
 );
+CREATE TABLE IF NOT EXISTS feishu_mail_folder (
+  person_id  TEXT NOT NULL,
+  folder_id  TEXT NOT NULL,
+  scanned_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (person_id, folder_id)
+);
+CREATE TABLE IF NOT EXISTS feishu_mail_seen (
+  person_id  TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  smtp_id    TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (person_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_feishu_mail_seen_smtp ON feishu_mail_seen(person_id, smtp_id);
 CREATE TABLE IF NOT EXISTS api_tokens (
   token_hash   TEXT PRIMARY KEY,
   display      TEXT NOT NULL DEFAULT '',
@@ -661,6 +674,46 @@ func (s *Store) UpsertSharedRoot(r SharedRoot) error {
 // DeleteSharedRoot 员工已看不到（无权限或已删除）时移除。
 func (s *Store) DeleteSharedRoot(viewerID, token string) error {
 	_, err := s.db.Exec(`DELETE FROM feishu_shared_root WHERE viewer_id=? AND token=?`, viewerID, token)
+	return err
+}
+
+// ===== 飞书邮箱：每个文件夹上次完整翻完、且没有漏存邮件的时间 =====
+
+// MailFolderScannedAt 某员工某个邮箱文件夹上次完整核对通过的时间（秒），没有记录返回 0。
+func (s *Store) MailFolderScannedAt(personID, folderID string) int64 {
+	var ts int64
+	_ = s.db.QueryRow(`SELECT scanned_at FROM feishu_mail_folder WHERE person_id=? AND folder_id=?`, personID, folderID).Scan(&ts)
+	return ts
+}
+
+// SetMailFolderScannedAt 记录一次完整核对通过。
+func (s *Store) SetMailFolderScannedAt(personID, folderID string, ts int64) error {
+	_, err := s.db.Exec(`
+INSERT INTO feishu_mail_folder (person_id, folder_id, scanned_at) VALUES (?, ?, ?)
+ON CONFLICT(person_id, folder_id) DO UPDATE SET scanned_at=excluded.scanned_at`, personID, folderID, ts)
+	return err
+}
+
+// MailSeen 这封邮件（按 message_id）是否已给该员工处理过：存过，或是已存邮件的另一份拷贝。
+func (s *Store) MailSeen(personID, messageID string) bool {
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(1) FROM feishu_mail_seen WHERE person_id=? AND message_id=?`, personID, messageID).Scan(&n)
+	return n > 0
+}
+
+// MailSeenSMTP 同一封邮件（按 RFC 邮件 ID）是否已给该员工存过。
+func (s *Store) MailSeenSMTP(personID, smtpID string) bool {
+	if smtpID == "" {
+		return false
+	}
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(1) FROM feishu_mail_seen WHERE person_id=? AND smtp_id=?`, personID, smtpID).Scan(&n)
+	return n > 0
+}
+
+// AddMailSeen 记录一封已处理的邮件。
+func (s *Store) AddMailSeen(personID, messageID, smtpID string) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO feishu_mail_seen (person_id, message_id, smtp_id) VALUES (?, ?, ?)`, personID, messageID, smtpID)
 	return err
 }
 
