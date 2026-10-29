@@ -118,7 +118,7 @@ func (m *mockAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error
 	return nil, nil
 }
 
-func (m *mockAPI) SearchDocWiki(string, []string, int64, int64, string) ([]feishuapi.DocWikiResult, string, error) {
+func (m *mockAPI) SearchDocWiki(string, string, []string, int64, int64, string) ([]feishuapi.DocWikiResult, string, error) {
 	return nil, "", nil
 }
 
@@ -130,8 +130,12 @@ func (m *mockAPI) DownloadMinutesTranscript(userToken, minuteToken string) (io.R
 	return io.NopCloser(strings.NewReader("逐字稿发言内容")), nil
 }
 
-func (m *mockAPI) ListMailboxMessages(userToken string, pageSize int) ([]string, error) {
+func (m *mockAPI) ListMailFolders(userToken string) ([]feishuapi.MailFolder, error) {
 	return nil, nil
+}
+
+func (m *mockAPI) ListMailboxMessages(userToken, folderID, pageToken string) ([]string, string, bool, error) {
+	return nil, "", false, nil
 }
 
 func (m *mockAPI) GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error) {
@@ -498,8 +502,11 @@ func (m *mockMinutesAndMailAPI) DownloadMinutesTranscript(userToken, minuteToken
 	return io.NopCloser(strings.NewReader("宋文帅：今天讨论项目方案\n张建丰：收到")), nil
 }
 
-func (m *mockMinutesAndMailAPI) ListMailboxMessages(userToken string, pageSize int) ([]string, error) {
-	return m.mailIDs, nil
+func (m *mockMinutesAndMailAPI) ListMailboxMessages(userToken, folderID, pageToken string) ([]string, string, bool, error) {
+	if folderID != "INBOX" {
+		return nil, "", false, nil
+	}
+	return m.mailIDs, "", false, nil
 }
 
 func (m *mockMinutesAndMailAPI) GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error) {
@@ -605,11 +612,12 @@ func TestMailAttachmentsSync(t *testing.T) {
 		t.Fatalf("应抓取到 1 封含附件邮件, 实际: %d", len(recs))
 	}
 	r := recs[0]
-	if r.Kind != "mail" || len(r.Attachments) != 1 || r.Attachments[0].Name != "采购合同_msg_m1.pdf" {
+	if r.Kind != "mail" || len(r.Attachments) != 2 || r.Attachments[0].Name != "2023-11-15_采购合同确认_msg_m1.html" ||
+		r.Attachments[1].Name != "采购合同_msg_m1.pdf" {
 		t.Fatalf("邮件记录附件属性错误: %+v", r)
 	}
 
-	rc, err := c.FetchAttachment(context.Background(), &r.Attachments[0])
+	rc, err := c.FetchAttachment(context.Background(), &r.Attachments[1])
 	if err != nil {
 		t.Fatalf("FetchAttachment 失败: %v", err)
 	}

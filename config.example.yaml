@@ -12,8 +12,20 @@
 server:
   enabled: true                    # 随主服务常驻启动
   addr: ":8080"                    # FastGPT 接口监听地址与内嵌 Web 浏览器页面
-  token: "dev-token"               # FastGPT Bearer 鉴权 Token（建议生产环境更换为复杂随机密钥）
   external_url: ""                 # 对外暴露地址（经反代/隧道暴露时填写，如 https://file.example.com；留空自动推断）
+
+  # ── 员工 token 隔离（v2）──────────────────────────────────────────────
+  # 员工侧不再共用一个全局 token：每个员工一份专属 token（`adapter token issue/list/rotate/revoke`），
+  # token 决定他的根目录 = <sinks.nas.root_path>/<姓名>。旧字段 server.token 已废弃（保留只会告警）。
+
+  admin_token: ""                  # 管理员全量 token（可看整个 NAS，仅运维排查用）；留空=关闭管理员通道。
+                                   # 开启时长度必须 >= 32 字节，生成方式：openssl rand -base64 32
+  admin_allow: []                  # 管理员来源网段（CIDR 列表，如 ["10.0.0.0/8", "192.168.1.0/24"]）；
+                                   # 留空=仅回环与私网（10/8、172.16/12、192.168/16、127/8、::1、fc00::/7）
+  sign_secret: ""                  # 下载链接 HMAC 签名密钥（>= 32 字节；留空=每次启动随机生成，重启后旧链接失效）
+  link_ttl: 10m                    # 下载链接（previewUrl）有效期，默认 10m
+  token_grace: 24h                 # 轮换 token 时旧 token 的宽限期，默认 24h
+  pending_file: "./secrets/pending-tokens.csv"   # 自动签发写入的待交付清单（含明文，已 .gitignore，交付后删除）
 
 # 飞书 OAuth 授权服务（员工通过此页面完成飞书账号授权）
 # 员工打开该链接完成扫码：http://<IP>:8089/oauth/feishu/start
@@ -62,6 +74,7 @@ connectors:
     interval: 5m                           # 增量扫描周期（建议 100 人规模设置为 15m~30m）
     mode: "both"                           # both（个人云文档 + 团队知识库）/ user（仅个人云文档）
     shared_discover_interval: 1h           # 搜索别人共享给员工的文件夹的周期（每人每次约 名单人数/20 次搜索；300 人以上建议 2h，500 人以上 3h）
+    mail_max_per_round: 100                # 每人每轮最多处理多少封还没存过的邮件（邮件详情接口 100 次/分钟，每 100 封约 1 分钟；历史邮件分多轮补齐）
 
 # ==============================================================================
 # 5. 跨平台实名身份解析（企微 UserID ↔ 飞书 OpenID ↔ 员工真实姓名）

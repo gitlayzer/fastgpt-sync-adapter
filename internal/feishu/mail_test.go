@@ -10,19 +10,34 @@ import (
 func TestListMailboxMessages(t *testing.T) {
 	c := New("cli_test", "secret")
 	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {
-		ps := r.URL.Query().Get("page_size")
-		if ps != "20" {
-			t.Fatalf("page_size 应限制不超过 20, 实际为 %s", ps)
+		q := r.URL.Query()
+		if q.Get("page_size") != "20" || q.Get("folder_id") != "SENT" || q.Get("page_token") != "p1" {
+			t.Fatalf("请求参数不符: %s", r.URL.RawQuery)
 		}
-		return `{"code":0,"data":{"has_more":false,"items":["m1","m2"]}}`
+		return `{"code":0,"data":{"has_more":true,"page_token":"p2","items":["m1","m2"]}}`
 	})}
 
-	items, err := c.ListMailboxMessages("ut", 50) // 传入 50 应自动限制为 20
+	items, next, more, err := c.ListMailboxMessages("ut", "SENT", "p1")
 	if err != nil {
 		t.Fatalf("ListMailboxMessages: %v", err)
 	}
-	if len(items) != 2 || items[0] != "m1" || items[1] != "m2" {
-		t.Fatalf("解析邮件 ID 列表不符: %v", items)
+	if len(items) != 2 || items[0] != "m1" || items[1] != "m2" || next != "p2" || !more {
+		t.Fatalf("解析邮件 ID 列表不符: %v %q %v", items, next, more)
+	}
+}
+
+// 列文件夹：系统文件夹 folder_type=1，用户自建 folder_type=2（结构以实测和官方 SDK 为准）。
+func TestListMailFolders(t *testing.T) {
+	c := New("cli_test", "secret")
+	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {
+		return `{"code":0,"data":{"items":[{"folder_type":1,"id":"INBOX","name":"Inbox"},{"folder_type":2,"id":"7351","name":"客户"}]}}`
+	})}
+	fs, err := c.ListMailFolders("ut")
+	if err != nil {
+		t.Fatalf("ListMailFolders: %v", err)
+	}
+	if len(fs) != 2 || fs[0].ID != "INBOX" || fs[0].Type != 1 || fs[1].ID != "7351" || fs[1].Type != 2 || fs[1].Name != "客户" {
+		t.Fatalf("解析文件夹不符: %+v", fs)
 	}
 }
 
@@ -32,7 +47,7 @@ func TestListMailboxMessagesObjectArray(t *testing.T) {
 		return `{"code":0,"data":{"has_more":false,"items":[{"id":"obj_m1"},{"id":"obj_m2"}]}}`
 	})}
 
-	items, err := c.ListMailboxMessages("ut", 20)
+	items, _, _, err := c.ListMailboxMessages("ut", "INBOX", "")
 	if err != nil {
 		t.Fatalf("ListMailboxMessages: %v", err)
 	}
@@ -47,7 +62,7 @@ func TestListMailboxMessagesUnactivated(t *testing.T) {
 		return `{"code":15180001,"msg":"user has no mailbox"}`
 	})}
 
-	items, err := c.ListMailboxMessages("ut", 20)
+	items, _, _, err := c.ListMailboxMessages("ut", "INBOX", "")
 	if err != nil {
 		t.Fatalf("未开通邮箱时不应报错: %v", err)
 	}
@@ -66,10 +81,14 @@ func TestGetMailMessage(t *testing.T) {
 					"message_id": "msg_123",
 					"subject": "重要采购合同",
 					"head_from": {"mail_address": "vendor@example.com", "name": "供应商"},
+					"to": [{"mail_address": "a@example.com", "name": "张三"}],
+					"cc": [{"mail_address": "b@example.com", "name": ""}],
 					"internal_date": "1700000000000",
+					"body_html": "PHA-5q2j5paHPC9wPg==",
+					"body_plain_text": "5q2j5paH",
 					"attachments": [
 						{"id": "att_1", "filename": "合同.pdf", "size": 10240, "is_inline": false},
-						{"id": "att_2", "filename": "签名.png", "size": 2048, "is_inline": true}
+						{"id": "att_2", "filename": "签名.png", "size": 2048, "is_inline": true, "cid": "sig01"}
 					]
 				}
 			}
@@ -83,8 +102,14 @@ func TestGetMailMessage(t *testing.T) {
 	if msg.MessageID != "msg_123" || msg.Subject != "重要采购合同" || msg.CreatedTime != 1700000000000 {
 		t.Fatalf("邮件详情解析错误: %+v", msg)
 	}
-	if msg.HeadFrom != "vendor@example.com" {
-		t.Fatalf("发件人解析错误: %q", msg.HeadFrom)
+	if msg.HeadFrom != "vendor@example.com" || msg.FromName != "供应商" {
+		t.Fatalf("发件人解析错误: %q %q", msg.HeadFrom, msg.FromName)
+	}
+	if len(msg.To) != 1 || msg.To[0].Address != "a@example.com" || msg.To[0].Name != "张三" || len(msg.Cc) != 1 || msg.Cc[0].Address != "b@example.com" {
+		t.Fatalf("收件人/抄送解析错误: %+v %+v", msg.To, msg.Cc)
+	}
+	if msg.BodyHTML != "<p>正文</p>" || msg.BodyPlain != "正文" {
+		t.Fatalf("正文 base64url 解码错误: %q %q", msg.BodyHTML, msg.BodyPlain)
 	}
 	if len(msg.Attachments) != 2 {
 		t.Fatalf("附件数量错误: %d", len(msg.Attachments))
@@ -92,7 +117,7 @@ func TestGetMailMessage(t *testing.T) {
 	if msg.Attachments[0].Name != "合同.pdf" || msg.Attachments[0].IsInline != false {
 		t.Fatalf("附件 1 错误: %+v", msg.Attachments[0])
 	}
-	if msg.Attachments[1].Name != "签名.png" || msg.Attachments[1].IsInline != true {
+	if msg.Attachments[1].Name != "签名.png" || msg.Attachments[1].IsInline != true || msg.Attachments[1].CID != "sig01" {
 		t.Fatalf("附件 2 错误: %+v", msg.Attachments[1])
 	}
 }

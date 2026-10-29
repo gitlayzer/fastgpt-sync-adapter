@@ -108,6 +108,8 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	log.Printf("[engine] 已启动：%d 个连接器，%d 个 Sink，%d 个任务", len(e.jobs), len(e.sinks), len(e.tasks))
 	wg.Wait()
+	// 没有连接器和任务时（例如只开文件服务）上面立即返回，这里继续空转到收到停止信号。
+	<-ctx.Done()
 	return nil
 }
 
