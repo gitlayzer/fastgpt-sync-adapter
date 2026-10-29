@@ -10,6 +10,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/apitoken"
 )
 
 // Store 存储入口。
@@ -152,7 +154,18 @@ CREATE TABLE IF NOT EXISTS feishu_shared_root (
   token      TEXT NOT NULL,
   doc_type   TEXT NOT NULL DEFAULT 'folder',
   PRIMARY KEY (viewer_id, token)
-);`)
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+  token_hash   TEXT PRIMARY KEY,
+  display      TEXT NOT NULL DEFAULT '',
+  person_id    TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'active',   -- active | revoked
+  created_at   INTEGER NOT NULL DEFAULT 0,
+  expires_at   INTEGER NOT NULL DEFAULT 0,       -- 0 = 不过期；轮换时给旧 token 设宽限期
+  last_used_at INTEGER NOT NULL DEFAULT 0,
+  revoked_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_person ON api_tokens(person_id);`)
 	if err != nil {
 		return fmt.Errorf("建表迁移: %w", err)
 	}
@@ -263,6 +276,25 @@ ON CONFLICT(wecom_user_id) DO UPDATE SET
   feishu_user_id=excluded.feishu_user_id, person_name=excluded.person_name, updated_at=excluded.updated_at`,
 		id.WeComUserID, id.FeishuUserID, id.PersonName, id.UpdatedAt)
 	return err
+}
+
+// ListIdentities 全部身份映射，按企微 userid 排序。
+func (s *Store) ListIdentities() ([]Identity, error) {
+	rows, err := s.db.Query(`
+SELECT wecom_user_id, feishu_user_id, person_name, updated_at FROM identities ORDER BY wecom_user_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Identity
+	for rows.Next() {
+		var id Identity
+		if err := rows.Scan(&id.WeComUserID, &id.FeishuUserID, &id.PersonName, &id.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) GetIdentityByWeCom(wecomUserID string) (*Identity, error) {
@@ -630,6 +662,173 @@ func (s *Store) UpsertSharedRoot(r SharedRoot) error {
 func (s *Store) DeleteSharedRoot(viewerID, token string) error {
 	_, err := s.db.Exec(`DELETE FROM feishu_shared_root WHERE viewer_id=? AND token=?`, viewerID, token)
 	return err
+}
+
+// ===== API token =====
+
+// APIToken 一枚员工专属 API token 的存库信息（不含明文与哈希）。
+// PersonID 现阶段是 identities.wecom_user_id；Status 为 active 或 revoked；
+// 时间均为 unix 秒，ExpiresAt=0 表示不过期。
+// 明文只在签发/轮换时返回一次，库里只存 SHA-256 哈希。
+type APIToken struct {
+	Display    string
+	PersonID   string
+	Status     string
+	CreatedAt  int64
+	ExpiresAt  int64
+	LastUsedAt int64
+	RevokedAt  int64
+}
+
+// tokenStatusActive token 有效状态值。
+const tokenStatusActive = "active"
+
+// tokenStatusRevoked token 已吊销状态值。
+const tokenStatusRevoked = "revoked"
+
+// tokenLastUsedThrottle 同一 token 的 last_used_at 最多每 60 秒写一次，避免每个请求都写库。
+const tokenLastUsedThrottle = 60
+
+// execer 让签发逻辑既能跑在 *sql.DB 上，也能跑在事务里。
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// issueAPIToken 生成明文并写入一行 api_tokens。
+func issueAPIToken(ex execer, personID string, now int64) (string, error) {
+	token, err := apitoken.Generate()
+	if err != nil {
+		return "", err
+	}
+	if _, err := ex.Exec(`
+INSERT INTO api_tokens (token_hash, display, person_id, status, created_at, expires_at, last_used_at, revoked_at)
+VALUES (?, ?, ?, ?, ?, 0, 0, 0)`,
+		apitoken.Hash(token), apitoken.Display(token), personID, tokenStatusActive, now); err != nil {
+		return "", fmt.Errorf("写入 api_tokens: %w", err)
+	}
+	return token, nil
+}
+
+// IssueAPIToken 为员工签发新 token，返回明文（只此一次）。
+func (s *Store) IssueAPIToken(personID string) (string, error) {
+	if strings.TrimSpace(personID) == "" {
+		return "", errors.New("签发 API token 需要 personID")
+	}
+	return issueAPIToken(s.db, personID, time.Now().Unix())
+}
+
+// RotateAPIToken 签发新 token；该员工现有 active 且未设过期的 token 改为 now+grace 过期。返回新明文。
+// 新 token 立即生效，旧 token 在宽限期内仍可用，grace<=0 时旧 token 立刻过期。
+func (s *Store) RotateAPIToken(personID string, grace time.Duration) (string, error) {
+	if strings.TrimSpace(personID) == "" {
+		return "", errors.New("轮换 API token 需要 personID")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 先给旧 token 设宽限期，再签发新 token，否则新 token 也会被设上过期时间。
+	now := time.Now().Unix()
+	expiresAt := now + int64(grace/time.Second)
+	if _, err := tx.Exec(`
+UPDATE api_tokens SET expires_at=? WHERE person_id=? AND status=? AND expires_at=0`,
+		expiresAt, personID, tokenStatusActive); err != nil {
+		return "", fmt.Errorf("设置旧 token 宽限期: %w", err)
+	}
+	token, err := issueAPIToken(tx, personID, now)
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// RevokeAPITokens 吊销该员工全部 token（status=revoked, revoked_at=now），返回吊销条数。
+func (s *Store) RevokeAPITokens(personID string) (int, error) {
+	if strings.TrimSpace(personID) == "" {
+		return 0, errors.New("吊销 API token 需要 personID")
+	}
+	res, err := s.db.Exec(`
+UPDATE api_tokens SET status=?, revoked_at=? WHERE person_id=? AND status!=?`,
+		tokenStatusRevoked, time.Now().Unix(), personID, tokenStatusRevoked)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// LookupAPIToken 明文 → 员工 ID。不存在、已吊销、已过期（expires_at>0 且 <=now）都返回 ("", false, nil)。
+// 命中时更新 last_used_at（同一 token 60 秒内不重复写，避免每个请求都写库）。
+func (s *Store) LookupAPIToken(token string) (personID string, ok bool, err error) {
+	if token == "" {
+		return "", false, nil
+	}
+	var (
+		status     string
+		expiresAt  int64
+		lastUsedAt int64
+	)
+	err = s.db.QueryRow(`
+SELECT person_id, status, expires_at, last_used_at FROM api_tokens WHERE token_hash=?`,
+		apitoken.Hash(token)).Scan(&personID, &status, &expiresAt, &lastUsedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	now := time.Now().Unix()
+	if status != tokenStatusActive || (expiresAt > 0 && expiresAt <= now) {
+		return "", false, nil
+	}
+	if now-lastUsedAt >= tokenLastUsedThrottle {
+		if _, err := s.db.Exec(`UPDATE api_tokens SET last_used_at=? WHERE token_hash=?`,
+			now, apitoken.Hash(token)); err != nil {
+			return "", false, err
+		}
+	}
+	return personID, true, nil
+}
+
+// ListAPITokens 列出全部 token（不含明文和哈希），按 person_id、created_at 排序。
+func (s *Store) ListAPITokens() ([]APIToken, error) {
+	rows, err := s.db.Query(`
+SELECT display, person_id, status, created_at, expires_at, last_used_at, revoked_at
+FROM api_tokens ORDER BY person_id, created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []APIToken
+	for rows.Next() {
+		var t APIToken
+		if err := rows.Scan(&t.Display, &t.PersonID, &t.Status, &t.CreatedAt,
+			&t.ExpiresAt, &t.LastUsedAt, &t.RevokedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// HasActiveAPIToken 员工是否已有有效 token（用于自动签发时跳过）。
+func (s *Store) HasActiveAPIToken(personID string) (bool, error) {
+	if strings.TrimSpace(personID) == "" {
+		return false, nil
+	}
+	var n int
+	err := s.db.QueryRow(`
+SELECT COUNT(1) FROM api_tokens WHERE person_id=? AND status=? AND (expires_at=0 OR expires_at>?)`,
+		personID, tokenStatusActive, time.Now().Unix()).Scan(&n)
+	return n > 0, err
 }
 
 // ListFeishuUserIDs 人名映射表里全部员工的飞书 open_id（去重、去空）。

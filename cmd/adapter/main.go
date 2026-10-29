@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	fastgmtsink "github.com/gitlayzer/fastgpt-sync-adapter/internal/sink/fastgpt"
 	nassink "github.com/gitlayzer/fastgpt-sync-adapter/internal/sink/nas"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/storage"
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/tokenauth"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/version"
 )
 
@@ -39,6 +41,9 @@ func main() {
 			return
 		case "serve":
 			serveMain(os.Args[2:])
+			return
+		case "token":
+			tokenMain(os.Args[2:])
 			return
 		}
 	}
@@ -63,7 +68,12 @@ func main() {
 	log.Printf(" 企微连接器 : enabled=%v", cfg.Connectors.WeCom.Enabled)
 	log.Printf(" 飞书连接器 : enabled=%v", cfg.Connectors.Feishu.Enabled)
 	log.Printf(" NAS Sink   : enabled=%v（归档：消息+附件原样落盘）", cfg.Sinks.NAS.Enabled)
-	log.Printf(" API 文件库 : enabled=%v（监听 %s，token=%s）", cfg.Server.Enabled, cfg.Server.Addr, cfg.Server.Token)
+	log.Printf(" API 文件库 : enabled=%v（监听 %s）", cfg.Server.Enabled, cfg.Server.Addr)
+	if cfg.Server.AdminToken != "" {
+		log.Printf(" 管理员通道 : 已开启（来源限制 %s）", adminAllowDesc(cfg.Server.AdminAllow))
+	} else {
+		log.Printf(" 管理员通道 : 未开启（仅员工专属 token）")
+	}
 	log.Printf(" 分类器     : enabled=%v（默认标签 %s）", cfg.Classifier.Enabled, cfg.Classifier.DefaultLabel)
 	log.Printf("==============================================")
 
@@ -104,12 +114,40 @@ func main() {
 		log.Printf("[OK] 身份解析器：source=local（%s）", cfg.Identity.LocalFile)
 	}
 
+	// ===== 员工专属 token 自动签发 =====
+	// 身份加载完成后先跑一次；之后每 10 分钟一次（身份刷新没有现成钩子，
+	// 多维表格/本地映射都在解析时惰性刷新，轮询扫描 identities 最稳）。
+	// 只写日志与待交付清单，日志里不出现明文 token。
+	if cfg.Server.Enabled {
+		issue := func() {
+			// local 模式的身份映射是惰性加载的（第一次解析时才导入 SQLite），
+			// 先空查一次触发加载，否则首次扫描 identities 还是空的。
+			_, _ = ids.ResolveWeCom("")
+			n, err := issuePendingTokens(st, cfg.Server.ExternalURL, cfg.Server.PendingFile)
+			if err != nil {
+				log.Printf("[警告] 自动签发 token: %v", err)
+				return
+			}
+			if n > 0 {
+				log.Printf("[OK] 已为 %d 名员工签发 token，清单见 %s", n, cfg.Server.PendingFile)
+			}
+		}
+		issue()
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				issue()
+			}
+		}()
+	}
+
 	// ===== Sink：NAS 归档 =====
 	clf := classifier.New(cfg.Classifier)
 	// NAS_URL 可覆盖 config.yaml（Docker 中通过 host.docker.internal 访问宿主机中继）。
-		nasCfg := cfg.Sinks.NAS.Config
-		nasCfg.GroupNames = cfg.Connectors.WeCom.GroupNames
-		if v := os.Getenv("NAS_URL"); v != "" {
+	nasCfg := cfg.Sinks.NAS.Config
+	nasCfg.GroupNames = cfg.Connectors.WeCom.GroupNames
+	if v := os.Getenv("NAS_URL"); v != "" {
 		nasCfg.URL = v
 		log.Printf("[NAS] 使用环境变量 NAS_URL=%s", v)
 	}
@@ -152,7 +190,7 @@ func main() {
 			AppID: fc.AppID, AppSecret: fc.AppSecret, Mode: fc.Mode, Folders: fc.Folders,
 			WikiSpaceIDs: fc.WikiSpaceIDs, CollabRefresh: fc.CollabRefresh.D(),
 			SharedDiscover: fc.SharedDiscover.D(),
-			SearchKeys: fc.SearchKeys,
+			SearchKeys:     fc.SearchKeys,
 		}, st)
 		eng.AddConnector(engine.ConnectorJob{
 			Conn:       fcConn,
@@ -163,19 +201,19 @@ func main() {
 		log.Printf("[OK] 飞书连接器已注册（mode=%s，共享文件夹 %d 个，间隔 %s）", fc.Mode, len(fc.Folders), fc.Interval.D())
 	}
 	if cfg.Auth.Enabled && feishuClient != nil {
-			authSvc := auth.New(auth.Config{
-				Addr:            cfg.Auth.Addr,
-				ExternalURL:     cfg.Auth.ExternalURL,
-				RefreshInterval: cfg.Auth.RefreshInterval.D(),
-			}, feishuClient, st)
-			// 启动前先同步刷新一次快过期的授权，避免首轮飞书扫描遇到已过期 token 竞争
-			_ = authSvc.Run(context.Background())
-			// HTTP 服务单独 goroutine
-			go func() {
-				if err := authSvc.Start(); err != nil {
-					log.Printf("[auth] webhook 退出: %v", err)
-				}
-			}()
+		authSvc := auth.New(auth.Config{
+			Addr:            cfg.Auth.Addr,
+			ExternalURL:     cfg.Auth.ExternalURL,
+			RefreshInterval: cfg.Auth.RefreshInterval.D(),
+		}, feishuClient, st)
+		// 启动前先同步刷新一次快过期的授权，避免首轮飞书扫描遇到已过期 token 竞争
+		_ = authSvc.Run(context.Background())
+		// HTTP 服务单独 goroutine
+		go func() {
+			if err := authSvc.Start(); err != nil {
+				log.Printf("[auth] webhook 退出: %v", err)
+			}
+		}()
 		// token 刷新注册为引擎周期任务
 		eng.AddTask(authSvc)
 		log.Printf("[OK] 飞书授权 webhook 已启动（%s），token 刷新间隔 %s", cfg.Auth.Addr, cfg.Auth.RefreshInterval.D())
@@ -199,18 +237,23 @@ func main() {
 	// ===== FastGPT API 文件库 HTTP 服务（serve 模式，随 daemon 同步启动） =====
 	var apiServer *http.Server
 	if cfg.Server.Enabled && cfg.Sinks.NAS.Enabled {
-		backend := nasstore.New(nas.Client(), cfg.Sinks.NAS.RootPath)
+		backendFor := func(root string) server.Backend { return nasstore.New(nas.Client(), root) }
 		srv := server.New(server.Options{
 			Addr:        cfg.Server.Addr,
-			Token:       cfg.Server.Token,
 			ExternalURL: cfg.Server.ExternalURL,
-		}, backend)
+			Auth:        tokenauth.New(st, cfg.Sinks.NAS.RootPath),
+			AdminToken:  cfg.Server.AdminToken,
+			AdminAllow:  cfg.Server.AdminAllow,
+			SignSecret:  []byte(cfg.Server.SignSecret),
+			LinkTTL:     cfg.Server.LinkTTL.D(),
+			NASRoot:     cfg.Sinks.NAS.RootPath,
+		}, backendFor)
 		apiServer = &http.Server{
 			Addr:    cfg.Server.Addr,
 			Handler: srv.Handler(),
 		}
 		go func() {
-			log.Printf("[OK] FastGPT API 文件库服务已启动（%s，token=%s）", cfg.Server.Addr, cfg.Server.Token)
+			log.Printf("[OK] FastGPT API 文件库服务已启动（%s）", cfg.Server.Addr)
 			if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Printf("[server] API 文件库退出: %v", err)
 			}
@@ -276,4 +319,12 @@ func ensureUserDirs(nas *nassink.Sink, userClient *fastgpt.UserClient, rootPath 
 		log.Printf("  [建目录] %s", dir)
 	}
 	return nil
+}
+
+// adminAllowDesc 管理员来源限制的人话描述（不含任何 token）。
+func adminAllowDesc(allow []string) string {
+	if len(allow) == 0 {
+		return "默认：仅回环与私网"
+	}
+	return strings.Join(allow, ", ")
 }

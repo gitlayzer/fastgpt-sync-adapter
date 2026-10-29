@@ -22,6 +22,9 @@ feishu_user_token.json
 *.log
 data/
 
+# 待交付 token 清单（含明文 token，交付后请删除）
+secrets/
+
 # ==== macOS ====
 .DS_Store
 ._*

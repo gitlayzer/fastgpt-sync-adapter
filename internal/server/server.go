@@ -1,28 +1,71 @@
 package server
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/store"
 )
 
+// defaultLinkTTL 下载链接默认有效期。
+const defaultLinkTTL = 10 * time.Minute
+
+// Scope 一次请求能访问的范围。
+type Scope struct {
+	Admin    bool   // 管理员全量：根目录 = 整个 NAS root
+	PersonID string // 员工 ID（Admin 时为空）
+	Root     string // 该请求的根目录（NAS 绝对路径）
+}
+
+// name 日志用的调用方标识（Admin 写 admin）；永不包含 token。
+func (sc *Scope) name() string {
+	if sc == nil || sc.Admin {
+		return adminPerson
+	}
+	return sc.PersonID
+}
+
+// Authenticator 由调用方实现：Bearer 明文 → 员工 → 员工根目录。
+type Authenticator interface {
+	// ResolveToken 返回员工 ID 与其 NAS 根目录；无效/吊销/过期返回 ok=false。
+	ResolveToken(token string) (personID, root string, ok bool, err error)
+	// RootOf 员工 ID → 当前根目录（签名下载链接校验时用，员工目录改名后仍能找到）。
+	RootOf(personID string) (root string, ok bool)
+}
+
 // Options serve 模式（API 文件库 + 文件服务器）的运行参数。
 type Options struct {
-	Addr  string // 监听地址，如 :8080
-	Token string // FastGPT 调用时携带的 Bearer token
+	Addr string // 监听地址，如 :8080
 	// 外部可访问地址（用于拼 previewUrl/read 链接）。
 	// 例如经 cloudflared 暴露时填 https://xxx.trycloudflare.com；
 	// 留空则从请求头推断（X-Forwarded-Proto/Host 或直连 Host）。
 	ExternalURL string
+	// Auth 员工 token 解析器；为 nil 时只保留管理员通道。
+	Auth Authenticator
+	// AdminToken 管理员全量 token；为空表示关闭管理员通道。
+	AdminToken string
+	// AdminAllow 管理员请求允许的来源网段（CIDR），为空时只允许回环和私网地址
+	//（10/8、172.16/12、192.168/16、127/8、::1、fc00::/7）。
+	AdminAllow []string
+	// SignSecret 下载链接签名密钥（>=32 字节）；为空时 New 内部用 crypto/rand 生成
+	//（进程重启后旧链接失效，可接受）。
+	SignSecret []byte
+	// LinkTTL 下载链接有效期，0=10 分钟。
+	LinkTTL time.Duration
+	// NASRoot 整个 NAS 根路径（管理员 Scope.Root 用）。
+	NASRoot string
 }
 
 // Backend 文件库后端：本地目录或群晖 NAS（WebAPI）。
@@ -62,57 +105,179 @@ type resp struct {
 }
 
 type Server struct {
-	opts    Options
-	backend Backend
-	mux     *http.ServeMux
+	opts       Options
+	backendFor func(root string) Backend
+	adminNets  []*net.IPNet
+	mux        *http.ServeMux
 }
 
-func New(opts Options, b Backend) *Server {
-	s := &Server{opts: opts, backend: b, mux: http.NewServeMux()}
+// New 构造 Server。backendFor 按请求 scope 的根目录构造隔离的 Backend
+// （nasstore 对应 func(root string) Backend { return nasstore.New(client, root) }）。
+func New(opts Options, backendFor func(root string) Backend) *Server {
+	if opts.LinkTTL <= 0 {
+		opts.LinkTTL = defaultLinkTTL
+	}
+	if len(opts.SignSecret) == 0 {
+		secret := make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			log.Printf("[server] ⚠️ 生成下载链接签名密钥失败: %v", err)
+		}
+		opts.SignSecret = secret
+	} else if len(opts.SignSecret) < 32 {
+		log.Printf("[server] ⚠️ SignSecret 长度不足 32 字节（%d），建议使用更长的密钥", len(opts.SignSecret))
+	}
+
+	s := &Server{opts: opts, backendFor: backendFor, mux: http.NewServeMux()}
+	for _, c := range opts.AdminAllow {
+		_, n, err := net.ParseCIDR(strings.TrimSpace(c))
+		if err != nil {
+			log.Printf("[server] ⚠️ 忽略非法 AdminAllow 网段 %q: %v", c, err)
+			continue
+		}
+		s.adminNets = append(s.adminNets, n)
+	}
 	s.routes()
 	return s
 }
 
 func (s *Server) routes() {
-	s.mux.HandleFunc("/v1/file/list", s.withAuth(s.handleList))
-	s.mux.HandleFunc("/v1/file/content", s.withAuth(s.handleContent))
-	s.mux.HandleFunc("/v1/file/read", s.withAuth(s.handleRead))
-	s.mux.HandleFunc("/v1/file/detail", s.withAuth(s.handleDetail))
-	// download 允许 query token（FastGPT 拉 previewUrl 时不带 Authorization 头）
-	s.mux.HandleFunc("/v1/file/download", s.withAuthOrQueryToken(s.handleDownload))
+	s.mux.HandleFunc("/v1/file/list", s.withScope(s.handleList))
+	s.mux.HandleFunc("/v1/file/content", s.withScope(s.handleContent))
+	s.mux.HandleFunc("/v1/file/read", s.withScope(s.handleRead))
+	s.mux.HandleFunc("/v1/file/detail", s.withScope(s.handleDetail))
+	// download 支持签名外链（?sig=，FastGPT 拉 previewUrl 时不带 Authorization 头）
+	// 或 Bearer；旧的 ?token= 查询参数鉴权已删除。
+	s.mux.HandleFunc("/v1/file/download", s.handleDownload)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/", s.handleIndex)
 }
 
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// tokenValid 校验 Bearer header。
-func (s *Server) tokenValid(r *http.Request) bool {
-	auth := r.Header.Get("Authorization")
+// scopeOf 解析请求的访问范围。返回非 0 状态码表示应直接以该状态码拒绝。
+func (s *Server) scopeOf(r *http.Request) (*Scope, int) {
 	const prefix = "Bearer "
-	return strings.HasPrefix(auth, prefix) && strings.TrimPrefix(auth, prefix) == s.opts.Token
+	head := r.Header.Get("Authorization")
+	if !strings.HasPrefix(head, prefix) {
+		return nil, http.StatusUnauthorized
+	}
+	t := strings.TrimSpace(strings.TrimPrefix(head, prefix))
+	if t == "" {
+		return nil, http.StatusUnauthorized
+	}
+
+	// 管理员通道：常量时间比较，且只接受来自允许网段的请求（不信任 X-Forwarded-For）。
+	if s.opts.AdminToken != "" && subtle.ConstantTimeCompare([]byte(t), []byte(s.opts.AdminToken)) == 1 {
+		if !s.adminIPAllowed(r.RemoteAddr) {
+			log.Printf("[server] ⛔ 管理员 token 来自非允许网段: %s", clientIP(r.RemoteAddr))
+			return nil, http.StatusForbidden
+		}
+		return &Scope{Admin: true, Root: s.opts.NASRoot}, 0
+	}
+
+	if s.opts.Auth == nil {
+		return nil, http.StatusUnauthorized
+	}
+	personID, root, ok, err := s.opts.Auth.ResolveToken(t)
+	if err != nil {
+		log.Printf("[server] ⚠️ token 解析失败: %v", err)
+		return nil, http.StatusInternalServerError
+	}
+	if !ok || personID == "" || root == "" {
+		return nil, http.StatusUnauthorized
+	}
+	return &Scope{PersonID: personID, Root: root}, 0
 }
 
-// withAuth 仅接受 Authorization: Bearer <token>。
-func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
+// withScope 鉴权后按 scope.Root 构造隔离的 Backend 传给 handler。
+func (s *Server) withScope(next func(w http.ResponseWriter, r *http.Request, sc *Scope, b Backend)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.tokenValid(r) {
-			writeErr(w, http.StatusUnauthorized, "invalid or missing bearer token")
+		sc, b, ok := s.resolve(w, r)
+		if !ok {
 			return
 		}
-		next(w, r)
+		next(w, r, sc, b)
 	}
 }
 
-// withAuthOrQueryToken Bearer 或 ?token= 均可（用于文件下载外链）。
-func (s *Server) withAuthOrQueryToken(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.tokenValid(r) && r.URL.Query().Get("token") != s.opts.Token {
-			writeErr(w, http.StatusUnauthorized, "invalid or missing token")
-			return
-		}
-		next(w, r)
+// resolve 解析 scope 并构造 Backend。失败时已写好错误响应（ok=false）。
+func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (*Scope, Backend, bool) {
+	sc, code := s.scopeOf(r)
+	if code != 0 {
+		writeErr(w, code, authErrMsg(code))
+		return nil, nil, false
 	}
+	b := s.backend(sc.Root)
+	if b == nil {
+		writeErr(w, http.StatusInternalServerError, "backend unavailable")
+		return nil, nil, false
+	}
+	return sc, b, true
+}
+
+// authErrMsg 鉴权失败对外的固定文案（不回显任何 token 信息）。
+func authErrMsg(code int) string {
+	switch code {
+	case http.StatusForbidden:
+		return "access not allowed from this address"
+	case http.StatusInternalServerError:
+		return "token resolve failed"
+	default:
+		return "invalid or missing bearer token"
+	}
+}
+
+// backend 按根目录构造 Backend（工厂为 nil 或返回 nil 时视为不可用）。
+func (s *Server) backend(root string) Backend {
+	if s.backendFor == nil {
+		return nil
+	}
+	return s.backendFor(root)
+}
+
+// adminIPAllowed 判断来源地址是否在管理员允许网段内。
+// AdminAllow 为空时只放行回环与私网地址。
+func (s *Server) adminIPAllowed(remoteAddr string) bool {
+	ip := net.ParseIP(clientIP(remoteAddr))
+	if ip == nil {
+		return false
+	}
+	if len(s.adminNets) > 0 {
+		for _, n := range s.adminNets {
+			if n.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, n := range defaultAdminNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultAdminNets 未配置 AdminAllow 时放行的私网网段。
+var defaultAdminNets = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128", "fc00::/7"} {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+// clientIP 从 RemoteAddr 取 IP（不信任任何代理头）。
+func clientIP(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 // externalBase 计算对外可访问的 base URL。
@@ -134,11 +299,9 @@ func (s *Server) externalBase(r *http.Request) string {
 	return scheme + "://" + host
 }
 
-// fileURL 拼某个文件的下载外链（带 token，供 FastGPT/浏览器直接访问）。
-func (s *Server) fileURL(r *http.Request, id string) string {
-	q := url.Values{}
-	q.Set("id", id)
-	q.Set("token", s.opts.Token)
+// fileURL 拼某个文件的下载外链（带 HMAC 签名，不携带任何明文 token）。
+func (s *Server) fileURL(r *http.Request, sc *Scope, id string) string {
+	q := s.signLink(id, sc.name(), time.Now())
 	return s.externalBase(r) + "/v1/file/download?" + q.Encode()
 }
 
@@ -147,7 +310,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /v1/file/list  body: {"parentId": "...", "searchKey": "..."}
-func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+// 只列当前 scope 的根目录（员工目录或 NAS 根）之下的内容。
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request, sc *Scope, b Backend) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
@@ -165,12 +329,12 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	var err error
 	pid := ""
 	if strings.TrimSpace(body.SearchKey) != "" {
-		nodes, err = s.backend.Search(body.SearchKey)
+		nodes, err = b.Search(body.SearchKey)
 	} else {
 		if body.ParentID != nil {
 			pid = *body.ParentID
 		}
-		nodes, err = s.backend.Children(pid)
+		nodes, err = b.Children(pid)
 	}
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
@@ -179,20 +343,20 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	if nodes == nil {
 		nodes = []*store.Node{}
 	}
-	log.Printf("[server] POST /v1/file/list parentId=%q searchKey=%q -> 返回 %d 项 (来自 %s)", pid, body.SearchKey, len(nodes), r.RemoteAddr)
+	log.Printf("[server] POST /v1/file/list person=%s parentId=%q searchKey=%q -> 返回 %d 项 (来自 %s)", sc.name(), pid, body.SearchKey, len(nodes), r.RemoteAddr)
 	writeOK(w, nodes)
 }
 
 // GET /v1/file/content?id=xx
-// 改为返回 previewUrl：FastGPT 通过该外链下载原文件并自行解析（支持 PDF/Word/Excel 等），
-// 本服务不再做文本提取，文件内容原样提供。
-func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
+// 返回 previewUrl（HMAC 签名的下载外链）：FastGPT 通过该外链下载原文件并自行解析
+// （支持 PDF/Word/Excel 等），本服务不再做文本提取，文件内容原样提供。
+func (s *Server) handleContent(w http.ResponseWriter, r *http.Request, sc *Scope, b Backend) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	node, err := s.backend.Get(id)
+	node, err := b.Get(id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -201,111 +365,166 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "node is not a file")
 		return
 	}
-		log.Printf("[server] GET /v1/file/content id=%q (%s) -> 生成 previewUrl (来自 %s)", id, node.Name, r.RemoteAddr)
-		writeOK(w, map[string]string{
-			"title":      node.Name,
-			"previewUrl": s.fileURL(r, id),
-			"dirPath":    path.Dir(node.AbsPath()),
-		})
-	}
+	log.Printf("[server] GET /v1/file/content person=%s id=%q (%s) -> 生成 previewUrl (来自 %s)", sc.name(), id, node.Name, r.RemoteAddr)
+	writeOK(w, map[string]string{
+		"title":      node.Name,
+		"previewUrl": s.fileURL(r, sc, id),
+		"dirPath":    path.Dir(node.AbsPath()),
+	})
+}
 
-	// GET /v1/file/read?id=xx  返回原文访问链接
-	func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			writeErr(w, http.StatusBadRequest, "missing id")
-			return
-		}
-		if _, err := s.backend.Get(id); err != nil {
-			writeErr(w, http.StatusNotFound, err.Error())
-			return
-		}
-		writeOK(w, map[string]string{
-			"url": s.fileURL(r, id),
-		})
+// GET /v1/file/read?id=xx  返回原文访问链接
+func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, sc *Scope, b Backend) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "missing id")
+		return
 	}
+	if _, err := b.Get(id); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{
+		"url": s.fileURL(r, sc, id),
+	})
+}
 
-	// GET /v1/file/detail?id=xx
-	func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			writeErr(w, http.StatusBadRequest, "missing id")
+// GET /v1/file/detail?id=xx
+func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request, sc *Scope, b Backend) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "missing id")
+		return
+	}
+	node, err := b.Get(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeOK(w, node)
+}
+
+// GET /v1/file/download?id=xx&sig=...  签名外链下载（无 sig 时走 Bearer）
+// GET /v1/file/download?path=xx       仅管理员可用（按绝对路径下载，仅供预览页图片用）
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	id := q.Get("id")
+	rawPath := q.Get("path")
+
+	var sc *Scope
+	var b Backend
+
+	switch {
+	case q.Get("sig") != "":
+		// 签名外链：id + exp + sig，不带任何 token。
+		if id == "" || rawPath != "" {
+			writeErr(w, http.StatusForbidden, errBadLink.Error())
 			return
 		}
-		node, err := s.backend.Get(id)
+		person, err := s.verifyLink(q, time.Now())
 		if err != nil {
-			writeErr(w, http.StatusNotFound, err.Error())
+			writeErr(w, http.StatusForbidden, err.Error())
 			return
 		}
-		writeOK(w, node)
-	}
-
-	// GET /v1/file/download?id=xx&token=xx 或 ?path=xx&token=xx  原样返回文件字节流（供 previewUrl/read/图片 使用）
-	func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("id")
-		rawPath := r.URL.Query().Get("path")
-		var rc io.ReadCloser
-		var fileName string
-		var err error
-
-		if id != "" {
-			node, err := s.backend.Get(id)
-			if err != nil {
-				writeErr(w, http.StatusNotFound, err.Error())
+		if person == adminPerson {
+			if s.opts.NASRoot == "" {
+				writeErr(w, http.StatusNotFound, "node not found")
 				return
 			}
-			if node.Type != "file" {
-				writeErr(w, http.StatusBadRequest, "node is not a file")
-				return
-			}
-			fileName = node.Name
-			log.Printf("[server] ⬇️ GET /v1/file/download 开始下载: %q (%s, 来自 %s)", node.Name, id, r.RemoteAddr)
-			rc, err = s.backend.Open(node)
-			if err != nil {
-				writeErr(w, http.StatusBadGateway, "open file: "+err.Error())
-				return
-			}
-		} else if rawPath != "" {
-			fileName = path.Base(rawPath)
-			log.Printf("[server] ⬇️ GET /v1/file/download 按路径下载: %q (来自 %s)", rawPath, r.RemoteAddr)
-			rc, err = s.backend.OpenPath(rawPath)
-			if err != nil {
-				writeErr(w, http.StatusNotFound, "open path: "+err.Error())
-				return
-			}
+			sc = &Scope{Admin: true, Root: s.opts.NASRoot}
 		} else {
-			writeErr(w, http.StatusBadRequest, "missing id or path")
+			if s.opts.Auth == nil {
+				writeErr(w, http.StatusNotFound, "node not found")
+				return
+			}
+			root, ok := s.opts.Auth.RootOf(person)
+			if !ok || root == "" {
+				writeErr(w, http.StatusNotFound, "node not found")
+				return
+			}
+			sc = &Scope{PersonID: person, Root: root}
+		}
+		b = s.backend(sc.Root)
+	default:
+		// Bearer 通道：与 list/content/detail 完全一致的 scope 隔离。
+		resolved, resolvedBackend, ok := s.resolve(w, r)
+		if !ok {
 			return
 		}
-		defer rc.Close()
-
-		ext := strings.ToLower(path.Ext(fileName))
-		switch ext {
-		case ".jpg", ".jpeg":
-			w.Header().Set("Content-Type", "image/jpeg")
-		case ".png":
-			w.Header().Set("Content-Type", "image/png")
-		case ".gif":
-			w.Header().Set("Content-Type", "image/gif")
-		case ".webp":
-			w.Header().Set("Content-Type", "image/webp")
-		case ".pdf":
-			w.Header().Set("Content-Type", "application/pdf")
-		case ".md", ".txt":
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		case ".json":
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		}
-
-		encoded := url.PathEscape(fileName)
-		w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+encoded)
-		n, err := io.Copy(w, rc)
-		if err != nil {
-			log.Printf("[server] ⚠️ GET /v1/file/download 传输中断: %q: %v", fileName, err)
-			return
-		}
-		log.Printf("[server] ✅ GET /v1/file/download 下载完成: %q (已传输 %.1f KB)", fileName, float64(n)/1024)
+		sc, b = resolved, resolvedBackend
 	}
+	if b == nil {
+		writeErr(w, http.StatusInternalServerError, "backend unavailable")
+		return
+	}
+
+	var rc io.ReadCloser
+	var fileName string
+	var err error
+
+	if id != "" {
+		node, err := b.Get(id)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if node.Type != "file" {
+			writeErr(w, http.StatusBadRequest, "node is not a file")
+			return
+		}
+		fileName = node.Name
+		log.Printf("[server] ⬇️ GET /v1/file/download person=%s 开始下载: %q (%s, 来自 %s)", sc.name(), node.Name, id, r.RemoteAddr)
+		rc, err = b.Open(node)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "open file: "+err.Error())
+			return
+		}
+	} else if rawPath != "" {
+		// 按路径下载会绕过 id 隔离，只允许管理员 scope；签名链接不支持 path。
+		if !sc.Admin {
+			writeErr(w, http.StatusForbidden, "path download requires admin scope")
+			return
+		}
+		fileName = path.Base(rawPath)
+		log.Printf("[server] ⬇️ GET /v1/file/download person=%s 按路径下载: %q (来自 %s)", sc.name(), rawPath, r.RemoteAddr)
+		rc, err = b.OpenPath(rawPath)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "open path: "+err.Error())
+			return
+		}
+	} else {
+		writeErr(w, http.StatusBadRequest, "missing id or path")
+		return
+	}
+	defer rc.Close()
+
+	ext := strings.ToLower(path.Ext(fileName))
+	switch ext {
+	case ".jpg", ".jpeg":
+		w.Header().Set("Content-Type", "image/jpeg")
+	case ".png":
+		w.Header().Set("Content-Type", "image/png")
+	case ".gif":
+		w.Header().Set("Content-Type", "image/gif")
+	case ".webp":
+		w.Header().Set("Content-Type", "image/webp")
+	case ".pdf":
+		w.Header().Set("Content-Type", "application/pdf")
+	case ".md", ".txt":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	case ".json":
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	}
+
+	encoded := url.PathEscape(fileName)
+	w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+encoded)
+	n, err := io.Copy(w, rc)
+	if err != nil {
+		log.Printf("[server] ⚠️ GET /v1/file/download 传输中断: %q: %v", fileName, err)
+		return
+	}
+	log.Printf("[server] ✅ GET /v1/file/download 下载完成: %q (已传输 %.1f KB)", fileName, float64(n)/1024)
+}
 
 func writeOK(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -318,14 +537,16 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(resp{Success: false, Message: msg, Data: nil})
 }
 
+// handleIndex 目录浏览页：纯静态壳，不含任何 token（使用者自行在输入框里填）。
+// 页面本身不鉴权，所有数据接口仍需 Bearer。
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	html := strings.ReplaceAll(indexHTMLTemplate, "DEFAULT_TOKEN", s.opts.Token)
-	w.Write([]byte(html))
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(indexHTMLTemplate))
 }
 
 const indexHTMLTemplate = `<!DOCTYPE html>
@@ -396,7 +617,7 @@ const indexHTMLTemplate = `<!DOCTYPE html>
       <div class="breadcrumb" id="breadcrumb"></div>
       <div class="token-bar">
         <span>Token:</span>
-        <input type="text" id="tokenInput" value="DEFAULT_TOKEN">
+        <input type="text" id="tokenInput" value="" placeholder="粘贴你的 API token" autocomplete="off">
         <button style="padding: 4px 8px; border: 1px solid var(--border); background: white; border-radius: 4px; cursor: pointer;" onclick="loadCurrent()">刷新</button>
       </div>
     </div>
@@ -417,7 +638,8 @@ let token = document.getElementById('tokenInput').value;
 let historyStack = [{ id: '', name: '根目录' }];
 
 document.getElementById('tokenInput').addEventListener('change', (e) => {
-  token = e.target.value;
+  token = e.target.value.trim();
+  historyStack = [{ id: '', name: '根目录' }];
   loadCurrent();
 });
 
@@ -448,6 +670,10 @@ async function loadCurrent() {
   renderBreadcrumb();
   const current = historyStack[historyStack.length - 1];
   const container = document.getElementById('listContainer');
+  if (!token) {
+    container.innerHTML = '<div class="empty">请先在上方输入你的 API token，然后点「刷新」。</div>';
+    return;
+  }
   container.innerHTML = '<div class="loading">正在加载 NAS 目录...</div>';
 
   try {
@@ -531,6 +757,7 @@ async function handleItemClick(id, name, type) {
       const fileRes = await fetch(previewUrl);
       const text = await fileRes.text();
       content.innerHTML = renderMarkdown(text, data.data.dirPath);
+      loadInlineImages(content);
     } else if (lower.endsWith('.txt') || lower.endsWith('.json')) {
       const fileRes = await fetch(previewUrl);
       const text = await fileRes.text();
@@ -563,11 +790,10 @@ function renderMarkdown(md, dirPath) {
       continue;
     }
     let escaped = escapeHtml(line);
-    // 渲染相对路径图片 ![图片](images/...)
+    // 渲染相对路径图片 ![图片](images/...)：图片字节流需要带 Bearer 拉取，再转 blob 显示（链接里不放 token）。
     escaped = escaped.replace(/!\[图片\]\((images\/[^)]+)\)/g, function(_, imgRel) {
       const fullImgPath = (dirPath ? dirPath + '/' : '') + imgRel;
-      const imgSrc = '/v1/file/download?path=' + encodeURIComponent(fullImgPath) + '&token=' + encodeURIComponent(token);
-      return '<div style="margin:8px 0;"><a href="' + imgSrc + '" target="_blank" title="点击查看大图"><img src="' + imgSrc + '" alt="图片" style="max-width:380px;max-height:300px;border-radius:6px;border:1px solid #cbd5e1;box-shadow:0 1px 3px rgba(0,0,0,0.08);cursor:zoom-in;display:block;" loading="lazy" onerror="this.onerror=null;this.parentNode.innerHTML=\'<span style=\\\'color:#ef4444;font-size:12px;\\\'>[图片已过期或未找到]</span>\';" /></a></div>';
+      return '<div style="margin:8px 0;"><img data-path="' + encodeURIComponent(fullImgPath) + '" alt="图片" style="max-width:380px;max-height:300px;border-radius:6px;border:1px solid #cbd5e1;box-shadow:0 1px 3px rgba(0,0,0,0.08);display:block;" loading="lazy" /></div>';
     });
     // 渲染超链接 [链接：...](...)（严格限制为 http/https 协议，防止 javascript: XSS）
     escaped = escaped.replace(/\[链接：([^\]]+)\]\(([^)]*)\)/g, function(_, title, url) {
@@ -589,6 +815,29 @@ function renderMarkdown(md, dirPath) {
 
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// 预览里的内嵌图片：用 Bearer 取字节流后转 blob 渲染，避免把 token 写进任何 URL。
+function loadInlineImages(rootEl) {
+  rootEl.querySelectorAll('img[data-path]').forEach(async (img) => {
+    const relPath = img.getAttribute('data-path');
+    try {
+      const res = await fetch('/v1/file/download?path=' + relPath, {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      img.src = URL.createObjectURL(blob);
+      img.style.cursor = 'zoom-in';
+      img.onclick = () => window.open(img.src, '_blank');
+    } catch (e) {
+      const tip = document.createElement('span');
+      tip.style.color = '#ef4444';
+      tip.style.fontSize = '12px';
+      tip.innerText = '[图片已过期或未找到]';
+      img.replaceWith(tip);
+    }
+  });
 }
 
 loadCurrent();
