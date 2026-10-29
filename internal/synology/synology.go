@@ -45,6 +45,31 @@ func New(baseURL, username, password string) *Client {
 	}
 }
 
+// redactErr 把网络错误里 URL 的敏感参数（passwd、_sid、account）替换为 ***，避免密码和会话 ID 进日志。
+// 不是 *url.Error 的错误原样返回；是的话返回一个新的 *url.Error，不修改原对象，
+// 保留 Err 字段，所以 errors.Is(err, io.EOF) 之类的底层判断依然成立。
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	redacted := "<redacted>"
+	if u, perr := url.Parse(ue.URL); perr == nil {
+		q := u.Query()
+		for _, k := range []string{"passwd", "_sid", "account"} {
+			if q.Has(k) {
+				q.Set(k, "***")
+			}
+		}
+		u.RawQuery = q.Encode()
+		redacted = u.String()
+	}
+	return &url.Error{Op: ue.Op, URL: redacted, Err: ue.Err}
+}
+
 // loginAttempts 登录尝试次数。群晖有「自动封锁」机制：短时间内多次失败会把来源 IP
 // 拉黑一段时间，表现为 TCP 能连上、TLS 刚起手就被对端断开（EOF）。这类故障是
 // 间歇性的，单次失败不代表配置有问题，重试通常能恢复。
@@ -86,7 +111,7 @@ func (c *Client) loginOnce() (bool, error) {
 	resp, err := c.HTTP.Get(u)
 	if err != nil {
 		// 网络层：EOF / 超时 / 连接重置 —— 多为间歇性，值得重试
-		return true, fmt.Errorf("nas 登录请求失败: %w", err)
+		return true, fmt.Errorf("nas 登录请求失败: %w", redactErr(err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -145,7 +170,7 @@ func (c *Client) apiCall(api, method string, params url.Values) (json.RawMessage
 
 		resp, err := c.HTTP.Get(u)
 		if err != nil {
-			lastErr = err // 网络层，重试
+			lastErr = redactErr(err) // 网络层，重试
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
@@ -254,7 +279,7 @@ func (c *Client) Download(filePath string) (io.ReadCloser, error) {
 
 	resp, err := c.HTTP.Get(u)
 	if err != nil {
-		return nil, err
+		return nil, redactErr(err)
 	}
 	// 下载失败时 NAS 返回 JSON 或 HTML 错误页，而不是文件流。
 	// 不能把它交给上层当作“旧 Markdown”继续拼接，否则下一次上传会把错误页永久写进 .md。
@@ -418,13 +443,13 @@ func (c *Client) uploadOnce(filename, destDir string, data []byte) error {
 	u := fmt.Sprintf("%s/webapi/entry.cgi?_sid=%s", c.BaseURL, url.QueryEscape(c.sid))
 	req, err := http.NewRequest("POST", u, &buf)
 	if err != nil {
-		return err
+		return fmt.Errorf("构造上传请求失败: %w", redactErr(err))
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)

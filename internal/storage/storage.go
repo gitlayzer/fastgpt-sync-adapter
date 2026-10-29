@@ -114,6 +114,14 @@ CREATE TABLE IF NOT EXISTS message_log (
   created_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (msgid, person)
 );
+CREATE TABLE IF NOT EXISTS dead_letter (
+  source     TEXT NOT NULL,
+  record_id  TEXT NOT NULL,
+  record     TEXT NOT NULL,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (source, record_id)
+);
 CREATE TABLE IF NOT EXISTS room_members (
   room_id    TEXT NOT NULL,
   user_id    TEXT NOT NULL,
@@ -434,6 +442,24 @@ INSERT INTO message_log (msgid, person, msg_time, created_at) VALUES (?, ?, ?, ?
 ON CONFLICT(msgid, person) DO NOTHING`,
 		msgid, person, msgTime, time.Now().Unix())
 	return err
+}
+
+// ===== 死信 =====
+
+// AddDeadLetter 记录多次重试仍写不进去的记录（已存在则更新 record/last_error）。
+func (s *Store) AddDeadLetter(source, recordID string, record []byte, lastErr string) error {
+	_, err := s.db.Exec(`
+INSERT INTO dead_letter (source, record_id, record, last_error, created_at) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(source, record_id) DO UPDATE SET record=excluded.record, last_error=excluded.last_error`,
+		source, recordID, string(record), lastErr, time.Now().Unix())
+	return err
+}
+
+// CountDeadLetters 死信条数（测试与排查用）。
+func (s *Store) CountDeadLetters(source string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(1) FROM dead_letter WHERE source=?`, source).Scan(&n)
+	return n, err
 }
 
 // ===== 群成员学习（企微群聊消息 tolist 为空，群成员无 API 可查，靠发言记录逐步积累）=====
