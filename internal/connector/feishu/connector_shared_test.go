@@ -3,6 +3,7 @@ package feishu
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ type sharedAPI struct {
 	searchErr error           // 搜索直接报错（非名单问题）
 	searchBy  map[string]int  // userToken → 搜索次数
 	searchCap int             // 单次搜索最多返回条数（模拟 200 上限）
+	visible   map[string]map[string]bool // userToken → 能看到的文档（模拟关键词搜索的权限范围；为空时都能看到）
 	searches  int
 }
 
@@ -30,7 +32,7 @@ func newSharedAPI() *sharedAPI {
 		failed: map[string]int{}, invalid: map[string]int{}, created: map[string]int64{}, searchBy: map[string]int{}, searchCap: 200}
 }
 
-func (m *sharedAPI) SearchDocWiki(tok string, ids []string, start, end int64, pageToken string) ([]feishuapi.DocWikiResult, string, error) {
+func (m *sharedAPI) SearchDocWiki(tok, query string, ids []string, start, end int64, pageToken string) ([]feishuapi.DocWikiResult, string, error) {
 	m.searches++
 	m.searchBy[tok]++
 	if m.searchErr != nil {
@@ -45,7 +47,12 @@ func (m *sharedAPI) SearchDocWiki(tok string, ids []string, start, end int64, pa
 	}
 	var hit []feishuapi.DocWikiResult
 	for _, d := range m.docs {
-		if ct := m.created[d.Token]; want[d.OwnerID] && (start == 0 && end == 0 || ct >= start && ct <= end) {
+		// 按创建人搜：只看名单里的人；按关键词搜（不限创建人）：标题含关键词、且本人能看到（visible 为空时都能看到）
+		match := want[d.OwnerID]
+		if len(ids) == 0 {
+			match = strings.Contains(d.Title, query) && (m.visible == nil || m.visible[tok][d.Token])
+		}
+		if ct := m.created[d.Token]; match && (start == 0 && end == 0 || ct >= start && ct <= end) {
 			hit = append(hit, d)
 		}
 	}
@@ -261,6 +268,86 @@ func TestSharedDiscoverRetryAndPerViewer(t *testing.T) {
 	if api.searchBy["ut_c"] == 0 || api.searchBy["ut0"] != before {
 		t.Fatalf("应只搜新授权的 C：C %d 次，A %d → %d", api.searchBy["ut_c"], before, api.searchBy["ut0"])
 	}
+}
+
+// 智能纪要：参会人搜到组织者的“智能纪要：”文档就记下并导出；其他单篇文档仍然不要。
+// 之后纪要被修改会重新导出，参会人看不到了（970003）就删掉他那份。
+func TestSharedSmartNoteFoundBySearch(t *testing.T) {
+	st, api := sharedSetup(t)
+	api.docs = append(api.docs, feishuapi.DocWikiResult{Token: "sn1", DocType: "DOCX", OwnerID: "ou_b", Title: "智能纪要：周会 2026年5月15日"})
+	api.metas["sn1"] = feishuapi.DocMeta{DocToken: "sn1", Title: "智能纪要：周会 2026年5月15日", OwnerID: "ou_b", LatestModifyTime: "100"}
+	c := newUserConn(t, st, api, Config{})
+
+	round(t, c)
+	if got := copyPersons(t, st, "sn1"); fmt.Sprint(got) != "[ou_a ou_b]" {
+		t.Fatalf("智能纪要应给参会人 A 和所有者 B 各存一份，实际 %v", got)
+	}
+	if got := copyPersons(t, st, "d1"); len(got) != 0 {
+		t.Fatalf("普通单篇文档不应存，实际 %v", got)
+	}
+	if fmt.Sprint(rootTypes(st, "ou_a")) != "map[fld:folder sn1:docx]" {
+		t.Fatalf("共享表应记文件夹和智能纪要，实际 %v", rootTypes(st, "ou_a"))
+	}
+
+	api.metas["sn1"] = feishuapi.DocMeta{DocToken: "sn1", Title: "智能纪要：周会 2026年5月15日", OwnerID: "ou_b", LatestModifyTime: "300"}
+	if recs := round(t, c); fmt.Sprint(kinds(recs)) != "[docx:sn1]" {
+		t.Fatalf("纪要修改后应重新导出，实际 %v", kinds(recs))
+	}
+
+	api.failed["sn1"] = codeMetaNoPerm
+	recs := round(t, c)
+	if fmt.Sprint(kinds(recs)) != "[delete:del_sn1_ou_a delete:del_sn1_ou_b]" {
+		t.Fatalf("看不到后应删除副本，实际 %v", kinds(recs))
+	}
+}
+
+// 智能纪要按关键词搜、不限创建人：组织者不在员工名单里、或纪要是本人自己的（不在本人云盘目录里也行）都能记下；
+// 标题只是含“智能纪要”、不以“智能纪要：”开头的不要。
+func TestSharedSmartNoteNotLimitedToRoster(t *testing.T) {
+	st, api := sharedSetup(t)
+	api.docs = append(api.docs,
+		feishuapi.DocWikiResult{Token: "sn_out", DocType: "DOCX", OwnerID: "ou_outsider", Title: "智能纪要：外部组织者的会 2026年5月15日"},
+		feishuapi.DocWikiResult{Token: "sn_own", DocType: "DOCX", OwnerID: "ou_a", Title: "智能纪要:A 自己的会"},
+		feishuapi.DocWikiResult{Token: "guide", DocType: "DOCX", OwnerID: "ou_b", Title: "智能纪要使用说明"},
+	)
+	api.metas["sn_out"] = feishuapi.DocMeta{DocToken: "sn_out", Title: "智能纪要：外部组织者的会 2026年5月15日", OwnerID: "ou_outsider", LatestModifyTime: "100"}
+	api.metas["sn_own"] = feishuapi.DocMeta{DocToken: "sn_own", Title: "智能纪要:A 自己的会", OwnerID: "ou_a", LatestModifyTime: "100"}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if got := rootTypes(st, "ou_a"); fmt.Sprint(got) != "map[fld:folder sn_out:docx sn_own:docx]" {
+		t.Fatalf("应记下名单外组织者的纪要和本人的纪要，不记使用说明，实际 %v", got)
+	}
+	if got := copyPersons(t, st, "sn_own"); fmt.Sprint(got) != "[ou_a]" {
+		t.Fatalf("本人的纪要应存进本人目录，实际 %v", got)
+	}
+}
+
+// 员工名单里只有本人（或名单为空）：文件夹那步跳过，智能纪要照样按关键词搜，本人的纪要能记下；
+// 这一轮算没搜完，下一轮还会再搜（名单读失败时不用等一个周期）。
+func TestSharedSmartNoteWithoutRoster(t *testing.T) {
+	st, api := sharedSetup(t)
+	st.UpsertIdentity(&storage.Identity{WeComUserID: "wb", FeishuUserID: "", PersonName: "B"}) // 名单里只剩 A
+	api.docs = append(api.docs, feishuapi.DocWikiResult{Token: "sn_own", DocType: "DOCX", OwnerID: "ou_a", Title: "智能纪要：A 自己的会"})
+	api.metas["sn_own"] = feishuapi.DocMeta{DocToken: "sn_own", Title: "智能纪要：A 自己的会", OwnerID: "ou_a", LatestModifyTime: "100"}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if got := rootTypes(st, "ou_a"); fmt.Sprint(got) != "map[sn_own:docx]" {
+		t.Fatalf("名单只有本人时也应记下本人的纪要，实际 %v", got)
+	}
+	before := api.searchBy["ut0"]
+	round(t, c)
+	if api.searchBy["ut0"] == before {
+		t.Fatalf("名单为空时这一轮不算搜完，下一轮应再搜")
+	}
+}
+
+func rootTypes(st *storage.Store, viewer string) map[string]string {
+	types := map[string]string{}
+	roots, _ := st.ListSharedRoots(viewer)
+	for _, r := range roots {
+		types[r.Token] = r.DocType
+	}
+	return types
 }
 
 // 结果达到 200 上限：按创建时间拆开重搜，拿全。

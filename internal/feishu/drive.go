@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -261,18 +262,23 @@ type DocWikiResult struct {
 	Token   string `json:"token"`
 	DocType string `json:"doc_types"` // FOLDER/DOCX/DOC/SHEET/BITABLE/FILE/SLIDES/MINDNOTE 等（大写）
 	OwnerID string `json:"owner_id"`
+	Title   string `json:"-"` // 取自结果的 title_highlighted，已去掉 <h></h> 高亮标签
 }
 
-// SearchDocWiki 按创建人搜索调用者能看到的云文档，返回一页（page_size 20）。
+// SearchDocWiki 搜索调用者能看到的云文档（只返回有授权关系的文档，"组织内获得链接可阅读"但未授权的不返回，实测），返回一页（page_size 20）。
+// query 为空时必须给 creatorIDs（空关键词不加过滤实测返回空）；creatorIDs 为空时不按创建人过滤。
 // creatorIDs 最多 20 个，名单里有一个 open_id 不存在（99992351）或属于别的应用（99992361）整次报错。
 // createStart/createEnd 都为 0 时不限创建时间；单位是秒（官方 SDK search/v2 DocFilter.CreateTime：“秒级时间戳”）。
 // 注意：单次搜索最多返回约 200 条，超出部分不报错、has_more=false，调用方需按创建时间拆分。
-func (c *Client) SearchDocWiki(userToken string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]DocWikiResult, string, error) {
-	filter := map[string]any{"creator_ids": creatorIDs}
+func (c *Client) SearchDocWiki(userToken, query string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]DocWikiResult, string, error) {
+	filter := map[string]any{}
+	if len(creatorIDs) > 0 {
+		filter["creator_ids"] = creatorIDs
+	}
 	if createStart > 0 || createEnd > 0 {
 		filter["create_time"] = map[string]int64{"start": createStart, "end": createEnd}
 	}
-	body := map[string]any{"query": "", "doc_filter": filter, "page_size": 20}
+	body := map[string]any{"query": query, "doc_filter": filter, "page_size": 20}
 	if pageToken != "" {
 		body["page_token"] = pageToken
 	}
@@ -282,7 +288,8 @@ func (c *Client) SearchDocWiki(userToken string, creatorIDs []string, createStar
 			HasMore   bool   `json:"has_more"`
 			PageToken string `json:"page_token"`
 			ResUnits  []struct {
-				ResultMeta DocWikiResult `json:"result_meta"`
+				TitleHighlighted string        `json:"title_highlighted"`
+				ResultMeta       DocWikiResult `json:"result_meta"`
 			} `json:"res_units"`
 		} `json:"data"`
 	}
@@ -291,7 +298,9 @@ func (c *Client) SearchDocWiki(userToken string, creatorIDs []string, createStar
 	}
 	items := make([]DocWikiResult, 0, len(out.Data.ResUnits))
 	for _, u := range out.Data.ResUnits {
-		items = append(items, u.ResultMeta)
+		r := u.ResultMeta
+		r.Title = strings.NewReplacer("<h>", "", "</h>", "").Replace(u.TitleHighlighted)
+		items = append(items, r)
 	}
 	next := ""
 	if out.Data.HasMore {
@@ -300,9 +309,12 @@ func (c *Client) SearchDocWiki(userToken string, creatorIDs []string, createStar
 	return items, next, nil
 }
 
-// DocMeta 文档元数据（drive/v1/metas/batch_query），这里只用来确认调用者还能看到。
+// DocMeta 文档元数据（drive/v1/metas/batch_query）：确认调用者还能看到；单篇文档还要用标题、所有者、修改时间。
 type DocMeta struct {
-	DocToken string `json:"doc_token"`
+	DocToken         string `json:"doc_token"`
+	Title            string `json:"title"`
+	OwnerID          string `json:"owner_id"`
+	LatestModifyTime string `json:"latest_modify_time"` // 秒级时间戳字符串
 }
 
 // DocMetaFailed 查询失败的文档（实测：970003 无权限，970005 已删除）。

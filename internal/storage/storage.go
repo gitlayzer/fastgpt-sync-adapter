@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS feishu_doc_members (
 CREATE TABLE IF NOT EXISTS feishu_shared_root (
   viewer_id  TEXT NOT NULL,
   token      TEXT NOT NULL,
+  doc_type   TEXT NOT NULL DEFAULT 'folder',
   PRIMARY KEY (viewer_id, token)
 );`)
 	if err != nil {
@@ -159,6 +160,12 @@ CREATE TABLE IF NOT EXISTS feishu_shared_root (
 	if !s.hasColumn("feishu_doc_copy", "kind") {
 		if _, err := s.db.Exec(`ALTER TABLE feishu_doc_copy ADD COLUMN kind TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("补充 feishu_doc_copy.kind 列: %w", err)
+		}
+	}
+	// 兼容已有表升级：旧版共享表只记文件夹，没有 doc_type 列，补上并把已有记录视为文件夹
+	if !s.hasColumn("feishu_shared_root", "doc_type") {
+		if _, err := s.db.Exec(`ALTER TABLE feishu_shared_root ADD COLUMN doc_type TEXT NOT NULL DEFAULT 'folder'`); err != nil {
+			return fmt.Errorf("补充 feishu_shared_root.doc_type 列: %w", err)
 		}
 	}
 	// 从旧版升级：副本表为空时，用 feishu_doc_state 给所有者回填一份副本记录（只做一次），
@@ -586,17 +593,18 @@ ON CONFLICT(token) DO UPDATE SET checked_at=excluded.checked_at, members=exclude
 	return err
 }
 
-// ===== 别人共享给员工的文件夹（搜索发现，每轮用员工身份列出）=====
+// ===== 别人共享给员工的文件夹和智能纪要（搜索发现，每轮用员工身份查）=====
 
-// SharedRoot 员工能看到、但不在他云盘树下的一个共享文件夹。
+// SharedRoot 员工能看到、但不在他云盘树下的一个共享文件夹或一篇智能纪要。
 type SharedRoot struct {
 	ViewerID string
 	Token    string
+	DocType  string // folder / docx
 }
 
-// ListSharedRoots 列出某员工已发现的共享文件夹。
+// ListSharedRoots 列出某员工已发现的共享文件夹和智能纪要。
 func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
-	rows, err := s.db.Query(`SELECT viewer_id, token FROM feishu_shared_root WHERE viewer_id=?`, viewerID)
+	rows, err := s.db.Query(`SELECT viewer_id, token, doc_type FROM feishu_shared_root WHERE viewer_id=?`, viewerID)
 	if err != nil {
 		return nil, err
 	}
@@ -604,7 +612,7 @@ func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
 	var out []SharedRoot
 	for rows.Next() {
 		var r SharedRoot
-		if err := rows.Scan(&r.ViewerID, &r.Token); err != nil {
+		if err := rows.Scan(&r.ViewerID, &r.Token, &r.DocType); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -614,7 +622,7 @@ func (s *Store) ListSharedRoots(viewerID string) ([]SharedRoot, error) {
 
 // UpsertSharedRoot 记录一次发现（已记录过的不重复写）。
 func (s *Store) UpsertSharedRoot(r SharedRoot) error {
-	_, err := s.db.Exec(`INSERT OR IGNORE INTO feishu_shared_root (viewer_id, token) VALUES (?, ?)`, r.ViewerID, r.Token)
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO feishu_shared_root (viewer_id, token, doc_type) VALUES (?, ?, ?)`, r.ViewerID, r.Token, r.DocType)
 	return err
 }
 

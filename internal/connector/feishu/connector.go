@@ -62,7 +62,7 @@ type API interface {
 	ListPermissionMembers(userToken, token, docType string) ([]feishuapi.PermissionMember, error)
 
 	// 按创建人搜索调用者能看到的云文档（一页），以及批量查文档元数据（发现别人共享给员工的文件夹）
-	SearchDocWiki(userToken string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]feishuapi.DocWikiResult, string, error)
+	SearchDocWiki(userToken, query string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]feishuapi.DocWikiResult, string, error)
 	BatchQueryMetas(userToken string, docs [][2]string) ([]feishuapi.DocMeta, []feishuapi.DocMetaFailed, error)
 
 	// 妙记/智能纪要接口
@@ -619,6 +619,15 @@ const (
 	codeMetaDeleted       = 970005                 // 批量查文档元数据：已删除
 )
 
+// smartNoteQuery 搜智能纪要用的关键词：飞书生成的纪要标题都以“智能纪要：”开头。
+const smartNoteQuery = "智能纪要"
+
+// isSmartNote 搜索结果里要记下的单篇文档：飞书生成的智能纪要（标题以“智能纪要：”开头的新版文档）。
+// 参会人靠“日程参与者”等整体条目获得权限、不在协作者名单里，只能靠搜索找到。
+func isSmartNote(it feishuapi.DocWikiResult) bool {
+	return it.DocType == "DOCX" && (strings.HasPrefix(it.Title, "智能纪要：") || strings.HasPrefix(it.Title, "智能纪要:"))
+}
+
 // searchMinInterval 云文档搜索限速（接口限 100 次/分钟）；测试里置 0。
 var searchMinInterval = 650 * time.Millisecond
 
@@ -644,8 +653,10 @@ func (c *Connector) rosterCreators() []string {
 	return ids
 }
 
-// discoverShared 用员工自己的身份，按“创建人 = 名单里的其他员工”搜索他能看到的文件夹，记进共享表。
-// 搜索结果里的单篇文档不要：只解决“共享文件夹找不到”。
+// discoverShared 用员工自己的身份搜索他能看到的、记进共享表：
+//   - 文件夹：按“创建人 = 名单里的其他员工”搜；
+//   - 智能纪要：按关键词搜、不限创建人（组织者不在名单里、或纪要是本人自己的也能找到），只要标题以“智能纪要：”开头的。
+// 其他单篇文档不要。名单为空或读失败时文件夹那步跳过、算没搜完（下一轮再看）；任何一步搜索或写表失败也算没搜完，下一轮重搜。
 // 只增不删：搜不到不代表看不到（结果可能被截断），看不到了由 scanSharedRoots 判断。
 // 全部批次都搜完才返回 true；某批失败就停下（不再继续消耗搜索次数），下一轮整体重搜。
 func (c *Connector) discoverShared(userToken, viewer string, creators []string) bool {
@@ -655,12 +666,10 @@ func (c *Connector) discoverShared(userToken, viewer string, creators []string) 
 			others = append(others, id)
 		}
 	}
-	if len(others) == 0 {
-		return false // 名单为空或读失败：下一轮再看
-	}
+	complete := true
 	n := 0
 	for i := 0; i < len(others); i += searchBatch {
-		items, err := c.searchCreators(userToken, others[i:min(i+searchBatch, len(others))], 0, 0)
+		items, err := c.searchCreators(userToken, "", others[i:min(i+searchBatch, len(others))], 0, 0)
 		if err != nil {
 			log.Printf("[feishu] %s 搜索共享文件夹失败（沿用已发现的，下一轮重搜）: %v", viewer, err)
 			return false
@@ -669,28 +678,46 @@ func (c *Connector) discoverShared(userToken, viewer string, creators []string) 
 			if it.Token == "" || it.DocType != "FOLDER" {
 				continue
 			}
-			if err := c.store.UpsertSharedRoot(storage.SharedRoot{ViewerID: viewer, Token: it.Token}); err != nil {
+			if err := c.store.UpsertSharedRoot(storage.SharedRoot{ViewerID: viewer, Token: it.Token, DocType: "folder"}); err != nil {
 				log.Printf("[feishu] 记录 %s 的共享 %s 失败: %v", viewer, it.Token, err)
+				complete = false
 				continue
 			}
 			n++
 		}
 	}
-	log.Printf("[feishu] %s 搜索共享文件夹：%d 个", viewer, n)
-	return true
+	notes, err := c.searchCreators(userToken, smartNoteQuery, nil, 0, 0)
+	if err != nil {
+		log.Printf("[feishu] %s 搜索智能纪要失败（沿用已发现的，下一轮重搜）: %v", viewer, err)
+		return false
+	}
+	m := 0
+	for _, it := range notes {
+		if it.Token == "" || !isSmartNote(it) {
+			continue
+		}
+		if err := c.store.UpsertSharedRoot(storage.SharedRoot{ViewerID: viewer, Token: it.Token, DocType: "docx"}); err != nil {
+			log.Printf("[feishu] 记录 %s 的智能纪要 %s 失败: %v", viewer, it.Token, err)
+			complete = false
+			continue
+		}
+		m++
+	}
+	log.Printf("[feishu] %s 搜索共享文件夹：%d 个，智能纪要：%d 篇", viewer, n, m)
+	return complete && len(others) > 0 // 名单为空或读失败：下一轮再看
 }
 
-// searchCreators 翻完所有页。名单里有不可用的 open_id（不存在/别的应用）时对半拆开重搜，找出它并跳过；
-// 结果达到上限时按创建时间对半拆开重搜。
-func (c *Connector) searchCreators(userToken string, ids []string, start, end int64) ([]feishuapi.DocWikiResult, error) {
+// searchCreators 翻完所有页（query 为空时按创建人搜，ids 为空时不限创建人）。名单里有不可用的 open_id（不存在/别的应用）时
+// 对半拆开重搜，找出它并跳过；结果达到上限时按创建时间对半拆开重搜。
+func (c *Connector) searchCreators(userToken, query string, ids []string, start, end int64) ([]feishuapi.DocWikiResult, error) {
 	var all []feishuapi.DocWikiResult
 	pageToken := ""
 	for {
 		c.searchThrottle()
-		items, next, err := c.api.SearchDocWiki(userToken, ids, start, end, pageToken)
+		items, next, err := c.api.SearchDocWiki(userToken, query, ids, start, end, pageToken)
 		if err != nil {
 			var apiErr *feishuapi.APIError
-			if !errors.As(err, &apiErr) || !isBadCreatorID(apiErr.Code) {
+			if !errors.As(err, &apiErr) || !isBadCreatorID(apiErr.Code) || len(ids) == 0 {
 				return nil, err
 			}
 			if len(ids) == 1 {
@@ -698,11 +725,11 @@ func (c *Connector) searchCreators(userToken string, ids []string, start, end in
 				return nil, nil
 			}
 			half := len(ids) / 2
-			a, err := c.searchCreators(userToken, ids[:half], start, end)
+			a, err := c.searchCreators(userToken, query, ids[:half], start, end)
 			if err != nil {
 				return nil, err
 			}
-			b, err := c.searchCreators(userToken, ids[half:], start, end)
+			b, err := c.searchCreators(userToken, query, ids[half:], start, end)
 			if err != nil {
 				return nil, err
 			}
@@ -725,18 +752,19 @@ func (c *Connector) searchCreators(userToken string, ids []string, start, end in
 		return all, nil
 	}
 	mid := start + (end-start)/2
-	a, err := c.searchCreators(userToken, ids, start, mid)
+	a, err := c.searchCreators(userToken, query, ids, start, mid)
 	if err != nil {
 		return nil, err
 	}
-	b, err := c.searchCreators(userToken, ids, mid+1, end)
+	b, err := c.searchCreators(userToken, query, ids, mid+1, end)
 	if err != nil {
 		return nil, err
 	}
 	return append(a, b...), nil
 }
 
-// scanSharedRoots 每轮用员工身份查一遍已发现的共享文件夹，列出里面的文档交给 see 汇总（和他云盘里的文档一样处理）。
+// scanSharedRoots 每轮用员工身份查一遍已发现的共享文件夹和智能纪要：文件夹列出里面的文档，智能纪要直接取元数据，
+// 交给 see 汇总（和他云盘里的文档一样处理）。
 // 看不到了（无权限/已删除）就移出共享表，本轮不算他能看到，由删除逻辑删掉他那份；
 // 其他错误返回 false，按扫描失败处理（本轮不删）。
 func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Record, string)) bool {
@@ -749,8 +777,14 @@ func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Rec
 	n := 0
 	for i := 0; i < len(roots); i += 200 { // 批量查元数据一次最多 200 个
 		var docs [][2]string
+		types := map[string]string{}
 		for _, r := range roots[i:min(i+200, len(roots))] {
-			docs = append(docs, [2]string{r.Token, "folder"})
+			t := r.DocType
+			if t == "" {
+				t = "folder" // 旧记录或异常空值：按文件夹查
+			}
+			docs = append(docs, [2]string{r.Token, t})
+			types[r.Token] = t
 		}
 		metas, failed, err := c.api.BatchQueryMetas(userToken, docs)
 		if err != nil {
@@ -770,6 +804,13 @@ func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Rec
 			}
 		}
 		for _, m := range metas {
+			if types[m.DocToken] == "docx" {
+				n++
+				see(docToRecord(feishuapi.DriveFile{
+					Token: m.DocToken, Name: m.Title, Type: "docx", OwnerID: m.OwnerID, ModifiedTime: m.LatestModifyTime,
+				}, viewer), "docx")
+				continue
+			}
 			err := c.api.WalkFolder(userToken, m.DocToken, 10, func(f feishuapi.DriveFile) {
 				n++
 				see(docToRecord(f, viewer), f.Type)
@@ -781,7 +822,7 @@ func (c *Connector) scanSharedRoots(userToken, viewer string, see func(model.Rec
 		}
 	}
 	if len(roots) > 0 {
-		log.Printf("[feishu] %s 共享文件夹：%d 个，含 %d 个条目", viewer, len(roots), n)
+		log.Printf("[feishu] %s 共享文件夹/智能纪要：%d 个，含 %d 个条目", viewer, len(roots), n)
 	}
 	return ok
 }
