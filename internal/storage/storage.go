@@ -37,8 +37,18 @@ type Identity struct {
 	WeComUserID  string
 	FeishuUserID string
 	PersonName   string // NAS 第一层目录名 / FastGPT 知识库名都以此为准
+	Status       string // active | offboarded | removed；空按 active
+	LeaveDate    string // 名单"离职日期"原文，可空
+	OffboardedAt int64  // adapter 完成离职处理（吊销 token、目录改名）的时间；0=未处理
 	UpdatedAt    int64
 }
+
+// 身份状态取值。
+const (
+	IdentityActive     = "active"     // 在职（名单内）
+	IdentityOffboarded = "offboarded" // 离职
+	IdentityRemoved    = "removed"    // 已从名单移出
+)
 
 // FileIndexEntry 文件推送台账：NAS 上一份文件 ↔ FastGPT collection 的映射（幂等推送依据）。
 type FileIndexEntry struct {
@@ -88,6 +98,9 @@ CREATE TABLE IF NOT EXISTS identities (
   wecom_user_id  TEXT PRIMARY KEY,
   feishu_user_id TEXT NOT NULL DEFAULT '',
   person_name    TEXT NOT NULL DEFAULT '',
+  status         TEXT NOT NULL DEFAULT 'active',
+  leave_date     TEXT NOT NULL DEFAULT '',
+  offboarded_at  INTEGER NOT NULL DEFAULT 0,
   updated_at     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_identities_feishu ON identities(feishu_user_id);
@@ -186,9 +199,30 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   last_used_at INTEGER NOT NULL DEFAULT 0,
   revoked_at   INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_api_tokens_person ON api_tokens(person_id);`)
+CREATE INDEX IF NOT EXISTS idx_api_tokens_person ON api_tokens(person_id);
+CREATE TABLE IF NOT EXISTS external_contacts (
+  external_userid TEXT PRIMARY KEY,
+  name       TEXT NOT NULL DEFAULT '',
+  corp_name  TEXT NOT NULL DEFAULT '',
+  label      TEXT NOT NULL DEFAULT '',   -- 文件名用的固定标签，首次查到时写入，之后不变
+  status     TEXT NOT NULL DEFAULT '',   -- ok | notfound
+  fetched_at INTEGER NOT NULL DEFAULT 0  -- unix 秒
+);`)
 	if err != nil {
 		return fmt.Errorf("建表迁移: %w", err)
+	}
+	// 兼容已有表升级：旧版 identities 没有名单状态相关列（在职/离职/移出），补上
+	for _, col := range []struct{ name, ddl string }{
+		{"status", `ALTER TABLE identities ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`},
+		{"leave_date", `ALTER TABLE identities ADD COLUMN leave_date TEXT NOT NULL DEFAULT ''`},
+		{"offboarded_at", `ALTER TABLE identities ADD COLUMN offboarded_at INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if s.hasColumn("identities", col.name) {
+			continue
+		}
+		if _, err := s.db.Exec(col.ddl); err != nil {
+			return fmt.Errorf("补充 identities.%s 列: %w", col.name, err)
+		}
 	}
 	// 兼容已有表升级：若旧版本已创建 feishu_doc_copy 但缺少 kind 列，补充该字段
 	if !s.hasColumn("feishu_doc_copy", "kind") {
@@ -288,57 +322,187 @@ FROM oauth_grants WHERE platform=?`, platform)
 
 // ===== 身份映射 =====
 
+// identityColumns identities 表的读取列（顺序与 scanIdentity 的 Scan 参数一致）。
+const identityColumns = `wecom_user_id, feishu_user_id, person_name, status, leave_date, offboarded_at, updated_at`
+
+// normalizeIdentityStatus 空状态按在职处理。
+func normalizeIdentityStatus(s string) string {
+	if s = strings.TrimSpace(s); s == "" {
+		return IdentityActive
+	}
+	return s
+}
+
 func (s *Store) UpsertIdentity(id *Identity) error {
 	id.UpdatedAt = time.Now().Unix()
 	_, err := s.db.Exec(`
-INSERT INTO identities (wecom_user_id, feishu_user_id, person_name, updated_at)
-VALUES (?, ?, ?, ?)
+INSERT INTO identities (wecom_user_id, feishu_user_id, person_name, status, leave_date, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(wecom_user_id) DO UPDATE SET
-  feishu_user_id=excluded.feishu_user_id, person_name=excluded.person_name, updated_at=excluded.updated_at`,
-		id.WeComUserID, id.FeishuUserID, id.PersonName, id.UpdatedAt)
+  feishu_user_id=excluded.feishu_user_id, person_name=excluded.person_name,
+  status=excluded.status, leave_date=excluded.leave_date, updated_at=excluded.updated_at,
+  -- 复职按新员工处理：状态回到 active 时清空离职处理时间；其余情况不覆盖已有值
+  offboarded_at = CASE WHEN excluded.status='active' THEN 0 ELSE identities.offboarded_at END`,
+		id.WeComUserID, id.FeishuUserID, id.PersonName,
+		normalizeIdentityStatus(id.Status), id.LeaveDate, id.UpdatedAt)
 	return err
 }
 
 // ListIdentities 全部身份映射，按企微 userid 排序。
 func (s *Store) ListIdentities() ([]Identity, error) {
 	rows, err := s.db.Query(`
-SELECT wecom_user_id, feishu_user_id, person_name, updated_at FROM identities ORDER BY wecom_user_id`)
+SELECT ` + identityColumns + ` FROM identities ORDER BY wecom_user_id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Identity
 	for rows.Next() {
-		var id Identity
-		if err := rows.Scan(&id.WeComUserID, &id.FeishuUserID, &id.PersonName, &id.UpdatedAt); err != nil {
+		id, err := scanIdentity(rows)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		out = append(out, *id)
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) GetIdentityByWeCom(wecomUserID string) (*Identity, error) {
 	row := s.db.QueryRow(`
-SELECT wecom_user_id, feishu_user_id, person_name, updated_at FROM identities WHERE wecom_user_id=?`, wecomUserID)
+SELECT `+identityColumns+` FROM identities WHERE wecom_user_id=?`, wecomUserID)
 	return scanIdentity(row)
 }
 
 func (s *Store) GetIdentityByFeishu(feishuUserID string) (*Identity, error) {
 	row := s.db.QueryRow(`
-SELECT wecom_user_id, feishu_user_id, person_name, updated_at FROM identities WHERE feishu_user_id=?`, feishuUserID)
+SELECT `+identityColumns+` FROM identities WHERE feishu_user_id=?`, feishuUserID)
 	return scanIdentity(row)
 }
 
-func scanIdentity(row *sql.Row) (*Identity, error) {
+// rowScanner 让 scanIdentity 既能读 *sql.Row 也能读 *sql.Rows。
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanIdentity(row rowScanner) (*Identity, error) {
 	id := &Identity{}
-	if err := row.Scan(&id.WeComUserID, &id.FeishuUserID, &id.PersonName, &id.UpdatedAt); err != nil {
+	if err := row.Scan(&id.WeComUserID, &id.FeishuUserID, &id.PersonName,
+		&id.Status, &id.LeaveDate, &id.OffboardedAt, &id.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	id.Status = normalizeIdentityStatus(id.Status)
 	return id, nil
+}
+
+// MarkIdentitiesRemoved 把 wecom_user_id 不在 keep 里、且 status 不是 removed 的行改成 removed，返回改了几行。
+// keep 为空时视为名单为空，全部未移出的行都会被标记（调用方应自行避免空名单误伤）。
+func (s *Store) MarkIdentitiesRemoved(keep []string) (int, error) {
+	query := `UPDATE identities SET status=? WHERE status!=?`
+	args := []any{IdentityRemoved, IdentityRemoved}
+	if len(keep) > 0 {
+		query += ` AND wecom_user_id NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(keep)), ",") + `)`
+		for _, k := range keep {
+			args = append(args, k)
+		}
+	}
+	res, err := s.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// SetOffboarded 记录离职处理完成时间。
+func (s *Store) SetOffboarded(wecomUserID string, ts int64) error {
+	_, err := s.db.Exec(`UPDATE identities SET offboarded_at=? WHERE wecom_user_id=?`, ts, wecomUserID)
+	return err
+}
+
+// ManagedByWeCom 返回纳管员工；不是纳管员工时返回 (nil, false, nil)。
+// 纳管 = 找到行 && status=active && person_name 去空格后非空 && 没有其他 status=active 的行 person_name 相同。
+func (s *Store) ManagedByWeCom(wecomUserID string) (*Identity, bool, error) {
+	id, err := s.GetIdentityByWeCom(wecomUserID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return s.managed(id)
+}
+
+// ManagedByFeishu 按飞书 open_id 返回纳管员工；openID 为空时直接 false。
+func (s *Store) ManagedByFeishu(openID string) (*Identity, bool, error) {
+	if strings.TrimSpace(openID) == "" {
+		return nil, false, nil
+	}
+	id, err := s.GetIdentityByFeishu(openID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return s.managed(id)
+}
+
+// managed 判定一行身份是否纳管（在职 + 姓名非空 + 同名在职员工唯一）。
+func (s *Store) managed(id *Identity) (*Identity, bool, error) {
+	if id == nil || normalizeIdentityStatus(id.Status) != IdentityActive {
+		return nil, false, nil
+	}
+	name := strings.TrimSpace(id.PersonName)
+	if name == "" {
+		return nil, false, nil
+	}
+	var n int
+	err := s.db.QueryRow(`
+SELECT COUNT(1) FROM identities WHERE wecom_user_id!=? AND status=? AND TRIM(person_name)=?`,
+		id.WeComUserID, IdentityActive, name).Scan(&n)
+	if err != nil {
+		return nil, false, err
+	}
+	if n > 0 {
+		return nil, false, nil
+	}
+	return id, true, nil
+}
+
+// DuplicateActiveNames 返回在职员工里重名的姓名 → 企微 ID 列表（用于告警）。
+func (s *Store) DuplicateActiveNames() (map[string][]string, error) {
+	rows, err := s.db.Query(`
+SELECT TRIM(person_name) AS name, wecom_user_id FROM identities
+WHERE status=? AND TRIM(person_name)!=? ORDER BY name, wecom_user_id`, IdentityActive, "")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	byName := map[string][]string{}
+	for rows.Next() {
+		var name, wecomID string
+		if err := rows.Scan(&name, &wecomID); err != nil {
+			return nil, err
+		}
+		byName[name] = append(byName[name], wecomID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := map[string][]string{}
+	for name, ids := range byName {
+		if len(ids) > 1 {
+			out[name] = ids
+		}
+	}
+	return out, nil
 }
 
 // ===== 文件推送台账 =====
@@ -908,6 +1072,50 @@ func (s *Store) HasActiveAPIToken(personID string) (bool, error) {
 SELECT COUNT(1) FROM api_tokens WHERE person_id=? AND status=? AND (expires_at=0 OR expires_at>?)`,
 		personID, tokenStatusActive, time.Now().Unix()).Scan(&n)
 	return n > 0, err
+}
+
+// ===== 企微外部联系人（客户）名字缓存 =====
+
+// ExternalContact 企微外部联系人（wm/wo 开头的客户）名字缓存。
+// Label 是单聊文件名用的固定标签：首次查到时写定，之后客户改名也不变，避免 NAS 上多出重复文件。
+// Status：ok（查到了）| notfound（接口 84061，对方已删除或不在可见范围）。
+type ExternalContact struct {
+	ExternalUserID string
+	Name           string
+	CorpName       string
+	Label          string
+	Status         string
+	FetchedAt      int64 // unix 秒
+}
+
+// externalContactColumns external_contacts 表的读取列。
+const externalContactColumns = `external_userid, name, corp_name, label, status, fetched_at`
+
+// GetExternalContact 读取某个外部联系人的缓存；没有记录返回 ErrNotFound。
+func (s *Store) GetExternalContact(id string) (ExternalContact, bool, error) {
+	c := ExternalContact{}
+	err := s.db.QueryRow(`SELECT `+externalContactColumns+` FROM external_contacts WHERE external_userid=?`, id).
+		Scan(&c.ExternalUserID, &c.Name, &c.CorpName, &c.Label, &c.Status, &c.FetchedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ExternalContact{}, false, nil
+	}
+	if err != nil {
+		return ExternalContact{}, false, err
+	}
+	return c, true, nil
+}
+
+// SaveExternalContact upsert：name/corp_name/status/fetched_at 每次覆盖；
+// label 只在库里原值为空时写入（首次查到时定下，之后不变）。
+func (s *Store) SaveExternalContact(c ExternalContact) error {
+	_, err := s.db.Exec(`
+INSERT INTO external_contacts (external_userid, name, corp_name, label, status, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(external_userid) DO UPDATE SET
+  name=excluded.name, corp_name=excluded.corp_name, status=excluded.status, fetched_at=excluded.fetched_at,
+  label = CASE WHEN external_contacts.label='' THEN excluded.label ELSE external_contacts.label END`,
+		c.ExternalUserID, c.Name, c.CorpName, c.Label, c.Status, c.FetchedAt)
+	return err
 }
 
 // ListFeishuUserIDs 人名映射表里全部员工的飞书 open_id（去重、去空）。

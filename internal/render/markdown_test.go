@@ -190,3 +190,22 @@ func TestRenderLineSanitizesHTMLInTextAndMarkdown(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderLineCardResolvesUserID(t *testing.T) {
+	card := mustParse(t, `{"msgid":"m1","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"card","card":{"corpname":"某公司","userid":"woTESTabcdefghijklmnopqrstuvw"}}`)
+
+	line, _ := RenderLine(card, func(u string) string {
+		if u == "woTESTabcdefghijklmnopqrstuvw" {
+			return "外部:张三@某公司"
+		}
+		return u
+	})
+	if !strings.Contains(line, "[名片：外部:张三@某公司]") || strings.Contains(line, "woTEST") {
+		t.Fatalf("名片应显示解析后的名字: %q", line)
+	}
+
+	line, _ = RenderLine(card, nil)
+	if !strings.Contains(line, "[名片：某公司 woTESTabcdefghijklmnopqrstuvw]") {
+		t.Fatalf("无解析器时保持原样: %q", line)
+	}
+}

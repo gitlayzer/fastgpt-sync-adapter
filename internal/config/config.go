@@ -149,6 +149,8 @@ type IdentityConfig struct {
 		FieldWeComName  string `yaml:"field_wecom_name"`
 		FieldFeishuUser string `yaml:"field_feishu_user"`
 		FieldOpenID     string `yaml:"field_openid"`
+		FieldStatus     string `yaml:"field_status"`     // 名单状态列（在职/离职）
+		FieldLeaveDate  string `yaml:"field_leave_date"` // 离职日期列
 	} `yaml:"bitable"`
 }
 

@@ -21,6 +21,8 @@ import (
 type Config struct {
 	CorpID string `yaml:"corp_id"` // 企业 corpid
 	Secret string `yaml:"secret"`  // 会话存档 secret
+	// ContactSecret 客户联系自建应用 Secret；空=不查外部联系人名字（客户仍显示为 wm/wo 开头的 ID）
+	ContactSecret string `yaml:"contact_secret"`
 	// RSA 私钥：可直接给 PEM 文本，或给文件路径（二选一）
 	RSAPrivateKey     string `yaml:"rsa_private_key"`
 	RSAPrivateKeyFile string `yaml:"rsa_private_key_file"`

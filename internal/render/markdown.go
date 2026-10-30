@@ -151,6 +151,12 @@ func RenderLine(m *Msg, resolveName func(string) string) (line string, skip bool
 	}
 
 	content := m.contentText()
+	// 名片里的 userid 可能是外部联系人 ID，和发送人一样走名字解析
+	if m.Card != nil && resolveName != nil {
+		if name := resolveName(m.Card.UserID); name != "" && name != m.Card.UserID {
+			content = fmt.Sprintf("[名片：%s]", name)
+		}
+	}
 	if content == "" {
 		content = "[" + m.MsgType + "]"
 	}

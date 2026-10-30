@@ -33,6 +33,7 @@ import (
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/storage"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/tokenauth"
 	"github.com/gitlayzer/fastgpt-sync-adapter/internal/version"
+	"github.com/gitlayzer/fastgpt-sync-adapter/internal/wecomcontact"
 )
 
 func main() {
@@ -103,6 +104,8 @@ func main() {
 			FieldWeComName:  bt.FieldWeComName,
 			FieldFeishuUser: bt.FieldFeishuUser,
 			FieldOpenID:     bt.FieldOpenID,
+			FieldStatus:     bt.FieldStatus,
+			FieldLeaveDate:  bt.FieldLeaveDate,
 		}, bc, st)
 		// 启动时先同步一次，避免首轮归档用空缓存把目录建成 userid
 		if err := br.Sync(); err != nil {
@@ -158,6 +161,10 @@ func main() {
 		log.Fatalf("群晖 NAS 登录失败: %v", err)
 	}
 	log.Printf("[OK] 群晖 NAS 登录成功（root=%s）", cfg.Sinks.NAS.RootPath)
+	if wcfg := cfg.Connectors.WeCom; wcfg.Enabled && wcfg.WeCom.ContactSecret != "" {
+		nas.SetExternalNamer(wecomcontact.NewResolver(st, wecomcontact.New(wcfg.WeCom.CorpID, wcfg.WeCom.ContactSecret)))
+		log.Printf("[OK] 企微外部联系人名字解析已启用")
+	}
 	eng.AddSink(nas)
 
 	// 按 FastGPT 用户列表在 NAS 自动建目录（人工上传区；需账号级 api_key）

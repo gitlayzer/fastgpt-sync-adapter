@@ -77,6 +77,7 @@ type Sink struct {
 	clf    *classifier.Classifier
 	ids    identity.Resolver
 	store  *storage.Store
+	ext    ExternalNamer // 企微外部联系人（客户）名字解析；nil=不解析（直接用 ID）
 
 	mu           sync.Mutex
 	batchMode    bool
@@ -109,6 +110,22 @@ func New(cfg Config, clf *classifier.Classifier, ids identity.Resolver, store *s
 }
 
 func (s *Sink) Name() string { return "nas" }
+
+// ExternalNamer 企微外部联系人名字解析（*wecomcontact.Resolver 满足）。
+// Display：会话正文里的发送人名字；FileLabel：单聊文件名用的固定标签。
+type ExternalNamer interface {
+	Display(ctx context.Context, id string) string
+	FileLabel(ctx context.Context, id string) string
+}
+
+// SetExternalNamer 注入外部联系人名字解析器（nil=不解析，保持用 ID 的旧行为）。
+func (s *Sink) SetExternalNamer(n ExternalNamer) { s.ext = n }
+
+// isExternalID 是否企微外部联系人 ID（wm/wo 开头，微信客户/企微客户）。
+// 与 wecomcontact.IsExternal 同义，这里本地实现避免 nas → wecomcontact 的包依赖。
+func isExternalID(id string) bool {
+	return strings.HasPrefix(id, "wm") || strings.HasPrefix(id, "wo")
+}
 
 // SetBatchMode 开启/关闭批次缓冲模式。
 // 开启后，对会话 Markdown 的追加会缓存在内存中并去重合并，避免频繁读写群晖 WebAPI。
@@ -262,40 +279,52 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 		add(r.SenderID) // 解析失败兜底：至少写发送者目录
 	}
 
-		nameOf := func(uid string) string {
-			if s.ids == nil {
-				return uid
+	nameOf := func(uid string) string {
+		// 企微外部联系人（客户）：只用于显示，不建员工目录
+		if r.Source == "wecom" && isExternalID(uid) {
+			if s.ext == nil {
+				return uid // 没配客户联系应用：保持旧行为
 			}
-			return s.ids.PersonName(r.Source, uid)
+			return s.ext.Display(ctx, uid)
 		}
+		if s.ids == nil {
+			return uid
+		}
+		// T1 之后非纳管员工（不在名单/离职/重名）PersonName 返回空串，这里兜底用 ID，
+		// 否则会出现 "与的单聊.md" 和空发送人
+		if n := s.ids.PersonName(r.Source, uid); n != "" {
+			return n
+		}
+		return uid
+	}
 
-		// 飞书云端删除事件：同步清理 NAS 物理文件
-		if r.Kind == "delete" {
-			for _, uid := range users {
-				person := sanitize(nameOf(uid))
-				if person == "" {
-					continue
+	// 飞书云端删除事件：同步清理 NAS 物理文件
+	if r.Kind == "delete" {
+		for _, uid := range users {
+			person := sanitize(nameOf(uid))
+			if person == "" {
+				continue
+			}
+			base := path.Join(s.cfg.RootPath, person, platform)
+			for _, a := range r.Attachments {
+				cleanName := sanitize(a.Name)
+				if cleanName == "" || cleanName == "." || cleanName == ".." {
+					continue // 文件名为空或特殊相对路径时绝对禁止删除，防止 path.Join 返回目录本身造成整目录误删
 				}
-				base := path.Join(s.cfg.RootPath, person, platform)
-					for _, a := range r.Attachments {
-						cleanName := sanitize(a.Name)
-						if cleanName == "" || cleanName == "." || cleanName == ".." {
-							continue // 文件名为空或特殊相对路径时绝对禁止删除，防止 path.Join 返回目录本身造成整目录误删
-						}
-						for _, sub := range []string{"云文档", "邮件", ""} {
-							targetFile := path.Join(base, sub, cleanName)
-							// 删除失败要返回错误：不 Ack，下一轮重试（文件不存在已在 Delete 内视为成功）
-							if err := s.fs.Delete(targetFile); err != nil {
-								return err
-							}
-						}
-						log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s/%s", base, cleanName)
+				for _, sub := range []string{"云文档", "邮件", ""} {
+					targetFile := path.Join(base, sub, cleanName)
+					// 删除失败要返回错误：不 Ack，下一轮重试（文件不存在已在 Delete 内视为成功）
+					if err := s.fs.Delete(targetFile); err != nil {
+						return err
 					}
+				}
+				log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s/%s", base, cleanName)
 			}
-			return nil
 		}
+		return nil
+	}
 
-		var firstErr error
+	var firstErr error
 	for _, uid := range users {
 		if ctx.Err() != nil {
 			return ctx.Err() // 停止信号：剩余用户目录由下轮（消息去重保证幂等）补齐
@@ -341,7 +370,7 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 		if msgOK && r.Source == "wecom" {
 			if logged, err := s.store.IsMessageLogged(r.ID, person); err == nil && !logged {
 				if line, skip := render.RenderLine(m, nameOf); !skip {
-					convFile := s.convFileName(m, uid, nameOf)
+					convFile := s.convFileName(ctx, m, uid, nameOf)
 					if err := s.appendFileWithMeta(path.Join(base, "群聊记录"), convFile, line, r.ID, person, r.Timestamp); err != nil {
 						return fmt.Errorf("追加会话 markdown: %w", err)
 					}
@@ -411,9 +440,9 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 }
 
 // convFileName 计算查看者视角的会话文件名。
-// 单聊：以对方姓名命名（与李四的单聊.md）；
+// 单聊：以对方姓名命名（与李四的单聊.md；对方是企微外部联系人时用固定标签，如 与张三@某公司_ab12的单聊.md）；
 // 群聊：优先使用配置或数据库中的群名；若无则智能提取群内实名员工姓名（如 群聊_罗静怡、王永国等人的群聊.md）；未解析出员工时兜底使用 roomid。
-func (s *Sink) convFileName(m *render.Msg, forUser string, nameOf func(string) string) string {
+func (s *Sink) convFileName(ctx context.Context, m *render.Msg, forUser string, nameOf func(string) string) string {
 	if m.RoomID == "" {
 		counterpart := ""
 		for _, u := range m.Participants() {
@@ -424,6 +453,14 @@ func (s *Sink) convFileName(m *render.Msg, forUser string, nameOf func(string) s
 		}
 		if counterpart == "" {
 			counterpart = m.From
+		}
+		// 员工给自己发的消息（tolist 只有本人，常用作备忘）
+		if counterpart == forUser {
+			return "与自己的单聊.md"
+		}
+		// 外部联系人：文件名用首次查到时定下的固定标签，客户改名也不产生新文件
+		if s.ext != nil && isExternalID(counterpart) {
+			return fmt.Sprintf("与%s的单聊.md", sanitize(s.ext.FileLabel(ctx, counterpart)))
 		}
 		name := counterpart
 		if nameOf != nil {
