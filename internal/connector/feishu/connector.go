@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,8 +33,12 @@ type Config struct {
 	SearchKeys   []string `yaml:"search_keys"` // 显式指定的共享文档搜索关键词（留空则不触发搜索，避免抓入公共模板）
 	// CollabRefresh 协作者列表刷新周期（0 = 默认 6h）。加减协作者不改文档修改时间，只能定期查。
 	CollabRefresh time.Duration `yaml:"collab_refresh_interval"`
-	// SharedDiscover 按“创建人”搜索别人共享给员工的文件夹的周期（0 = 默认 1h）。
+	// SharedDiscover 按“创建人”搜索别人共享给员工的文件夹的周期（0 = 默认 1h），平时只搜这段时间新建的。
 	SharedDiscover time.Duration `yaml:"shared_discover_interval"`
+	// SharedFullEvery 按全部时间搜一次的周期（0 = 默认 24h）。很早以前建、最近才共享的文件夹靠这一步发现。
+	SharedFullEvery time.Duration `yaml:"shared_full_interval"`
+	// SharedPerRound 每轮最多几个员工搜索共享文件夹（0 = 默认 10），其余的排到后面几轮。
+	SharedPerRound int `yaml:"shared_discover_per_round"`
 	// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（0 = 默认 100）。
 	MailMaxPerRound int `yaml:"mail_max_per_round"`
 	// WikiEnabled 是否拉知识库（团队知识库 + 个人“我的文档库”），默认不拉：不在客户要求的范围内。
@@ -69,8 +74,11 @@ type API interface {
 	ListPermissionMembers(userToken, token, docType string) ([]feishuapi.PermissionMember, error)
 
 	// 按创建人搜索调用者能看到的云文档（一页），以及批量查文档元数据（发现别人共享给员工的文件夹）
-	SearchDocWiki(userToken, query string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]feishuapi.DocWikiResult, string, error)
+	SearchDocWiki(userToken, query string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]feishuapi.DocWikiResult, string, int, error)
 	BatchQueryMetas(userToken string, docs [][2]string) ([]feishuapi.DocMeta, []feishuapi.DocMetaFailed, error)
+
+	// 全公司员工（作为搜索的“创建人”）
+	ListCompanyUserIDs(tenantToken string) ([]string, error)
 
 	// 妙记/智能纪要接口
 	SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error)
@@ -98,6 +106,8 @@ type Connector struct {
 	lastDl       atomic.Int64          // 上次下载时间（纳秒），限流用
 	lastSearch   atomic.Int64          // 上次搜索时间（纳秒），限流用
 	discoveredAt map[string]int64      // 员工 → 上次完整搜索共享文件夹的时间（秒）
+	sharedFullAt map[string]int64      // 员工 → 上次按全部时间搜索共享文件夹的时间（秒）
+	discoverTry  map[string]int64      // 员工 → 上次轮到他搜索的时间（秒），决定排队顺序
 	lastMailList atomic.Int64          // 上次列邮件的时间（纳秒），限流用
 	lastMailGet  atomic.Int64          // 上次取邮件详情的时间（纳秒），限流用
 	lastMailURL  atomic.Int64          // 上次取邮件附件下载链接的时间（纳秒），限流用
@@ -305,19 +315,23 @@ func (c *Connector) scan(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().Unix()
-		// 每个员工每隔 SharedDiscover 搜一次别人共享给他的文件夹；“创建人”取名单里的全部员工
-		// （授权了的所有者也要搜：协作者列表只含个人，分享给群/部门的拿不到）。
+		// 每个员工每隔 SharedDiscover 搜一次别人共享给他的文件夹，平时只搜最近新建的，每隔 SharedFullEvery 按全部时间搜一次；
+		// “创建人”取全公司员工和名单（授权了的所有者也要搜：协作者列表只含个人，分享给群/部门的拿不到）。
 		// 按员工计时、搜完整才计时：授权失效或搜索失败的员工，重新授权/恢复后下一轮就搜。
-		discoverEvery := int64(c.sharedDiscoverEvery() / time.Second)
+		discoverNow := c.pickDiscover(grants, now)
 		var creators []string
-		rosterLoaded := false
+		creatorsLoaded := false
 		for _, g := range grants {
+			// 一轮可能很长，用轮到这个人时最新的令牌（开头读到的可能已经过期）
+			if fresh, err := c.store.GetOAuthGrant("feishu", g.ExternalUserID); err == nil && fresh != nil {
+				g = *fresh
+			}
 			if g.Status != "authorized" || g.AccessToken == "" {
 				log.Printf("[feishu] 用户 %s 未处于已授权状态（status=%s），跳过", g.ExternalUserID, g.Status)
 				st.inactiveUsers[g.ExternalUserID] = true // 没扫：整篇删除时保留他那份，重新授权后再判断
 				continue
 			}
-			if g.ExpireAt <= now {
+			if g.ExpireAt <= time.Now().Unix() {
 				log.Printf("[feishu] 用户 %s 授权已过期（已于 %s 到期），跳过待刷新",
 					g.ExternalUserID, time.Unix(g.ExpireAt, 0).Format("2006-01-02 15:04:05"))
 				st.failedUsers[g.ExternalUserID] = true // 没扫到：他持有副本的文档本轮不做整篇删除
@@ -408,15 +422,23 @@ func (c *Connector) scan(ctx context.Context) error {
 			}
 
 			// b2) 别人共享给本人、本人云盘树下列不到的文件夹（所有者没授权、或分享给群/部门时只能这样拿到）。
-			if now-c.discoveredAt[g.ExternalUserID] >= discoverEvery {
-				if !rosterLoaded {
-					creators, rosterLoaded = c.rosterCreators(), true
+			if discoverNow[g.ExternalUserID] {
+				if !creatorsLoaded {
+					creators, creatorsLoaded = c.allCreators(now), true
 				}
-				if c.discoverShared(g.AccessToken, g.ExternalUserID, creators) {
+				since := int64(0)
+				if now-c.sharedFullAt[g.ExternalUserID] < int64(c.sharedFullEvery()/time.Second) {
+					since = c.discoveredAt[g.ExternalUserID] - sharedOverlap
+				}
+				if c.discoverShared(g.AccessToken, g.ExternalUserID, creators, since, now) {
 					if c.discoveredAt == nil {
 						c.discoveredAt = map[string]int64{}
+						c.sharedFullAt = map[string]int64{}
 					}
 					c.discoveredAt[g.ExternalUserID] = now
+					if since == 0 {
+						c.sharedFullAt[g.ExternalUserID] = now
+					}
 				}
 			}
 			if !c.scanSharedRoots(g.AccessToken, g.ExternalUserID, see) {
@@ -577,8 +599,13 @@ const collabRefreshDefault = 6 * time.Hour
 
 const (
 	// sharedDiscoverDefault 共享文件夹搜索发现的默认周期（cfg.SharedDiscover 为 0 时使用）。
-	// 一轮约“授权员工数 × 名单人数 / 20”次搜索。
+	// 全员都到期时约“授权员工数 × 公司人数 / 20”次搜索，接口限 100 次/分钟，按接口、应用、租户计算。
 	sharedDiscoverDefault = time.Hour
+	sharedFullDefault     = 24 * time.Hour   // 按全部时间搜的默认周期（cfg.SharedFullEvery 为 0 时使用）
+	sharedPerRoundDefault = 10               // 每轮搜索人数的默认上限（cfg.SharedPerRound 为 0 时使用）
+	sharedOverlap         = int64(3600)      // 只搜最近新建的时，比上次搜索时间多往前搜这么久（秒），防止新文档还没进搜索
+	companyUsersEvery     = int64(24 * 3600) // 全公司员工名单的刷新周期（秒）
+	companyUsersKey       = "feishu_company_users"
 	searchBatch           = 20       // creator_ids 一次最多 20 个
 	searchSplitAt         = 180      // 单次搜索最多返回约 200 条且不报错，达到这个数就按创建时间拆开
 	codeOpenIDNotExist    = 99992351 // 搜索名单里有不存在的 open_id，整次报错
@@ -598,6 +625,42 @@ func isSmartNote(it feishuapi.DocWikiResult) bool {
 
 // searchMinInterval 云文档搜索限速（接口限 100 次/分钟）；测试里置 0。
 var searchMinInterval = 650 * time.Millisecond
+
+func (c *Connector) sharedFullEvery() time.Duration {
+	if c.cfg.SharedFullEvery > 0 {
+		return c.cfg.SharedFullEvery
+	}
+	return sharedFullDefault
+}
+
+// pickDiscover 选出这一轮要搜索共享文件夹的员工：到期的人里，最久没轮到的优先，最多 SharedPerRound 个。
+// 人数多时一轮搜不完，排在后面的不会因为前面的人又到期而一直等；搜索失败的人排到队尾，不占住名额。
+func (c *Connector) pickDiscover(grants []storage.OAuthGrant, now int64) map[string]bool {
+	every := int64(c.sharedDiscoverEvery() / time.Second)
+	var due []string
+	for _, g := range grants {
+		if g.Status == "authorized" && g.AccessToken != "" && g.ExpireAt > now && now-c.discoveredAt[g.ExternalUserID] >= every {
+			due = append(due, g.ExternalUserID)
+		}
+	}
+	sort.SliceStable(due, func(i, j int) bool { return c.discoverTry[due[i]] < c.discoverTry[due[j]] })
+	limit := c.cfg.SharedPerRound
+	if limit <= 0 {
+		limit = sharedPerRoundDefault
+	}
+	if len(due) > limit {
+		due = due[:limit]
+	}
+	if c.discoverTry == nil {
+		c.discoverTry = map[string]int64{}
+	}
+	picked := map[string]bool{}
+	for _, id := range due {
+		picked[id] = true
+		c.discoverTry[id] = now
+	}
+	return picked
+}
 
 func (c *Connector) sharedDiscoverEvery() time.Duration {
 	if c.cfg.SharedDiscover > 0 {
@@ -621,14 +684,69 @@ func (c *Connector) rosterCreators() []string {
 	return ids
 }
 
+// allCreators 搜索用的“创建人”：全公司员工加上名单里的员工（名单可能有通讯录读不到的人）。
+func (c *Connector) allCreators(now int64) []string {
+	seen := map[string]bool{}
+	var ids []string
+	for _, list := range [][]string{c.companyCreators(now), c.rosterCreators()} {
+		for _, id := range list {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+// companyCreators 全公司员工，每天读一次，存在 checkpoint 里（重启不用重读）。
+// 读失败时沿用上次成功的结果；从没读成功过（应用没开通讯录权限）时返回空，只用名单。
+func (c *Connector) companyCreators(now int64) []string {
+	var saved struct {
+		At  int64    `json:"at"`
+		IDs []string `json:"ids"`
+	}
+	if cp, err := c.store.GetCheckpoint(companyUsersKey); err == nil && cp != "" {
+		if err := json.Unmarshal([]byte(cp), &saved); err != nil {
+			log.Printf("[feishu] 解析全公司员工缓存失败（重新读取）: %v", err)
+		}
+	}
+	if now-saved.At < companyUsersEvery {
+		return saved.IDs
+	}
+	tok, err := c.api.TenantAccessToken()
+	var ids []string
+	if err == nil {
+		ids, err = c.api.ListCompanyUserIDs(tok)
+	}
+	if err != nil || len(ids) == 0 {
+		log.Printf("[feishu] 读全公司员工失败（沿用上次的 %d 人，并用员工名单）: %v", len(saved.IDs), err)
+		return saved.IDs
+	}
+	saved.At, saved.IDs = now, ids
+	data, err := json.Marshal(saved)
+	if err == nil {
+		err = c.store.SetCheckpoint(companyUsersKey, string(data))
+	}
+	if err != nil {
+		log.Printf("[feishu] 保存全公司员工缓存失败: %v", err)
+	}
+	log.Printf("[feishu] 全公司员工：%d 人", len(ids))
+	return ids
+}
+
 // discoverShared 用员工自己的身份搜索他能看到的、记进共享表：
-//   - 文件夹：按“创建人 = 名单里的其他员工”搜；
+//   - 文件夹：按“创建人 = 全公司其他员工”搜（只按创建时间搜实测会漏，不能用）；since 大于 0 时只搜 since 之后新建的；
 //   - 智能纪要：按关键词搜、不限创建人（组织者不在名单里、或纪要是本人自己的也能找到），只要标题以“智能纪要：”开头的。
 //
-// 其他单篇文档不要。名单为空或读失败时文件夹那步跳过、算没搜完（下一轮再看）；任何一步搜索或写表失败也算没搜完，下一轮重搜。
+// 其他单篇文档不要。创建人为空时文件夹那步跳过、算没搜完（下一轮再看）；任何一步搜索或写表失败也算没搜完，下一轮重搜。
 // 只增不删：搜不到不代表看不到（结果可能被截断），看不到了由 scanSharedRoots 判断。
 // 全部批次都搜完才返回 true；某批失败就停下（不再继续消耗搜索次数），下一轮整体重搜。
-func (c *Connector) discoverShared(userToken, viewer string, creators []string) bool {
+func (c *Connector) discoverShared(userToken, viewer string, creators []string, since, now int64) bool {
+	end := now
+	if since <= 0 {
+		since, end = 0, 0 // 全部时间：不加创建时间条件
+	}
 	var others []string
 	for _, id := range creators {
 		if id != viewer {
@@ -638,7 +756,7 @@ func (c *Connector) discoverShared(userToken, viewer string, creators []string) 
 	complete := true
 	n := 0
 	for i := 0; i < len(others); i += searchBatch {
-		items, err := c.searchCreators(userToken, "", others[i:min(i+searchBatch, len(others))], 0, 0)
+		items, err := c.searchCreators(userToken, "", others[i:min(i+searchBatch, len(others))], since, end)
 		if err != nil {
 			log.Printf("[feishu] %s 搜索共享文件夹失败（沿用已发现的，下一轮重搜）: %v", viewer, err)
 			return false
@@ -677,13 +795,14 @@ func (c *Connector) discoverShared(userToken, viewer string, creators []string) 
 }
 
 // searchCreators 翻完所有页（query 为空时按创建人搜，ids 为空时不限创建人）。名单里有不可用的 open_id（不存在/别的应用）时
-// 对半拆开重搜，找出它并跳过；结果达到上限时按创建时间对半拆开重搜。
+// 对半拆开重搜，找出它并跳过；结果达到上限时按创建时间对半拆开重搜，第一页的 total 已到上限时不翻完这一段。
 func (c *Connector) searchCreators(userToken, query string, ids []string, start, end int64) ([]feishuapi.DocWikiResult, error) {
 	var all []feishuapi.DocWikiResult
 	pageToken := ""
+	atCap := false
 	for {
 		c.searchThrottle()
-		items, next, err := c.api.SearchDocWiki(userToken, query, ids, start, end, pageToken)
+		items, next, total, err := c.api.SearchDocWiki(userToken, query, ids, start, end, pageToken)
 		if err != nil {
 			var apiErr *feishuapi.APIError
 			if !errors.As(err, &apiErr) || !isBadCreatorID(apiErr.Code) || len(ids) == 0 {
@@ -704,13 +823,17 @@ func (c *Connector) searchCreators(userToken, query string, ids []string, start,
 			}
 			return append(a, b...), nil
 		}
+		if pageToken == "" && total >= searchSplitAt && (start == 0 && end == 0 || end-start >= 2) {
+			atCap = true
+			break
+		}
 		all = append(all, items...)
 		if next == "" {
 			break
 		}
 		pageToken = next
 	}
-	if len(all) < searchSplitAt {
+	if !atCap && len(all) < searchSplitAt {
 		return all, nil
 	}
 	if start == 0 && end == 0 {

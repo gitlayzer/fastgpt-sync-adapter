@@ -118,9 +118,11 @@ func (m *mockAPI) SearchMinutes(userToken string) ([]feishuapi.MinuteItem, error
 	return nil, nil
 }
 
-func (m *mockAPI) SearchDocWiki(string, string, []string, int64, int64, string) ([]feishuapi.DocWikiResult, string, error) {
-	return nil, "", nil
+func (m *mockAPI) SearchDocWiki(string, string, []string, int64, int64, string) ([]feishuapi.DocWikiResult, string, int, error) {
+	return nil, "", 0, nil
 }
+
+func (m *mockAPI) ListCompanyUserIDs(string) ([]string, error) { return nil, nil }
 
 func (m *mockAPI) BatchQueryMetas(string, [][2]string) ([]feishuapi.DocMeta, []feishuapi.DocMetaFailed, error) {
 	return nil, nil, nil
