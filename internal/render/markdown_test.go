@@ -54,17 +54,17 @@ func TestRenderLine(t *testing.T) {
 		t.Fatalf("text 渲染: %q skip=%v", line, skip)
 	}
 
-		file := mustParse(t, `{"msgid":"m2","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"file","file":{"sdkfileid":"fid","filename":"采购合同V1.docx","filesize":123}}`)
-		line, _ = RenderLine(file, resolve)
-		if !strings.Contains(line, "[文件：采购合同V1.docx]") {
-			t.Fatalf("file 渲染: %q", line)
-		}
+	file := mustParse(t, `{"msgid":"m2","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"file","file":{"sdkfileid":"fid","filename":"采购合同V1.docx","filesize":123}}`)
+	line, _ = RenderLine(file, resolve)
+	if !strings.Contains(line, "[文件：采购合同V1.docx]") {
+		t.Fatalf("file 渲染: %q", line)
+	}
 
-		imgMsg := mustParse(t, `{"msgid":"img123","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"image","image":{"sdkfileid":"fid_img"}}`)
-		line, _ = RenderLine(imgMsg, resolve)
-		if !strings.Contains(line, "![图片](images/2025-10-09/image_img123.jpg)") {
-			t.Fatalf("image 渲染未按相对路径出图: %q", line)
-		}
+	imgMsg := mustParse(t, `{"msgid":"img123","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"image","image":{"sdkfileid":"fid_img"}}`)
+	line, _ = RenderLine(imgMsg, resolve)
+	if !strings.Contains(line, "![图片](images/2025-10-09/image_img123.jpg)") {
+		t.Fatalf("image 渲染未按相对路径出图: %q", line)
+	}
 
 	recall := mustParse(t, `{"msgid":"m3","action":"recall","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"text"}`)
 	line, skip = RenderLine(recall, resolve)
@@ -77,13 +77,13 @@ func TestRenderLine(t *testing.T) {
 		t.Fatal("switch 应跳过")
 	}
 
-		mixed := mustParse(t, `{"msgid":"m5","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"mixed","mixed":{"item":[{"type":"text","content":"看这个"},{"type":"image"}]}}`)
-		line, _ = RenderLine(mixed, resolve)
-		if !strings.Contains(line, "看这个") || !strings.Contains(line, "[image]") {
-			t.Fatalf("mixed 渲染: %q", line)
-		}
+	mixed := mustParse(t, `{"msgid":"m5","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"mixed","mixed":{"item":[{"type":"text","content":"看这个"},{"type":"image"}]}}`)
+	line, _ = RenderLine(mixed, resolve)
+	if !strings.Contains(line, "看这个") || !strings.Contains(line, "[image]") {
+		t.Fatalf("mixed 渲染: %q", line)
+	}
 
-		chatRecordJSON := `{
+	chatRecordJSON := `{
 			"msgid": "m6",
 			"action": "send",
 			"from": "u1",
@@ -108,21 +108,21 @@ func TestRenderLine(t *testing.T) {
 				]
 			}
 		}`
-		cr := mustParse(t, chatRecordJSON)
-		line, _ = RenderLine(cr, resolve)
-		if !strings.Contains(line, "[聊天记录：项目组讨论]") {
-			t.Fatalf("chatrecord 标题丢失: %q", line)
-		}
-		if !strings.Contains(line, "明天提交方案") {
-			t.Fatalf("chatrecord 文本子项丢失: %q", line)
-		}
-		if !strings.Contains(line, "[文件：架构方案V2.docx]") {
-			t.Fatalf("chatrecord 文件子项丢失: %q", line)
-		}
-		if !strings.Contains(line, "[图片]") {
-			t.Fatalf("chatrecord 图片子项丢失: %q", line)
-		}
+	cr := mustParse(t, chatRecordJSON)
+	line, _ = RenderLine(cr, resolve)
+	if !strings.Contains(line, "[聊天记录：项目组讨论]") {
+		t.Fatalf("chatrecord 标题丢失: %q", line)
 	}
+	if !strings.Contains(line, "明天提交方案") {
+		t.Fatalf("chatrecord 文本子项丢失: %q", line)
+	}
+	if !strings.Contains(line, "[文件：架构方案V2.docx]") {
+		t.Fatalf("chatrecord 文件子项丢失: %q", line)
+	}
+	if !strings.Contains(line, "[图片]") {
+		t.Fatalf("chatrecord 图片子项丢失: %q", line)
+	}
+}
 
 // TestSanitizeMarkdownHTML 企微 markdown 消息里可能塞整段 HTML（含 base64 图片），
 // 原样写进会话文件会变成几百 KB 乱码。这里验证会被压成一行可读文本。
@@ -188,5 +188,24 @@ func TestRenderLineSanitizesHTMLInTextAndMarkdown(t *testing.T) {
 				t.Fatalf("%s 未清理 %q: %q", msgtype, unwanted, line)
 			}
 		}
+	}
+}
+
+func TestRenderLineCardResolvesUserID(t *testing.T) {
+	card := mustParse(t, `{"msgid":"m1","action":"send","from":"u1","tolist":["u2"],"msgtime":1760000000000,"msgtype":"card","card":{"corpname":"某公司","userid":"woTESTabcdefghijklmnopqrstuvw"}}`)
+
+	line, _ := RenderLine(card, func(u string) string {
+		if u == "woTESTabcdefghijklmnopqrstuvw" {
+			return "外部:张三@某公司"
+		}
+		return u
+	})
+	if !strings.Contains(line, "[名片：外部:张三@某公司]") || strings.Contains(line, "woTEST") {
+		t.Fatalf("名片应显示解析后的名字: %q", line)
+	}
+
+	line, _ = RenderLine(card, nil)
+	if !strings.Contains(line, "[名片：某公司 woTESTabcdefghijklmnopqrstuvw]") {
+		t.Fatalf("无解析器时保持原样: %q", line)
 	}
 }

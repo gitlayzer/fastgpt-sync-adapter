@@ -64,11 +64,11 @@ func (f *fakeNAS) Download(p string) (io.ReadCloser, error) {
 
 // fakeFastGPT 模拟 FastGPT 服务端，记录调用。
 type fakeFastGPT struct {
-	mu         sync.Mutex
-	datasets   map[string]string // name -> id
-	uploads    []string          // 收到的文件名
+	mu          sync.Mutex
+	datasets    map[string]string // name -> id
+	uploads     []string          // 收到的文件名
 	collections map[string]string // collectionID -> name
-	nextID     int
+	nextID      int
 }
 
 func newFakeFastGPT(t *testing.T) (*fakeFastGPT, string) {
@@ -80,7 +80,9 @@ func newFakeFastGPT(t *testing.T) (*fakeFastGPT, string) {
 		body, _ := io.ReadAll(r.Body)
 		switch {
 		case r.URL.Path == "/api/core/dataset/list":
-			var req struct{ SearchKey string `json:"searchKey"` }
+			var req struct {
+				SearchKey string `json:"searchKey"`
+			}
 			json.Unmarshal(body, &req)
 			var out []map[string]string
 			for name, id := range fg.datasets {
@@ -90,36 +92,40 @@ func newFakeFastGPT(t *testing.T) (*fakeFastGPT, string) {
 			}
 			json.NewEncoder(w).Encode(map[string]any{"code": 200, "data": out})
 		case r.URL.Path == "/api/core/dataset/create":
-			var req struct{ Name string `json:"name"` }
+			var req struct {
+				Name string `json:"name"`
+			}
 			json.Unmarshal(body, &req)
 			fg.nextID++
 			id := fmt.Sprintf("ds%d", fg.nextID)
 			fg.datasets[req.Name] = id
 			json.NewEncoder(w).Encode(map[string]any{"code": 200, "data": id})
-			case r.URL.Path == "/api/core/dataset/collection/create/localFile":
-				// multipart：取 file 字段文件名
-				_, params, _ := parseMultipart(r, body)
-				fg.nextID++
-				cid := fmt.Sprintf("col%d", fg.nextID)
-				name := params["display_name"]
-				if name == "" {
-					name = params["filename"]
-				}
-				fg.uploads = append(fg.uploads, name)
-				fg.collections[cid] = name
-				json.NewEncoder(w).Encode(map[string]any{"code": 200, "data": map[string]string{"collectionId": cid}})
-			case r.URL.Path == "/api/core/dataset/collection/update":
-				var req struct {
-					ID   string `json:"id"`
-					Name string `json:"name"`
-				}
-				json.Unmarshal(body, &req)
-				if req.Name != "" && req.ID != "" {
-					fg.collections[req.ID] = req.Name
-				}
-				json.NewEncoder(w).Encode(map[string]any{"code": 200})
+		case r.URL.Path == "/api/core/dataset/collection/create/localFile":
+			// multipart：取 file 字段文件名
+			_, params, _ := parseMultipart(r, body)
+			fg.nextID++
+			cid := fmt.Sprintf("col%d", fg.nextID)
+			name := params["display_name"]
+			if name == "" {
+				name = params["filename"]
+			}
+			fg.uploads = append(fg.uploads, name)
+			fg.collections[cid] = name
+			json.NewEncoder(w).Encode(map[string]any{"code": 200, "data": map[string]string{"collectionId": cid}})
+		case r.URL.Path == "/api/core/dataset/collection/update":
+			var req struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			}
+			json.Unmarshal(body, &req)
+			if req.Name != "" && req.ID != "" {
+				fg.collections[req.ID] = req.Name
+			}
+			json.NewEncoder(w).Encode(map[string]any{"code": 200})
 		case r.URL.Path == "/api/core/dataset/collection/delete":
-			var req struct{ CollectionIds []string `json:"collectionIds"` }
+			var req struct {
+				CollectionIds []string `json:"collectionIds"`
+			}
 			json.Unmarshal(body, &req)
 			for _, id := range req.CollectionIds {
 				delete(fg.collections, id)
@@ -285,11 +291,11 @@ func TestFrozenDeletesPushed(t *testing.T) {
 
 	// 冻结后再跑 → 应从 FastGPT 删除
 	fs.files[metaPath] = []byte(`{"frozen":true}`)
-		task.Run(context.Background())
-		if len(fg.collections) != 0 {
-			t.Fatalf("冻结后应删除, 还剩 %d", len(fg.collections))
-		}
+	task.Run(context.Background())
+	if len(fg.collections) != 0 {
+		t.Fatalf("冻结后应删除, 还剩 %d", len(fg.collections))
 	}
+}
 
 func TestPushFileUpdateDeletesOldCollection(t *testing.T) {
 	fs := newFakeNAS()
@@ -344,12 +350,12 @@ func TestPushFileUpdateDeletesOldCollection(t *testing.T) {
 		t.Fatalf("旧集合 %s 未被删除，存在重复数据堆积", oldCid)
 	}
 
-		// 台账应该指向新集合
-		fi, err := st.GetFileIndex("张三", "wecom", convPath)
-		if err != nil || fi.CollectionID == oldCid {
-			t.Fatalf("台账未更新为新集合: %v %+v", err, fi)
-		}
+	// 台账应该指向新集合
+	fi, err := st.GetFileIndex("张三", "wecom", convPath)
+	if err != nil || fi.CollectionID == oldCid {
+		t.Fatalf("台账未更新为新集合: %v %+v", err, fi)
 	}
+}
 
 func TestPushDateSubdirectoryOptionA(t *testing.T) {
 	fs := newFakeNAS()
@@ -438,6 +444,3 @@ func TestPushDeletesCollectionWhenNASFileDeleted(t *testing.T) {
 		t.Fatalf("台账记录应被清理，实际仍存在: %+v", fi)
 	}
 }
-
-
-

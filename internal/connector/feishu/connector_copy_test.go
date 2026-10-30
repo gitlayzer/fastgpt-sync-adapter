@@ -28,10 +28,10 @@ type copyAPI struct {
 
 func newCopyAPI() *copyAPI {
 	return &copyAPI{
-		mockAPI:  newMockAPI(),
-		mailMap:  map[string]*feishuapi.MailMessage{},
-		myLib:    map[string]string{},
-		walkErr:  map[string]bool{},
+		mockAPI: newMockAPI(),
+		mailMap: map[string]*feishuapi.MailMessage{},
+		myLib:   map[string]string{},
+		walkErr: map[string]bool{},
 	}
 }
 
@@ -383,7 +383,7 @@ func TestCopyDocDeleteBlockedByFailedHolder(t *testing.T) {
 	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 	round(t, c)
 
-	api.wikiNodes["team"] = nil  // A 看不到了
+	api.wikiNodes["team"] = nil // A 看不到了
 	api.walkErr["team2"] = true // B 这一轮扫描失败
 	if got := round(t, c); len(got) != 0 {
 		t.Fatalf("B 没扫成功时不应整篇删除，实际 %v", kinds(got))

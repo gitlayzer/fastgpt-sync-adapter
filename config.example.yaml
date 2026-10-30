@@ -61,6 +61,12 @@ connectors:
     enabled: true                          # 是否启用企微会话归档
     corp_id: "ww1234567890abcdef"          # 企业微信 CorpID
     secret: "YourWeComChatSecret"          # 会话内容存档 Secret
+    # [可选] 客户联系（外部联系人名字）：会话记录里客户只有 ID（wm/wo 开头），
+    # 配上客户联系自建应用的 Secret 才能查出名字，会话里显示"外部:张三@某公司"、
+    # 单聊文件名变成"与张三@某公司_ab12的单聊.md"。留空=不查，客户只显示 ID。
+    # 配置前提：在企微后台"客户联系 → API → 可调用接口的应用"里加入该应用，
+    # 并把服务器出口 IP 加进该应用的企业可信 IP。
+    contact_secret: ""
     rsa_private_key_file: "./private.pem"  # 解密消息用的 RSA 私钥文件路径
     interval: 60s                          # 增量拉取轮询间隔
 
@@ -90,3 +96,6 @@ identity:
     app_id: "cli_1234567890abcdef"         # 读取多维表格的应用凭证（建议直接使用飞书同步应用，消除跨应用 open_id 差异）
     app_secret: "YourFeishuAppSecret"
     refresh_interval: 1h                   # 全员名单自动定时刷新间隔
+    # 名单状态相关列名（与表格列名一致即可，改列名时只改这里）
+    # field_status: "状态"                # 在职 / 离职（空按在职；离职=不再建目录、不再同步）
+    # field_leave_date: "离职日期"        # 离职日期列，原文记录，可空

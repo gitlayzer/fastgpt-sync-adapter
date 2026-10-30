@@ -19,10 +19,10 @@ type sharedAPI struct {
 	metas     map[string]feishuapi.DocMeta // token → 元数据（查得到）
 	failed    map[string]int               // token → 失败码
 	metaErr   error
-	invalid   map[string]int  // 不可用的 open_id → 搜索返回的错误码
-	searchErr error           // 搜索直接报错（非名单问题）
-	searchBy  map[string]int  // userToken → 搜索次数
-	searchCap int             // 单次搜索最多返回条数（模拟 200 上限）
+	invalid   map[string]int             // 不可用的 open_id → 搜索返回的错误码
+	searchErr error                      // 搜索直接报错（非名单问题）
+	searchBy  map[string]int             // userToken → 搜索次数
+	searchCap int                        // 单次搜索最多返回条数（模拟 200 上限）
 	visible   map[string]map[string]bool // userToken → 能看到的文档（模拟关键词搜索的权限范围；为空时都能看到）
 	searches  int
 }

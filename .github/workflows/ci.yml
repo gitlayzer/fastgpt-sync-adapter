@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# 全局只读权限：CI 只做检查，不发布、不推送镜像、不使用任何 secrets。
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 纯 Go 构建 / 静态检查 / 单元测试
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./internal/... ./cmd/...
+
+      - name: go test
+        run: go test -count=1 ./internal/... ./cmd/...
+
+  # 双架构镜像构建验证（只构建，不推送、不加载；使用原生 runner，不用 QEMU）
+  image:
+    name: image-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (linux/${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          load: false
+          tags: fastgpt-sync-adapter:ci-${{ matrix.arch }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+
+  # go.mod / go.sum 与源码是否一致
+  deps:
+    name: deps
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod tidy 后不应有 diff
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod / go.sum 与源码不一致，请在本地执行 go mod tidy 后提交"
+            exit 1
+          fi
+
+      - name: go mod verify
+        run: go mod verify
+
+  # 所有被跟踪的 .go 文件都必须 gofmt 干净
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt check
+        run: |
+          unformatted=$(git ls-files -z -- '*.go' | xargs -0 gofmt -l --)
+          if [ -n "$unformatted" ]; then
+            while IFS= read -r f; do
+              echo "::error file=$f::未格式化，请执行 gofmt -w \"$f\" 后提交"
+            done <<<"$unformatted"
+            exit 1
+          fi
+          echo "gofmt: OK"
+
+  # 禁止提交的敏感文件 + 密钥扫描
+  secrets:
+    name: secrets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检查被跟踪的敏感文件
+        run: |
+          bad=0; n=0
+          while IFS= read -r f; do
+            n=$((n + 1))
+            name="${f##*/}"
+            # 示例文件（config.example.yaml 等）始终放行
+            case "$name" in *.example.*) continue ;; esac
+            hit=0
+            case "$name" in
+              config.yaml|config.yml|identity_map.json|connector_state.json) hit=1 ;;
+              feishu_user_token.json|pending-tokens.csv|.env|.env.*) hit=1 ;;
+              *.pem|*.key|*.p12|*.pfx) hit=1 ;;
+              *.db|*.db-wal|*.db-shm|adapter.db*|*.sqlite|*.sqlite3) hit=1 ;;
+            esac
+            # 任何一级 secrets/ 目录下的文件
+            case "/$f" in */secrets/*) hit=1 ;; esac
+            if [ "$hit" -eq 1 ]; then
+              echo "::error file=$f::该文件可能含敏感信息，禁止提交到公开仓库"
+              bad=1
+            fi
+          done < <(git ls-files)
+          [ "$bad" -eq 0 ] || exit 1
+          echo "forbidden-files: OK ($n tracked files checked)"
+
+      - name: gitleaks 密钥扫描（完整历史，输出脱敏）
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:v8.21.2 git --redact -v /repo
+
+  # 漏洞扫描（信息性，不阻塞合并：step 级 continue-on-error，job 保持绿色，结果看 warning）
+  vuln:
+    name: vuln
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        run: |
+          if ! go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...; then
+            echo "::warning::govulncheck 发现漏洞（不阻塞合并），详见本步骤日志"
+          fi

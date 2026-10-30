@@ -157,21 +157,21 @@ func (t *Task) pushPlatform(ctx context.Context, person, source, platLabel, plat
 		indexedFiles, err := t.store.ListFileIndexByPersonAndSource(person, source)
 		if err == nil {
 			for _, entry := range indexedFiles {
-					if !activePaths[entry.NasPath] && entry.CollectionID != "" {
-						log.Printf("[fastgpt] 检测到 NAS 文件已删除，同步清理 FastGPT 知识库集合: %s (collection: %s)", entry.NasPath, entry.CollectionID)
-						c := t.manager.ClientFor(datasetID)
-						if err := c.DeleteCollection(entry.CollectionID); err != nil {
-							errStr := strings.ToLower(err.Error())
-							// 若远端已不存在（404 或 not found），视为成功并同步清理本地索引，避免死循环重试
-							if strings.Contains(errStr, "not found") || strings.Contains(errStr, "不存在") || strings.Contains(errStr, "404") {
-								_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
-							} else {
-								log.Printf("[fastgpt] 删除 FastGPT 集合失败 %s: %v", entry.CollectionID, err)
-							}
-						} else {
+				if !activePaths[entry.NasPath] && entry.CollectionID != "" {
+					log.Printf("[fastgpt] 检测到 NAS 文件已删除，同步清理 FastGPT 知识库集合: %s (collection: %s)", entry.NasPath, entry.CollectionID)
+					c := t.manager.ClientFor(datasetID)
+					if err := c.DeleteCollection(entry.CollectionID); err != nil {
+						errStr := strings.ToLower(err.Error())
+						// 若远端已不存在（404 或 not found），视为成功并同步清理本地索引，避免死循环重试
+						if strings.Contains(errStr, "not found") || strings.Contains(errStr, "不存在") || strings.Contains(errStr, "404") {
 							_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
+						} else {
+							log.Printf("[fastgpt] 删除 FastGPT 集合失败 %s: %v", entry.CollectionID, err)
 						}
+					} else {
+						_ = t.store.DeleteFileIndex(person, source, entry.NasPath)
 					}
+				}
 			}
 		}
 	}
@@ -190,11 +190,11 @@ func (t *Task) pushDir(ctx context.Context, person, source, defaultCategory, dir
 		if strings.HasSuffix(f.Name, ".meta.json") {
 			continue
 		}
-			if f.IsDir {
-				if skipDirs[f.Name] {
-					continue
-				}
-				if err := t.pushDir(ctx, person, source, defaultCategory, f.Path, datasetID, activePaths); err != nil {
+		if f.IsDir {
+			if skipDirs[f.Name] {
+				continue
+			}
+			if err := t.pushDir(ctx, person, source, defaultCategory, f.Path, datasetID, activePaths); err != nil {
 				log.Printf("[fastgpt] 遍历子目录失败 %s: %v", f.Path, err)
 				if firstErr == nil {
 					firstErr = err
@@ -273,28 +273,28 @@ func (t *Task) pushFile(ctx context.Context, person, source, category string, f 
 		return fmt.Errorf("读取: %w", err)
 	}
 
-		// 展示名：默认使用真实文件名；若带有 _<短Token> 后缀或历史遗留 <msgid>_ 机器前缀，则剥离以还原最纯净的中文标题
-		display := f.Name
-		if category != "会话" {
-			ext := path.Ext(f.Name)
-			base := strings.TrimSuffix(f.Name, ext)
-			// 1) 优先剥离末尾的 _<8位Token短码> 后缀（必须为8位且包含字母，避免误伤 _20240516 等纯数字日期）
-			if idx := strings.LastIndex(base, "_"); idx > 0 {
-				suffix := base[idx+1:]
-				if len(suffix) == 8 && isAlphanumericToken(suffix) && strings.ContainsAny(suffix, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
-					base = base[:idx]
-					display = base + ext
-				}
-			}
-			// 2) 历史遗留带纯数字 <msgid>_ 机器前缀（长度 > 10 且纯数字）：剥离前缀
-			if idx := strings.Index(base, "_"); idx > 0 {
-				prefix := base[:idx]
-				if len(prefix) > 10 && isAllDigits(prefix) {
-					base = base[idx+1:]
-					display = base + ext
-				}
+	// 展示名：默认使用真实文件名；若带有 _<短Token> 后缀或历史遗留 <msgid>_ 机器前缀，则剥离以还原最纯净的中文标题
+	display := f.Name
+	if category != "会话" {
+		ext := path.Ext(f.Name)
+		base := strings.TrimSuffix(f.Name, ext)
+		// 1) 优先剥离末尾的 _<8位Token短码> 后缀（必须为8位且包含字母，避免误伤 _20240516 等纯数字日期）
+		if idx := strings.LastIndex(base, "_"); idx > 0 {
+			suffix := base[idx+1:]
+			if len(suffix) == 8 && isAlphanumericToken(suffix) && strings.ContainsAny(suffix, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+				base = base[:idx]
+				display = base + ext
 			}
 		}
+		// 2) 历史遗留带纯数字 <msgid>_ 机器前缀（长度 > 10 且纯数字）：剥离前缀
+		if idx := strings.Index(base, "_"); idx > 0 {
+			prefix := base[:idx]
+			if len(prefix) > 10 && isAllDigits(prefix) {
+				base = base[idx+1:]
+				display = base + ext
+			}
+		}
+	}
 
 	// 标签：分类 + 来源平台（前缀字符串形式）。
 	// 注：FastGPT 对象式 {tag,value} 标签要求库内预先创建标签定义（仅 Pro UI 可建，无公开 API，
@@ -310,19 +310,19 @@ func (t *Task) pushFile(ctx context.Context, person, source, category string, f 
 	if err != nil {
 		return fmt.Errorf("上传: %w", err)
 	}
-		// localFile 接口用表单文件名做展示名，二次调用修正为我们想要的名字
-		_ = c.RenameCollection(collectionID, display)
+	// localFile 接口用表单文件名做展示名，二次调用修正为我们想要的名字
+	_ = c.RenameCollection(collectionID, display)
 
-		// 若此前已有该文件的旧版本 Collection，在上传新版本成功后清理旧集合，防止知识库产生同名重复数据
-		if existing != nil && existing.CollectionID != "" && existing.CollectionID != collectionID {
-			if err := c.DeleteCollection(existing.CollectionID); err != nil {
-				log.Printf("[fastgpt] 清理旧版本集合 %s 失败 (新集合: %s): %v", existing.CollectionID, collectionID, err)
-			} else {
-				log.Printf("[fastgpt] 已清理旧版本集合 %s (文件更新: %s)", existing.CollectionID, f.Path)
-			}
+	// 若此前已有该文件的旧版本 Collection，在上传新版本成功后清理旧集合，防止知识库产生同名重复数据
+	if existing != nil && existing.CollectionID != "" && existing.CollectionID != collectionID {
+		if err := c.DeleteCollection(existing.CollectionID); err != nil {
+			log.Printf("[fastgpt] 清理旧版本集合 %s 失败 (新集合: %s): %v", existing.CollectionID, collectionID, err)
+		} else {
+			log.Printf("[fastgpt] 已清理旧版本集合 %s (文件更新: %s)", existing.CollectionID, f.Path)
 		}
+	}
 
-		// 更新台账
+	// 更新台账
 	t.store.UpsertFileIndex(&storage.FileIndexEntry{
 		Person: person, Source: source, NasPath: f.Path, Category: category,
 		CollectionID: collectionID, Checksum: checksum,
@@ -351,36 +351,36 @@ func (t *Task) isFrozen(nasPath string) bool {
 	return m.Frozen
 }
 
-	func platformLabel(source string) string {
-		switch source {
-		case "wecom":
-			return "企微"
-		case "feishu":
-			return "飞书"
-		}
-		return source
+func platformLabel(source string) string {
+	switch source {
+	case "wecom":
+		return "企微"
+	case "feishu":
+		return "飞书"
 	}
+	return source
+}
 
-	func isAlphanumericToken(s string) bool {
-		if s == "" {
+func isAlphanumericToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
 			return false
 		}
-		for _, c := range s {
-			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
-				return false
-			}
-		}
-		return true
 	}
+	return true
+}
 
-	func isAllDigits(s string) bool {
-		if s == "" {
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
 			return false
 		}
-		for _, c := range s {
-			if c < '0' || c > '9' {
-				return false
-			}
-		}
-		return true
 	}
+	return true
+}

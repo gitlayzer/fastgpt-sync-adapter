@@ -19,8 +19,8 @@ type Record struct {
 
 // Attachment 附件引用。字节不随 Record 走，由 Sink 通过连接器的 FetchAttachment 懒加载。
 type Attachment struct {
-	Name   string `json:"name"`              // 原始文件名（可能为空，如图片/语音）
-	FileID string `json:"file_id"`           // 源端文件标识（企微 sdkfileid / 飞书 file_token）
+	Name   string `json:"name"`    // 原始文件名（可能为空，如图片/语音）
+	FileID string `json:"file_id"` // 源端文件标识（企微 sdkfileid / 飞书 file_token）
 	Size   int64  `json:"size"`
 	MD5    string `json:"md5"`
 	UserID string `json:"user_id,omitempty"` // 扫描/持有权限的用户 ExternalUserID (open_id)，用于精确定向取 Token

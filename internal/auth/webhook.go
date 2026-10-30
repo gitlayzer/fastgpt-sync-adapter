@@ -63,7 +63,8 @@ func (s *Service) Handler() http.Handler {
 
 // handleStart 生成授权链接并跳转（或返回链接供复制）。
 // 用法：/oauth/feishu/start           → 302 跳转到飞书授权页
-//       /oauth/feishu/start?show=1    → 返回链接文本（便于复制发给员工）
+//
+//	/oauth/feishu/start?show=1    → 返回链接文本（便于复制发给员工）
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	state := fmt.Sprintf("%d", time.Now().UnixNano())
 	authURL := feishu.AuthorizeURL(s.fs.AppID, s.redirectURI(r), state)
@@ -174,8 +175,8 @@ func (s *Service) Stop(ctx context.Context) {
 }
 
 // RefreshLoop 周期性刷新临近过期的 token（实现 engine.Task 接口）。
-func (s *Service) Name() string                 { return "feishu-token-refresher" }
-func (s *Service) Interval() time.Duration      { return s.cfg.RefreshInterval }
+func (s *Service) Name() string            { return "feishu-token-refresher" }
+func (s *Service) Interval() time.Duration { return s.cfg.RefreshInterval }
 func (s *Service) Run(ctx context.Context) error {
 	s.refreshExpiring()
 	return nil
