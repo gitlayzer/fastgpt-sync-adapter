@@ -266,11 +266,12 @@ type DocWikiResult struct {
 }
 
 // SearchDocWiki 搜索调用者能看到的云文档（只返回有授权关系的文档，"组织内获得链接可阅读"但未授权的不返回，实测），返回一页（page_size 20）。
-// query 为空时必须给 creatorIDs（空关键词不加过滤实测返回空）；creatorIDs 为空时不按创建人过滤。
+// query 为空时必须给 creatorIDs（空关键词不加过滤实测返回空，只按创建时间搜实测会漏文档且无从发现）；creatorIDs 为空时不按创建人过滤。
 // creatorIDs 最多 20 个，名单里有一个 open_id 不存在（99992351）或属于别的应用（99992361）整次报错。
 // createStart/createEnd 都为 0 时不限创建时间；单位是秒（官方 SDK search/v2 DocFilter.CreateTime：“秒级时间戳”）。
 // 注意：单次搜索最多返回约 200 条，超出部分不报错、has_more=false，调用方需按创建时间拆分。
-func (c *Client) SearchDocWiki(userToken, query string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]DocWikiResult, string, error) {
+// 第三个返回值是这次搜索的总条数（实测第一页就有，超过上限时封顶为 200），可以不翻页就判断要不要拆分。
+func (c *Client) SearchDocWiki(userToken, query string, creatorIDs []string, createStart, createEnd int64, pageToken string) ([]DocWikiResult, string, int, error) {
 	filter := map[string]any{}
 	if len(creatorIDs) > 0 {
 		filter["creator_ids"] = creatorIDs
@@ -287,6 +288,7 @@ func (c *Client) SearchDocWiki(userToken, query string, creatorIDs []string, cre
 		Data struct {
 			HasMore   bool   `json:"has_more"`
 			PageToken string `json:"page_token"`
+			Total     int    `json:"total"`
 			ResUnits  []struct {
 				TitleHighlighted string        `json:"title_highlighted"`
 				ResultMeta       DocWikiResult `json:"result_meta"`
@@ -294,7 +296,7 @@ func (c *Client) SearchDocWiki(userToken, query string, creatorIDs []string, cre
 		} `json:"data"`
 	}
 	if err := c.postJSON(baseURL+"/search/v2/doc_wiki/search", body, userToken, &out); err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	items := make([]DocWikiResult, 0, len(out.Data.ResUnits))
 	for _, u := range out.Data.ResUnits {
@@ -306,7 +308,7 @@ func (c *Client) SearchDocWiki(userToken, query string, creatorIDs []string, cre
 	if out.Data.HasMore {
 		next = out.Data.PageToken
 	}
-	return items, next, nil
+	return items, next, out.Data.Total, nil
 }
 
 // DocMeta 文档元数据（drive/v1/metas/batch_query）：确认调用者还能看到；单篇文档还要用标题、所有者、修改时间。

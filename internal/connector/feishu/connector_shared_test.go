@@ -14,17 +14,27 @@ import (
 // sharedAPI 模拟搜索与批量查元数据：docs 是“查看者能搜到的文档”，按创建人、创建时间过滤。
 type sharedAPI struct {
 	*mockAPI
-	docs      []feishuapi.DocWikiResult
-	created   map[string]int64             // token → 创建时间（秒），模拟按创建时间过滤
-	metas     map[string]feishuapi.DocMeta // token → 元数据（查得到）
-	failed    map[string]int               // token → 失败码
-	metaErr   error
-	invalid   map[string]int             // 不可用的 open_id → 搜索返回的错误码
-	searchErr error                      // 搜索直接报错（非名单问题）
-	searchBy  map[string]int             // userToken → 搜索次数
-	searchCap int                        // 单次搜索最多返回条数（模拟 200 上限）
-	visible   map[string]map[string]bool // userToken → 能看到的文档（模拟关键词搜索的权限范围；为空时都能看到）
-	searches  int
+	docs         []feishuapi.DocWikiResult
+	created      map[string]int64             // token → 创建时间（秒），模拟按创建时间过滤
+	metas        map[string]feishuapi.DocMeta // token → 元数据（查得到）
+	failed       map[string]int               // token → 失败码
+	metaErr      error
+	invalid      map[string]int             // 不可用的 open_id → 搜索返回的错误码
+	searchErr    error                      // 搜索直接报错（非名单问题）
+	searchBy     map[string]int             // userToken → 搜索次数
+	searchCap    int                        // 单次搜索最多返回条数（模拟 200 上限）
+	visible      map[string]map[string]bool // userToken → 能看到的文档（模拟关键词搜索的权限范围；为空时都能看到）
+	searches     int
+	company      []string // 全公司员工
+	companyErr   error
+	companyCalls int
+	starts       map[string][]int64 // userToken → 每次按创建人搜的起始创建时间
+	overPaged    int                // 总条数已达上限还继续翻页的次数
+}
+
+func (m *sharedAPI) ListCompanyUserIDs(string) ([]string, error) {
+	m.companyCalls++
+	return m.company, m.companyErr
 }
 
 func newSharedAPI() *sharedAPI {
@@ -32,16 +42,22 @@ func newSharedAPI() *sharedAPI {
 		failed: map[string]int{}, invalid: map[string]int{}, created: map[string]int64{}, searchBy: map[string]int{}, searchCap: 200}
 }
 
-func (m *sharedAPI) SearchDocWiki(tok, query string, ids []string, start, end int64, pageToken string) ([]feishuapi.DocWikiResult, string, error) {
+func (m *sharedAPI) SearchDocWiki(tok, query string, ids []string, start, end int64, pageToken string) ([]feishuapi.DocWikiResult, string, int, error) {
 	m.searches++
 	m.searchBy[tok]++
 	if m.searchErr != nil {
-		return nil, "", m.searchErr
+		return nil, "", 0, m.searchErr
+	}
+	if len(ids) > 0 && pageToken == "" {
+		if m.starts == nil {
+			m.starts = map[string][]int64{}
+		}
+		m.starts[tok] = append(m.starts[tok], start)
 	}
 	want := map[string]bool{}
 	for _, id := range ids {
 		if code := m.invalid[id]; code != 0 {
-			return nil, "", &feishuapi.APIError{Code: code, Msg: "bad open_id"}
+			return nil, "", 0, &feishuapi.APIError{Code: code, Msg: "bad open_id"}
 		}
 		want[id] = true
 	}
@@ -59,6 +75,9 @@ func (m *sharedAPI) SearchDocWiki(tok, query string, ids []string, start, end in
 	if len(hit) > m.searchCap {
 		hit = hit[:m.searchCap] // 超出部分静默截断
 	}
+	if pageToken != "" && len(hit) >= searchSplitAt {
+		m.overPaged++
+	}
 	// 每页 20 条
 	from := 0
 	fmt.Sscanf(pageToken, "%d", &from)
@@ -67,7 +86,7 @@ func (m *sharedAPI) SearchDocWiki(tok, query string, ids []string, start, end in
 	if to < len(hit) {
 		next = fmt.Sprint(to)
 	}
-	return hit[from:to], next, nil
+	return hit[from:to], next, len(hit), nil
 }
 
 func (m *sharedAPI) BatchQueryMetas(tok string, docs [][2]string) ([]feishuapi.DocMeta, []feishuapi.DocMetaFailed, error) {
@@ -364,5 +383,171 @@ func TestSharedSearchSplitsAtCap(t *testing.T) {
 	round(t, c)
 	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 450 {
 		t.Fatalf("应拆分后拿全 450 个，实际 %d", len(roots))
+	}
+	if api.overPaged != 0 {
+		t.Fatalf("第一页 total 达到上限时应直接拆分、不翻页，实际多翻 %d 页", api.overPaged)
+	}
+}
+
+// 所有者不在名单里、但在全公司员工里：能搜到他共享的文件夹；名单里的人仍然要搜。
+func TestSharedFolderOwnerOutsideRoster(t *testing.T) {
+	st, api := sharedSetup(t)
+	api.company = []string{"ou_a", "ou_outsider"}
+	api.docs = append(api.docs, feishuapi.DocWikiResult{Token: "fld_out", DocType: "FOLDER", OwnerID: "ou_outsider"})
+	api.metas["fld_out"] = feishuapi.DocMeta{DocToken: "fld_out"}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if got := rootTypes(st, "ou_a"); fmt.Sprint(got) != "map[fld:folder fld_out:folder]" {
+		t.Fatalf("应记下名单外同事和名单内同事的文件夹，实际 %v", got)
+	}
+}
+
+// 全公司员工读失败：沿用上次成功的结果；从没读成功过时只用名单，照常搜。一天内不重读。
+func TestSharedCompanyListFallback(t *testing.T) {
+	st, api := sharedSetup(t)
+	api.companyErr = errors.New("飞书错误 code=99991672 msg=Access denied")
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if got := rootTypes(st, "ou_a"); fmt.Sprint(got) != "map[fld:folder]" {
+		t.Fatalf("没开通讯录权限时应只用名单，实际 %v", got)
+	}
+
+	api.companyErr = nil
+	api.company = []string{"ou_outsider"}
+	api.docs = append(api.docs, feishuapi.DocWikiResult{Token: "fld_out", DocType: "FOLDER", OwnerID: "ou_outsider"})
+	api.metas["fld_out"] = feishuapi.DocMeta{DocToken: "fld_out"}
+	c.discoveredAt["ou_a"] = 0
+	round(t, c)
+	if got := rootTypes(st, "ou_a"); fmt.Sprint(got) != "map[fld:folder fld_out:folder]" {
+		t.Fatalf("读到全公司员工后应搜到名单外同事的文件夹，实际 %v", got)
+	}
+	calls := api.companyCalls
+	c.discoveredAt["ou_a"] = 0
+	round(t, c)
+	if api.companyCalls != calls {
+		t.Fatalf("一天内不应重读全公司员工：%d → %d", calls, api.companyCalls)
+	}
+
+	// 过期后读失败：不能变成空名单
+	st.SetCheckpoint(companyUsersKey, `{"at":1,"ids":["ou_outsider"]}`)
+	api.companyErr = errors.New("飞书错误 code=131001 msg=rpc fail")
+	if got := c.allCreators(time.Now().Unix()); fmt.Sprint(got) != "[ou_outsider ou_a ou_b]" {
+		t.Fatalf("读失败时应沿用上次的结果并加上名单，实际 %v", got)
+	}
+}
+
+// 平时只搜最近新建的；很早以前建、刚共享的文件夹等到全量搜索才找到。
+func TestSharedIncrementalAndFull(t *testing.T) {
+	st, api := sharedSetup(t)
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if got := api.starts["ut0"]; len(got) != 1 || got[0] != 0 {
+		t.Fatalf("第一次应搜全部时间，实际 %v", got)
+	}
+
+	now := time.Now().Unix()
+	api.docs = append(api.docs,
+		feishuapi.DocWikiResult{Token: "fld_old", DocType: "FOLDER", OwnerID: "ou_b"},
+		feishuapi.DocWikiResult{Token: "fld_new", DocType: "FOLDER", OwnerID: "ou_b"},
+	)
+	api.created["fld_old"] = 1000
+	api.created["fld_new"] = now - 60
+	api.metas["fld_old"] = feishuapi.DocMeta{DocToken: "fld_old"}
+	api.metas["fld_new"] = feishuapi.DocMeta{DocToken: "fld_new"}
+	c.discoveredAt["ou_a"] -= 7200
+	round(t, c)
+	if got := api.starts["ut0"]; got[len(got)-1] <= 1 {
+		t.Fatalf("没到全量周期时只应搜最近新建的，实际 %v", got)
+	}
+	if got := rootTypes(st, "ou_a"); fmt.Sprint(got) != "map[fld:folder fld_new:folder]" {
+		t.Fatalf("增量搜索应只找到新建的文件夹，实际 %v", got)
+	}
+
+	c.discoveredAt["ou_a"] -= 7200
+	c.sharedFullAt["ou_a"] -= int64(sharedFullDefault / time.Second)
+	round(t, c)
+	if got := rootTypes(st, "ou_a"); fmt.Sprint(got) != "map[fld:folder fld_new:folder fld_old:folder]" {
+		t.Fatalf("全量搜索应找到以前建的文件夹，实际 %v", got)
+	}
+}
+
+// 每轮限量：最久没轮到的优先，人多时后面的人不会一直排不上；搜索失败的人不占住名额。
+func TestSharedPerRoundFair(t *testing.T) {
+	st, api := sharedSetup(t)
+	for i := 1; i <= 3; i++ {
+		tok := fmt.Sprint("ut_x", i)
+		st.UpsertOAuthGrant(&storage.OAuthGrant{
+			Platform: "feishu", ExternalUserID: fmt.Sprint("ou_x", i), AccessToken: tok, RefreshToken: "rt",
+			ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+		})
+		api.roots[tok] = "root_" + tok
+	}
+	c := newUserConn(t, st, api, Config{SharedPerRound: 2})
+	round(t, c)
+	if len(api.searchBy) != 2 {
+		t.Fatalf("第一轮应只有 2 人搜索，实际 %v", api.searchBy)
+	}
+	first := map[string]bool{}
+	for tok := range api.searchBy {
+		first[tok] = true
+	}
+	for id := range c.discoveredAt { // 第一批人又到期了
+		c.discoveredAt[id] -= 7200
+	}
+	api.searchBy = map[string]int{}
+	round(t, c)
+	if len(api.searchBy) != 2 {
+		t.Fatalf("第二轮应有 2 人搜索，实际 %v", api.searchBy)
+	}
+	fresh := 0
+	for tok := range api.searchBy {
+		if !first[tok] {
+			fresh++
+		}
+	}
+	if fresh != 2 {
+		t.Fatalf("第二轮应先轮到还没搜过的 2 个人，第一轮 %v，第二轮 %v", first, api.searchBy)
+	}
+}
+
+// refreshAPI 模拟扫描途中令牌被刷新：第一个员工开始扫描时，后面员工的令牌换成新的。
+type refreshAPI struct {
+	*sharedAPI
+	onRoot func()
+	tokens []string
+}
+
+func (a *refreshAPI) RootFolderMeta(tok string) (string, error) {
+	a.tokens = append(a.tokens, tok)
+	if a.onRoot != nil {
+		a.onRoot()
+		a.onRoot = nil
+	}
+	return a.sharedAPI.RootFolderMeta(tok)
+}
+
+// 一轮可能很长：扫描途中刷新的令牌，轮到这个人时要用新的。
+func TestScanUsesFreshToken(t *testing.T) {
+	st, shared := sharedSetup(t)
+	st.UpsertOAuthGrant(&storage.OAuthGrant{
+		Platform: "feishu", ExternalUserID: "ou_x", AccessToken: "ut_x_old", RefreshToken: "rt",
+		ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+	})
+	shared.roots["ut_x_old"] = "root_x"
+	shared.roots["ut_x_new"] = "root_x"
+	shared.roots["ut0_new"] = "root_a"
+	api := &refreshAPI{sharedAPI: shared}
+	api.onRoot = func() { // 不管谁先扫，另一个人的令牌都在他开始前被换掉
+		for id, tok := range map[string]string{"ou_a": "ut0_new", "ou_x": "ut_x_new"} {
+			if g, _ := st.GetOAuthGrant("feishu", id); g.AccessToken != api.tokens[0] {
+				g.AccessToken = tok
+				st.UpsertOAuthGrant(g)
+			}
+		}
+	}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if len(api.tokens) != 2 || (api.tokens[1] != "ut0_new" && api.tokens[1] != "ut_x_new") {
+		t.Fatalf("第二个员工应使用扫描途中刷新的令牌，实际 %v", api.tokens)
 	}
 }

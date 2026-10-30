@@ -83,7 +83,7 @@ func TestSearchDocWikiTitle(t *testing.T) {
 	c.HTTP = &http.Client{Transport: stubTransport(func(r *http.Request) string {
 		return `{"code":0,"data":{"has_more":false,"res_units":[{"title_highlighted":"<h>智能纪要</h>：周会 2026年5月15日","result_meta":{"token":"sn1","doc_types":"DOCX","owner_id":"ou_b"}}]}}`
 	})}
-	items, _, err := c.SearchDocWiki("ut", "智能纪要", nil, 0, 0, "")
+	items, _, _, err := c.SearchDocWiki("ut", "智能纪要", nil, 0, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
