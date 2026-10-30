@@ -276,7 +276,7 @@ func TestUserModeWikiOnly(t *testing.T) {
 	api.docxData["doccn1"] = "docx-bytes"
 	api.docxData["sht1"] = "xlsx-bytes"
 
-	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	c := NewWithAPI(Config{Mode: "user", WikiEnabled: true}, st, api)
 	if err := c.Init(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestNotAckedMeansRetry(t *testing.T) {
 	}
 	api.docxData["doc1"] = "内容"
 
-	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	c := NewWithAPI(Config{Mode: "user", WikiEnabled: true}, st, api)
 	if err := c.Init(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -538,7 +538,7 @@ func TestMinutesSyncAndTranscriptExport(t *testing.T) {
 		},
 	}
 
-	c := NewWithAPI(Config{Mode: "user"}, st, api)
+	c := NewWithAPI(Config{Mode: "user", MinutesEnabled: true}, st, api)
 	if err := c.Init(context.Background()); err != nil {
 		t.Fatal(err)
 	}

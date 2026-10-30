@@ -3,12 +3,14 @@ package feishu
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,6 +24,10 @@ const (
 	mailMaxPerRoundDefault = 100
 	// 已补齐的文件夹平时只翻到“整页都存过”为止；每天完整翻一遍，兜住移进旧位置的邮件。
 	mailFullScanEvery = int64(24 * 3600)
+	// 每天核对一次已存的邮件有没有在飞书删除。
+	mailVerifyEvery = int64(24 * 3600)
+	// 邮件不存在（实测 HTTP 404）。
+	codeMailNotFound = 1234034
 	// 列邮件 10 次/秒、邮件详情 100 次/分钟、附件下载链接 1 次/秒（官方文档）。
 	mailListMinInterval   = 100 * time.Millisecond
 	mailFolderMinInterval = 200 * time.Millisecond // 文件夹列表 5 次/秒
@@ -31,16 +37,18 @@ const (
 	mailSubjectMaxRunes = 60
 )
 
-// 要存的系统文件夹；草稿箱、垃圾邮件、已删除不存。用户自建文件夹另外从文件夹列表里取。
-var mailSystemFolders = []string{"INBOX", "SENT", "ARCHIVED"}
+// 要存的系统文件夹：收件箱、已发送（客户要求的范围）；已归档、草稿箱、垃圾邮件、已删除不存。用户自建文件夹另外从文件夹列表里取。
+var mailSystemFolders = []string{"INBOX", "SENT"}
 
 // mailTZ 邮件时间统一按北京时间显示和命名（服务器容器里一般是 UTC）。
 var mailTZ = time.FixedZone("CST", 8*3600)
 
 // mailAck 一条邮件记录写成功后要记为已处理的邮件拷贝（同一封邮件在不同文件夹里 message_id 不同）。
+// files 是这封邮件写到 NAS 的全部文件名，删除时要用。
 type mailAck struct {
 	smtpID string
 	ids    []string
+	files  []string
 }
 
 // scanMail 扫一个员工的邮箱：逐个文件夹翻页列邮件 ID，跳过已处理过的，
@@ -138,6 +146,9 @@ func (c *Connector) scanMail(st *scanState, userToken, userID string, now int64)
 		}
 		rec := mailToRecord(id, msg, userID)
 		ack := &mailAck{smtpID: msg.SMTPID, ids: []string{id}}
+		for _, a := range rec.Attachments {
+			ack.files = append(ack.files, a.Name)
+		}
 		if msg.SMTPID != "" {
 			bySMTP[msg.SMTPID] = ack
 		}
@@ -164,6 +175,9 @@ func (c *Connector) ackMail(recordID, personID string) error {
 	if ack == nil {
 		return nil
 	}
+	if err := c.store.AddMailFiles(personID, recordID, ack.files); err != nil {
+		return err
+	}
 	for _, id := range ack.ids {
 		if err := c.store.AddMailSeen(personID, id, ack.smtpID); err != nil {
 			return err
@@ -175,14 +189,14 @@ func (c *Connector) ackMail(recordID, personID string) error {
 	return nil
 }
 
-// mailFolders 要扫的文件夹：收件箱、已发送、已归档 + 用户自建文件夹。
-// 列文件夹失败（旧授权没有 mail:user_mailbox.folder:read）时只扫三个系统文件夹。
+// mailFolders 要扫的文件夹：收件箱、已发送 + 用户自建文件夹。
+// 列文件夹失败（旧授权没有 mail:user_mailbox.folder:read）时只扫收件箱和已发送。
 func (c *Connector) mailFolders(userToken, userID string) []string {
 	out := append([]string(nil), mailSystemFolders...)
 	pace(&c.lastMailList, mailFolderMinInterval)
 	folders, err := c.api.ListMailFolders(userToken)
 	if err != nil {
-		log.Printf("[feishu] 列 %s 邮箱文件夹失败（本轮只扫收件箱、已发送、已归档）: %v", userID, err)
+		log.Printf("[feishu] 列 %s 邮箱文件夹失败（本轮只扫收件箱、已发送）: %v", userID, err)
 		return out
 	}
 	for _, f := range folders {
@@ -191,6 +205,107 @@ func (c *Connector) mailFolders(userToken, userID string) []string {
 		}
 	}
 	return out
+}
+
+// verifyMailDeleted 每天核对一次：已存的邮件在飞书删除了就返回它的副本 token。
+// 同一封邮件的所有拷贝都不在任何文件夹（已删除除外）里才算删除，还要确认：拷贝在已删除文件夹里，或详情接口明确返回不存在。
+// 移到已归档、垃圾邮件或自建文件夹不算删除（message_id 不变，实测）。详情里的 folder_id 在归档、删除后仍是原文件夹（实测），不能用来判断。
+// 列表或文件夹接口失败时本轮不判断，下一轮重试；疑似删除超过一半时当作接口异常，和云盘同样熔断。
+func (c *Connector) verifyMailDeleted(userToken, userID string, now int64) []string {
+	key := "feishu_mail_verify:" + userID
+	if last, err := c.store.GetCheckpoint(key); err == nil {
+		if ts, _ := strconv.ParseInt(last, 10, 64); now-ts < mailVerifyEvery {
+			return nil
+		}
+	}
+	copies, err := c.store.ListCopiesByPerson(userID)
+	if err != nil {
+		return nil
+	}
+	var mine []string
+	for _, cp := range copies {
+		if cp.Kind == "mail" || strings.HasPrefix(cp.Token, "mail_") {
+			mine = append(mine, cp.Token)
+		}
+	}
+	if len(mine) == 0 {
+		return nil
+	}
+	pace(&c.lastMailList, mailFolderMinInterval)
+	folders, err := c.api.ListMailFolders(userToken)
+	if err != nil {
+		log.Printf("[feishu] 列 %s 邮箱文件夹失败（本轮不核对邮件删除）: %v", userID, err)
+		return nil
+	}
+	live, trash := map[string]bool{}, map[string]bool{}
+	for _, f := range folders {
+		if f.ID == "" {
+			continue
+		}
+		into := live
+		if f.ID == "TRASH" {
+			into = trash
+		}
+		pageToken := ""
+		for {
+			pace(&c.lastMailList, mailListMinInterval)
+			ids, next, more, err := c.api.ListMailboxMessages(userToken, f.ID, pageToken)
+			if err != nil {
+				log.Printf("[feishu] 列 %s 邮箱文件夹 %s 失败（本轮不核对邮件删除）: %v", userID, f.ID, err)
+				return nil
+			}
+			for _, id := range ids {
+				into[id] = true
+			}
+			if !more || next == "" {
+				break
+			}
+			pageToken = next
+		}
+	}
+	if len(live) == 0 && len(trash) == 0 { // 没开通邮箱时列表接口返回空，分不清是不是全删了
+		return nil
+	}
+	var missing []string
+	for _, token := range mine {
+		alive := false
+		for _, id := range c.store.MailCopyIDs(userID, strings.TrimPrefix(token, "mail_")) {
+			alive = alive || live[id]
+		}
+		if !alive {
+			missing = append(missing, token)
+		}
+	}
+	if len(mine) > 5 && len(missing) > len(mine)/2 {
+		log.Printf("[feishu] 警告：用户 %s 疑似删除的邮件比例过高 (%d/%d)，触发熔断防误删保护，跳过本次核对", userID, len(missing), len(mine))
+		return nil
+	}
+	var gone []string
+	for _, token := range missing {
+		confirmed := true
+		for _, id := range c.store.MailCopyIDs(userID, strings.TrimPrefix(token, "mail_")) {
+			if trash[id] {
+				continue
+			}
+			pace(&c.lastMailGet, mailGetMinInterval)
+			_, err := c.api.GetMailMessage(userToken, id)
+			var apiErr *feishuapi.APIError
+			if !errors.As(err, &apiErr) || apiErr.Code != codeMailNotFound {
+				confirmed = false
+				break
+			}
+		}
+		if confirmed {
+			gone = append(gone, token)
+		}
+	}
+	if err := c.store.SetCheckpoint(key, strconv.FormatInt(now, 10)); err != nil {
+		log.Printf("[feishu] 记录 %s 邮件核对时间失败: %v", userID, err)
+	}
+	if len(gone) > 0 {
+		log.Printf("[feishu] %s 邮件：确认 %d 封已在飞书删除", userID, len(gone))
+	}
+	return gone
 }
 
 // mailShortID 文件名后缀：邮件 ID 去掉末尾 = 补位后的最后 8 位，区分同名附件和同主题邮件。

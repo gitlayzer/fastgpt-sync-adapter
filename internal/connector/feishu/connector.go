@@ -36,6 +36,10 @@ type Config struct {
 	SharedDiscover time.Duration `yaml:"shared_discover_interval"`
 	// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（0 = 默认 100）。
 	MailMaxPerRound int `yaml:"mail_max_per_round"`
+	// WikiEnabled 是否拉知识库（团队知识库 + 个人“我的文档库”），默认不拉：不在客户要求的范围内。
+	WikiEnabled bool `yaml:"wiki_enabled"`
+	// MinutesEnabled 是否拉妙记逐字稿，默认不拉：不在客户要求的范围内（智能纪要文档另由搜索发现，不受影响）。
+	MinutesEnabled bool `yaml:"minutes_enabled"`
 }
 
 // API 抽象（便于测试替换；feishuapi.Client 适配实现）。
@@ -352,24 +356,26 @@ func (c *Connector) scan(ctx context.Context) error {
 				}
 			}
 
-			// b) 团队知识库空间 + 个人“我的文档库”自动发现。
+			// b) 团队知识库空间 + 个人“我的文档库”自动发现（WikiEnabled 关闭时不拉，默认关闭）。
 			// 用户模式不再使用 cfg.WikiSpaceIDs：别人的个人文档库会报无权限，
 			// 被算作扫描失败后会让这个人的删除同步永远不执行。
 			spaceIDs := []string{}
-			myLib, err := c.api.GetMyLibrarySpace(g.AccessToken)
-			if err != nil {
-				log.Printf("[feishu] 取 %s 的我的文档库失败: %v", g.ExternalUserID, err)
-				userScanFailed = true
-			} else if myLib != nil && myLib.SpaceID != "" {
-				spaceIDs = append(spaceIDs, myLib.SpaceID)
-			}
-			spaces, err := c.api.ListWikiSpaces(g.AccessToken)
-			if err != nil {
-				log.Printf("[feishu] 列 %s 知识库失败: %v", g.ExternalUserID, err)
-				userScanFailed = true
-			} else {
-				for _, sp := range spaces {
-					spaceIDs = append(spaceIDs, sp.SpaceID)
+			if c.cfg.WikiEnabled {
+				myLib, err := c.api.GetMyLibrarySpace(g.AccessToken)
+				if err != nil {
+					log.Printf("[feishu] 取 %s 的我的文档库失败: %v", g.ExternalUserID, err)
+					userScanFailed = true
+				} else if myLib != nil && myLib.SpaceID != "" {
+					spaceIDs = append(spaceIDs, myLib.SpaceID)
+				}
+				spaces, err := c.api.ListWikiSpaces(g.AccessToken)
+				if err != nil {
+					log.Printf("[feishu] 列 %s 知识库失败: %v", g.ExternalUserID, err)
+					userScanFailed = true
+				} else {
+					for _, sp := range spaces {
+						spaceIDs = append(spaceIDs, sp.SpaceID)
+					}
 				}
 			}
 
@@ -446,12 +452,18 @@ func (c *Connector) scan(ctx context.Context) error {
 
 			// d) 智能纪要/妙记扫描（SearchMinutes 会翻完所有页，列表完整，可参与删除判断）。
 			// 接口失败时不算整个人扫描失败（没开通妙记的账号可能一直报错），只是本轮不判断妙记的删除。
-			minutesList, err := c.api.SearchMinutes(g.AccessToken)
-			minutesOK := err == nil
-			if err != nil {
-				log.Printf("[feishu] 取 %s 的妙记失败（本轮不判断妙记删除）: %v", g.ExternalUserID, err)
+			// MinutesEnabled 关闭时不拉（默认关闭），也不判断妙记的删除。
+			var minutesList []feishuapi.MinuteItem
+			minutesOK := false
+			if c.cfg.MinutesEnabled {
+				var err error
+				minutesList, err = c.api.SearchMinutes(g.AccessToken)
+				minutesOK = err == nil
+				if err != nil {
+					log.Printf("[feishu] 取 %s 的妙记失败（本轮不判断妙记删除）: %v", g.ExternalUserID, err)
+				}
 			}
-			if err == nil && len(minutesList) > 0 {
+			if minutesOK && len(minutesList) > 0 {
 				for _, m := range minutesList {
 					if m.MinuteToken == "" {
 						continue
@@ -478,7 +490,7 @@ func (c *Connector) scan(ctx context.Context) error {
 				log.Printf("[feishu] %s 扫描到 %d 篇智能纪要/妙记", g.ExternalUserID, len(minutesList))
 			}
 
-			// e) 邮箱：正文和附件都存。逐个文件夹翻页，已存过的跳过，没存过的取详情产出记录（不参与删除判断）。
+			// e) 邮箱：正文和附件都存。逐个文件夹翻页，已存过的跳过，没存过的取详情产出记录（删除由 verifyMailDeleted 单独判断）。
 			c.scanMail(st, g.AccessToken, g.ExternalUserID, now)
 
 			// f) 本人是所有者的文档：按周期刷新协作者列表，把协作者加进“能看到的人”。
@@ -489,7 +501,8 @@ func (c *Connector) scan(ctx context.Context) error {
 				st.failedUsers[g.ExternalUserID] = true
 				log.Printf("[feishu] 用户 %s 扫描过程存在接口错误，触发熔断保护，暂停该用户本轮删除同步", g.ExternalUserID)
 			} else {
-				st.scanned = append(st.scanned, scannedUser{id: g.ExternalUserID, seen: userSeen, minutesOK: minutesOK})
+				st.scanned = append(st.scanned, scannedUser{id: g.ExternalUserID, seen: userSeen, minutesOK: minutesOK,
+					mailGone: c.verifyMailDeleted(g.AccessToken, g.ExternalUserID, now)})
 				for t := range userSeen {
 					st.globalSeen[t] = true
 				}
@@ -812,7 +825,8 @@ func (w *wantDoc) addPerson(person, via string) {
 type scannedUser struct {
 	id        string
 	seen      map[string]bool
-	minutesOK bool // 本轮妙记列表取成功；失败时不判断妙记删除
+	minutesOK bool     // 本轮妙记列表取成功；失败时不判断妙记删除
+	mailGone  []string // 本轮确认已在飞书删除的邮件（副本 token）
 }
 
 // scanState 一轮扫描的汇总结果。
@@ -965,12 +979,15 @@ func (c *Connector) emitWrites(st *scanState) {
 }
 
 // emitDeletes 产出删除记录。只对本轮扫描完全成功的员工判断，原熔断保留：
+//
 //   - 本人看不到了、但还有别人看得到：只删本人那份（权限收回）；本人是所有者时保留
 //     （所有者的文档可能放在别人的文件夹里，本人云盘树下本来就列不到）
+//
 //   - 本轮所有扫描成功的员工都看不到了：整篇删除（所有副本），前提是持有副本的人本轮都扫描成功
+//
 //   - 协作者列表刷新后某人不在了：只删他那份
 //
-// 邮件只取最近 50 封，列表不完整，不参与删除判断。
+//   - 邮件：不走上面的判断，只删 verifyMailDeleted 确认过已删除的
 func (c *Connector) emitDeletes(st *scanState) {
 	dels := map[string]bool{}
 	del := func(cp storage.DocCopy) {
@@ -980,17 +997,25 @@ func (c *Connector) emitDeletes(st *scanState) {
 		}
 		dels[key] = true
 		id := "del_" + cp.Token + "_" + cp.PersonID
+		atts := []model.Attachment{{
+			Name:   cp.FileName,
+			FileID: cp.Token,
+			UserID: cp.PersonID,
+		}}
+		if cp.Kind == "mail" { // 一封邮件有正文和附件多个文件，副本状态只记了正文
+			for _, name := range c.store.ListMailFiles(cp.PersonID, cp.Token) {
+				if name != cp.FileName {
+					atts = append(atts, model.Attachment{Name: name, FileID: cp.Token, UserID: cp.PersonID})
+				}
+			}
+		}
 		c.pending = append(c.pending, model.Record{
-			Source:   "feishu",
-			Kind:     "delete",
-			ID:       id,
-			SenderID: cp.OwnerID,
-			OwnerIDs: []string{cp.PersonID},
-			Attachments: []model.Attachment{{
-				Name:   cp.FileName,
-				FileID: cp.Token,
-				UserID: cp.PersonID,
-			}},
+			Source:      "feishu",
+			Kind:        "delete",
+			ID:          id,
+			SenderID:    cp.OwnerID,
+			OwnerIDs:    []string{cp.PersonID},
+			Attachments: atts,
 		})
 		c.pendingMeta[id] = pendingDoc{token: cp.Token, deletePerson: cp.PersonID, isDelete: true}
 		log.Printf("[feishu] %s 的副本需删除: %s (%s)", cp.PersonID, cp.FileName, cp.Token)
@@ -1003,7 +1028,14 @@ func (c *Connector) emitDeletes(st *scanState) {
 			continue
 		}
 		var mine, missing []storage.DocCopy
+		gone := map[string]bool{}
+		for _, token := range u.mailGone {
+			gone[token] = true
+		}
 		for _, cp := range copies {
+			if gone[cp.Token] {
+				del(cp)
+			}
 			if cp.Kind == "mail" || strings.HasPrefix(cp.Token, "mail_") || (cp.Via != viaOwner && cp.Via != viaScan) {
 				continue
 			}
@@ -1085,6 +1117,11 @@ func (c *Connector) Ack(recordID string) error {
 	}
 	delete(c.pendingMeta, recordID)
 	if meta.isDelete {
+		if strings.HasPrefix(meta.token, "mail_") { // 清掉已处理记录：邮件从已删除恢复后能重新存
+			if err := c.store.DeleteMailSeen(meta.deletePerson, strings.TrimPrefix(meta.token, "mail_"), meta.token); err != nil {
+				return err
+			}
+		}
 		if err := c.store.DeleteCopy(meta.token, meta.deletePerson); err != nil {
 			return err
 		}

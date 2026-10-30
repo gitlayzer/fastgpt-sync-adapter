@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -145,7 +146,7 @@ func TestCopyMailAndMinutesNoFlapping(t *testing.T) {
 		Attachments: []feishuapi.MailAttachment{{ID: "a1", Name: "合同.pdf"}},
 	}
 	api.minutes = []feishuapi.MinuteItem{{MinuteToken: "min1", Title: "周会", OwnerID: "ou_a", CreateTime: 1700000000000}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{MinutesEnabled: true})
 
 	if got := round(t, c); len(got) != 5 {
 		t.Fatalf("首轮应产出 3 篇文档 + 1 封邮件 + 1 篇妙记，实际 %v", kinds(got))
@@ -189,7 +190,7 @@ func TestCopyForeignWikiSpaceIgnored(t *testing.T) {
 	api.roots["ut0"] = "rootA"
 	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "文档1", "ou_a", "100"), doc("d2", "文档2", "ou_a", "100"), doc("d3", "文档3", "ou_a", "100")}
 	api.walkErr["lib_of_other"] = true
-	c := newUserConn(t, st, api, Config{WikiSpaceIDs: []string{"lib_of_other"}})
+	c := newUserConn(t, st, api, Config{WikiSpaceIDs: []string{"lib_of_other"}, WikiEnabled: true})
 	round(t, c)
 
 	api.folders["rootA"] = api.folders["rootA"][:2] // 云端删掉 d3
@@ -206,7 +207,7 @@ func TestCopyTeamWikiEveryViewer(t *testing.T) {
 	api.wikiSpaces["ut0"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiSpaces["ut1"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_c"}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 
 	got := round(t, c)
 	if len(got) != 1 {
@@ -274,7 +275,7 @@ func TestCopyViewerLosesAccess(t *testing.T) {
 	api.wikiSpaces["ut0"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiSpaces["ut1"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_c"}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 	round(t, c)
 
 	api.wikiSpaces["ut1"] = nil
@@ -290,7 +291,7 @@ func TestCopyNobodySeesUnauthorizedOwnerDoc(t *testing.T) {
 	api := newCopyAPI()
 	api.wikiSpaces["ut0"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_c"}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 	round(t, c)
 
 	api.wikiNodes["team"] = nil
@@ -306,7 +307,7 @@ func TestCopyScanFailureNoDelete(t *testing.T) {
 	api := newCopyAPI()
 	api.wikiSpaces["ut0"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_c"}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 	round(t, c)
 
 	api.walkErr["team"] = true
@@ -323,7 +324,7 @@ func TestCopyMyLibraryErrorNoDelete(t *testing.T) {
 	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "文档1", "ou_a", "100"), doc("d2", "文档2", "ou_a", "100"), doc("d3", "文档3", "ou_a", "100")}
 	api.myLib["ut0"] = "mylib"
 	api.wikiNodes["mylib"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "wikidoc1", ObjType: "docx", Title: "库文档", ObjEditTime: "100", Owner: "ou_a"}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 	round(t, c)
 
 	api.myLibErr = errors.New("rate limited")
@@ -379,7 +380,7 @@ func TestCopyDocDeleteBlockedByFailedHolder(t *testing.T) {
 	api.wikiSpaces["ut1"] = []feishuapi.WikiSpace{{SpaceID: "team2"}}
 	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_c"}}
 	api.wikiNodes["team2"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_c"}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 	round(t, c)
 
 	api.wikiNodes["team"] = nil // A 看不到了
@@ -402,7 +403,7 @@ func TestCopyMinutesErrorNoDelete(t *testing.T) {
 	api.roots["ut0"] = "rootA"
 	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "文档1", "ou_a", "100")}
 	api.minutes = []feishuapi.MinuteItem{{MinuteToken: "min1", Title: "周会", OwnerID: "ou_a", CreateTime: 1700000000000}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{MinutesEnabled: true})
 	round(t, c)
 
 	api.minutes, api.minErr = nil, errors.New("rate limited")
@@ -476,7 +477,7 @@ func TestCopyInactiveOwnerKeptUntilReauth(t *testing.T) {
 	api.wikiSpaces["ut0"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiSpaces["ut1"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
 	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_a"}}
-	c := newUserConn(t, st, api, Config{})
+	c := newUserConn(t, st, api, Config{WikiEnabled: true})
 	round(t, c)
 
 	setStatus := func(status string) {
@@ -526,5 +527,47 @@ func TestCopyMailUsesListMessageID(t *testing.T) {
 	a := got[0].Attachments[1]
 	if a.FileID != "mail:msg_abcdefgh123:a1" || a.Name != "合同_defgh123.pdf" {
 		t.Fatalf("附件标识/文件名应带列表里的邮件 ID，实际 %q %q", a.FileID, a.Name)
+	}
+}
+
+// 默认（WikiEnabled 关闭）：不拉知识库（团队库、我的文档库），云盘照常；不查知识库接口，接口出错也不影响本人删除同步。
+func TestCopyWikiDisabledByDefault(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "文档1", "ou_a", "100"), doc("d2", "文档2", "ou_a", "100")}
+	api.wikiSpaces["ut0"] = []feishuapi.WikiSpace{{SpaceID: "team"}}
+	api.wikiNodes["team"] = []feishuapi.WikiNode{{Token: "n1", ObjToken: "teamdoc", ObjType: "docx", Title: "团队文档", ObjEditTime: "100", Owner: "ou_c"}}
+	api.myLib["ut0"] = "mylib"
+	api.wikiNodes["mylib"] = []feishuapi.WikiNode{{Token: "n2", ObjToken: "libdoc", ObjType: "docx", Title: "库文档", ObjEditTime: "100", Owner: "ou_a"}}
+	api.myLibErr = errors.New("不应调用我的文档库接口")
+	c := newUserConn(t, st, api, Config{})
+	got := round(t, c)
+	if fmt.Sprint(kinds(got)) != "[docx:d1 docx:d2]" {
+		t.Fatalf("只应存云盘文档，实际 %v", kinds(got))
+	}
+	api.folders["rootA"] = api.folders["rootA"][:1] // 云端删掉 d2
+	if got := round(t, c); len(got) != 1 || got[0].ID != "del_d2_ou_a" {
+		t.Fatalf("云盘删除照常同步，实际 %v", kinds(got))
+	}
+}
+
+// 默认（MinutesEnabled 关闭）：不拉妙记；之前存过的妙记副本不判断删除（留着）。
+func TestCopyMinutesDisabledByDefault(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "文档1", "ou_a", "100")}
+	api.minutes = []feishuapi.MinuteItem{{MinuteToken: "min1", Title: "周会", OwnerID: "ou_a", CreateTime: 1700000000000}}
+	if err := st.UpsertCopy(storage.DocCopy{Token: "min_old", PersonID: "ou_a", Via: viaOwner, EditTime: 1, FileName: "旧妙记.md", OwnerID: "ou_a", Kind: "minutes"}); err != nil {
+		t.Fatal(err)
+	}
+	c := newUserConn(t, st, api, Config{})
+	got := round(t, c)
+	if fmt.Sprint(kinds(got)) != "[docx:d1]" {
+		t.Fatalf("不应拉妙记、也不应删旧妙记副本，实际 %v", kinds(got))
+	}
+	if p := copyPersons(t, st, "min_old"); len(p) != 1 {
+		t.Fatalf("旧妙记副本应留着，实际 %v", p)
 	}
 }

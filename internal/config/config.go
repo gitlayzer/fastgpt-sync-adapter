@@ -112,6 +112,10 @@ type FeishuConnectorConfig struct {
 	SharedDiscover Duration `yaml:"shared_discover_interval"`
 	// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（默认 100）。邮件详情接口限 100 次/分钟，首次补历史邮件会分多轮完成。
 	MailMaxPerRound int `yaml:"mail_max_per_round"`
+	// WikiEnabled 是否拉知识库（团队知识库 + 个人“我的文档库”），默认不拉（不在客户要求的范围内）。
+	WikiEnabled bool `yaml:"wiki_enabled"`
+	// MinutesEnabled 是否拉妙记逐字稿，默认不拉（不在客户要求的范围内；智能纪要文档不受影响）。
+	MinutesEnabled bool `yaml:"minutes_enabled"`
 	// SearchKeys 显式指定的共享文档搜索关键词列表（留空则不触发搜索，避免抓入公共模板）
 	SearchKeys []string `yaml:"search_keys"`
 }

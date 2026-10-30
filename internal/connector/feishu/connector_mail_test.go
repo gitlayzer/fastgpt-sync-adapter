@@ -3,7 +3,9 @@ package feishu
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +23,7 @@ type mailAPI struct {
 	pages      map[string][][]string // 文件夹 → 每页的邮件 ID（从新到旧）
 	listErr    map[string]error
 	msgs       map[string]*feishuapi.MailMessage
+	getErr     map[string]error
 	inlineErr  error
 	listCalls  map[string]int
 	getCalls   int
@@ -32,6 +35,7 @@ func newMailAPI() *mailAPI {
 		pages:     map[string][][]string{},
 		listErr:   map[string]error{},
 		msgs:      map[string]*feishuapi.MailMessage{},
+		getErr:    map[string]error{},
 		listCalls: map[string]int{},
 	}
 }
@@ -61,6 +65,9 @@ func (m *mailAPI) ListMailboxMessages(_, folderID, pageToken string) ([]string, 
 
 func (m *mailAPI) GetMailMessage(_, msgID string) (*feishuapi.MailMessage, error) {
 	m.getCalls++
+	if err := m.getErr[msgID]; err != nil {
+		return nil, err
+	}
 	return m.msgs[msgID], nil
 }
 
@@ -201,37 +208,36 @@ func TestMailMaxPerRound(t *testing.T) {
 	}
 }
 
-// 扫哪些文件夹：收件箱、已发送、已归档 + 自建文件夹；草稿、垃圾、已删除不扫。列文件夹失败时只扫三个系统文件夹。
+// 扫哪些文件夹：收件箱、已发送 + 自建文件夹；已归档、草稿、垃圾、已删除不扫。列文件夹失败时只扫收件箱和已发送。
 func TestMailFolders(t *testing.T) {
 	st := copyStore(t, "ou_a")
 	api := newMailAPI()
 	api.folders = []feishuapi.MailFolder{
-		{ID: "INBOX", Type: 1}, {ID: "DRAFT", Type: 1}, {ID: "TRASH", Type: 1}, {ID: "SPAM", Type: 1}, {ID: "77", Type: 2, Name: "客户"},
+		{ID: "INBOX", Type: 1}, {ID: "ARCHIVED", Type: 1}, {ID: "DRAFT", Type: 1}, {ID: "TRASH", Type: 1}, {ID: "SPAM", Type: 1}, {ID: "77", Type: 2, Name: "客户"},
 	}
-	api.pages["77"] = [][]string{{"c1"}}
+	api.pages["INBOX"] = [][]string{{"i1"}}
 	api.pages["SENT"] = [][]string{{"s1"}}
-	api.addMail("c1", "客户来信")
-	api.addMail("s1", "我发的")
+	api.pages["ARCHIVED"] = [][]string{{"a1"}}
+	api.pages["77"] = [][]string{{"c1"}}
+	for _, id := range []string{"i1", "s1", "a1", "c1"} {
+		api.addMail(id, id)
+	}
 	c := newUserConn(t, st, api, Config{})
-	if got := mailRecs(round(t, c)); len(got) != 2 {
-		t.Fatalf("应存自建文件夹和已发送里的邮件，实际 %v", kinds(got))
+	got := mailRecs(round(t, c))
+	if fmt.Sprint(kinds(got)) != "[mail:mail_c1 mail:mail_i1 mail:mail_s1]" {
+		t.Fatalf("应存收件箱、已发送、自建文件夹的邮件，实际 %v", kinds(got))
 	}
-	for _, f := range []string{"INBOX", "SENT", "ARCHIVED", "77"} {
-		if api.listCalls[f] == 0 {
-			t.Fatalf("应扫文件夹 %s，调用次数 %v", f, api.listCalls)
-		}
-	}
-	for _, f := range []string{"DRAFT", "TRASH", "SPAM"} {
+	for _, f := range []string{"ARCHIVED", "DRAFT", "TRASH", "SPAM"} {
 		if api.listCalls[f] != 0 {
-			t.Fatalf("不应扫文件夹 %s", f)
+			t.Fatalf("不应扫文件夹 %s，调用次数 %v", f, api.listCalls)
 		}
 	}
 
 	api.foldersErr = errors.New("99991679 no permission")
 	api.listCalls = map[string]int{}
 	round(t, c)
-	if api.listCalls["77"] != 0 || api.listCalls["INBOX"] == 0 || api.listCalls["SENT"] == 0 || api.listCalls["ARCHIVED"] == 0 {
-		t.Fatalf("列文件夹失败时应只扫三个系统文件夹，实际 %v", api.listCalls)
+	if api.listCalls["77"] != 0 || api.listCalls["INBOX"] == 0 || api.listCalls["SENT"] == 0 {
+		t.Fatalf("列文件夹失败时应只扫收件箱和已发送，实际 %v", api.listCalls)
 	}
 }
 
@@ -376,5 +382,245 @@ func TestMailFoldersShareQuota(t *testing.T) {
 	}
 	if len(got) != 2 || !ids["mail_i4"] || !ids["mail_s1"] {
 		t.Fatalf("首轮应收件箱、已发送各处理 1 封，实际 %v", kinds(got))
+	}
+}
+
+// mailDeleteSetup 邮箱里有全部系统文件夹和一个自建文件夹，ids 都在收件箱里，已存过一轮。
+func mailDeleteSetup(t *testing.T, ids ...string) (*storage.Store, *mailAPI, *Connector) {
+	t.Helper()
+	st := copyStore(t, "ou_a")
+	api := newMailAPI()
+	for _, f := range []string{"INBOX", "SENT", "ARCHIVED", "TRASH", "DRAFT", "SPAM"} {
+		api.folders = append(api.folders, feishuapi.MailFolder{ID: f, Type: 1})
+	}
+	api.folders = append(api.folders, feishuapi.MailFolder{ID: "77", Type: 2})
+	for _, id := range ids {
+		api.pages["INBOX"] = append(api.pages["INBOX"], []string{id})
+		api.addMail(id, id)
+	}
+	c := newUserConn(t, st, api, Config{})
+	if got := mailRecs(round(t, c)); len(got) != len(ids) {
+		t.Fatalf("应先存下 %d 封，实际 %v", len(ids), kinds(got))
+	}
+	return st, api, c
+}
+
+// move 把邮件移到另一个文件夹；to 为空表示彻底删除。
+func (m *mailAPI) move(id, to string) {
+	for f, pages := range m.pages {
+		var kept [][]string
+		for _, pg := range pages {
+			var rest []string
+			for _, x := range pg {
+				if x != id {
+					rest = append(rest, x)
+				}
+			}
+			if len(rest) > 0 {
+				kept = append(kept, rest)
+			}
+		}
+		m.pages[f] = kept
+	}
+	if to != "" {
+		m.pages[to] = append(m.pages[to], []string{id})
+	}
+}
+
+func verifyDue(st *storage.Store) { st.SetCheckpoint("feishu_mail_verify:ou_a", "0") }
+
+func deleteRecs(recs []model.Record) []model.Record {
+	var out []model.Record
+	for _, r := range recs {
+		if r.Kind == "delete" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// 邮件移到已删除：正文和附件都删；从已删除恢复后重新存。
+func TestMailTrashedDeletesAllFiles(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newMailAPI()
+	api.folders = []feishuapi.MailFolder{{ID: "INBOX", Type: 1}, {ID: "TRASH", Type: 1}}
+	api.pages["INBOX"] = [][]string{{"m1"}, {"m2"}}
+	api.addMail("m1", "m1")
+	api.addMail("m2", "m2")
+	api.msgs["m1"].Attachments = []feishuapi.MailAttachment{{ID: "a1", Name: "合同.pdf"}}
+	c := newUserConn(t, st, api, Config{})
+	stored := mailRecs(round(t, c))
+	if len(stored) != 2 {
+		t.Fatalf("应存下 2 封，实际 %v", kinds(stored))
+	}
+	api.move("m1", "TRASH")
+	dels := deleteRecs(round(t, c))
+	if len(dels) != 1 || dels[0].ID != "del_mail_m1_ou_a" || len(dels[0].Attachments) != 2 {
+		t.Fatalf("应删除 m1 的正文和附件，实际 %+v", dels)
+	}
+	names := []string{dels[0].Attachments[0].Name, dels[0].Attachments[1].Name}
+	sort.Strings(names)
+	if fmt.Sprint(names) != "[2023-11-15_m1_m1.html 合同_m1.pdf]" {
+		t.Fatalf("要删的文件不对: %v", names)
+	}
+	if got := copyPersons(t, st, "mail_m1"); len(got) != 0 {
+		t.Fatalf("副本记录应清掉，实际 %v", got)
+	}
+	if st.MailSeen("ou_a", "m1") || len(st.ListMailFiles("ou_a", "mail_m1")) != 0 {
+		t.Fatalf("已处理记录和文件名记录应清掉")
+	}
+	if got := copyPersons(t, st, "mail_m2"); fmt.Sprint(got) != "[ou_a]" {
+		t.Fatalf("没删的邮件不受影响，实际 %v", got)
+	}
+
+	// 恢复的邮件回到原来的时间位置，平时翻不到那一页，由每天一次的完整核对补上
+	api.move("m1", "INBOX")
+	st.SetMailFolderScannedAt("ou_a", "INBOX", 0)
+	if got := mailRecs(round(t, c)); len(got) != 1 || got[0].ID != "mail_m1" {
+		t.Fatalf("恢复后应重新存，实际 %v", kinds(got))
+	}
+}
+
+// 彻底删除：详情接口明确返回不存在才算删除。
+func TestMailPurgedDeleted(t *testing.T) {
+	_, api, c := mailDeleteSetup(t, "m1", "m2")
+	api.move("m1", "")
+	api.getErr["m1"] = &feishuapi.APIError{Code: codeMailNotFound, Msg: "user message not found"}
+	if dels := deleteRecs(round(t, c)); len(dels) != 1 || dels[0].ID != "del_mail_m1_ou_a" {
+		t.Fatalf("彻底删除的邮件应删除，实际 %v", kinds(dels))
+	}
+}
+
+// 移到已归档、垃圾邮件、自建文件夹都不算删除，也不用查详情。
+func TestMailMovedNotDeleted(t *testing.T) {
+	_, api, c := mailDeleteSetup(t, "m1", "m2", "m3")
+	api.move("m1", "ARCHIVED")
+	api.move("m2", "SPAM")
+	api.move("m3", "77")
+	calls := api.getCalls
+	if recs := round(t, c); len(deleteRecs(recs)) != 0 || api.getCalls != calls {
+		t.Fatalf("移动不算删除，实际 %v，详情 %d → %d", kinds(recs), calls, api.getCalls)
+	}
+}
+
+// 发给自己的邮件有两份拷贝：只删一份时 NAS 不动，两份都删了才删。
+func TestMailAllCopiesMustBeGone(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newMailAPI()
+	api.folders = []feishuapi.MailFolder{{ID: "INBOX", Type: 1}, {ID: "SENT", Type: 1}, {ID: "TRASH", Type: 1}}
+	api.pages["INBOX"] = [][]string{{"i1"}}
+	api.pages["SENT"] = [][]string{{"s1"}}
+	api.addMail("i1", "同一封")
+	api.addMail("s1", "同一封")
+	api.msgs["i1"].SMTPID = "smtp-1"
+	api.msgs["s1"].SMTPID = "smtp-1"
+	c := newUserConn(t, st, api, Config{})
+	if got := mailRecs(round(t, c)); len(got) != 1 {
+		t.Fatalf("两份拷贝只存一份，实际 %v", kinds(got))
+	}
+	api.move("i1", "TRASH")
+	if dels := deleteRecs(round(t, c)); len(dels) != 0 {
+		t.Fatalf("已发送里还有一份，不应删除，实际 %v", kinds(dels))
+	}
+	api.move("s1", "TRASH")
+	verifyDue(st)
+	if dels := deleteRecs(round(t, c)); len(dels) != 1 {
+		t.Fatalf("两份都删了应删除，实际 %v", kinds(dels))
+	}
+}
+
+// 不能确认时不删：详情报其他错误、或邮件还查得到；文件夹列表失败时本轮不核对，下一轮重试。
+func TestMailDeleteNeedsConfirmation(t *testing.T) {
+	st, api, c := mailDeleteSetup(t, "m1", "m2", "m3")
+	api.move("m1", "")
+	api.getErr["m1"] = errors.New("飞书错误 code=1277001 msg=rate limit exceeded")
+	if dels := deleteRecs(round(t, c)); len(dels) != 0 {
+		t.Fatalf("详情报其他错误时不应删除，实际 %v", kinds(dels))
+	}
+	delete(api.getErr, "m1")
+	verifyDue(st)
+	if dels := deleteRecs(round(t, c)); len(dels) != 0 {
+		t.Fatalf("详情还查得到时不应删除，实际 %v", kinds(dels))
+	}
+
+	api.getErr["m1"] = &feishuapi.APIError{Code: codeMailNotFound}
+	verifyDue(st)
+	api.listErr["SENT"] = errors.New("飞书错误 code=1277001 msg=rate limit exceeded")
+	if dels := deleteRecs(round(t, c)); len(dels) != 0 {
+		t.Fatalf("文件夹列表失败时不应删除，实际 %v", kinds(dels))
+	}
+	delete(api.listErr, "SENT")
+	if dels := deleteRecs(round(t, c)); len(dels) != 1 {
+		t.Fatalf("列表恢复后下一轮应继续核对，实际 %v", kinds(dels))
+	}
+}
+
+// 疑似删除超过一半时当作接口异常，不删。
+func TestMailDeleteFuse(t *testing.T) {
+	_, api, c := mailDeleteSetup(t, "m1", "m2", "m3", "m4", "m5", "m6")
+	for _, id := range []string{"m1", "m2", "m3", "m4"} {
+		api.move(id, "TRASH")
+	}
+	if dels := deleteRecs(round(t, c)); len(dels) != 0 {
+		t.Fatalf("超过一半时应熔断，实际 %v", kinds(dels))
+	}
+}
+
+// 所有文件夹都是空的（没开通邮箱时列表接口返回空）：分不清是不是全删了，不删。
+func TestMailEmptyMailboxNotDeleted(t *testing.T) {
+	_, api, c := mailDeleteSetup(t, "m1")
+	api.move("m1", "")
+	api.getErr["m1"] = &feishuapi.APIError{Code: codeMailNotFound}
+	if dels := deleteRecs(round(t, c)); len(dels) != 0 {
+		t.Fatalf("文件夹全空时不应删除，实际 %v", kinds(dels))
+	}
+}
+
+// 每天只核对一次，不到周期不再翻已归档等文件夹。
+func TestMailVerifyDaily(t *testing.T) {
+	_, api, c := mailDeleteSetup(t, "m1")
+	round(t, c)
+	calls := api.listCalls["ARCHIVED"]
+	if calls == 0 {
+		t.Fatalf("核对时应翻已归档")
+	}
+	round(t, c)
+	if api.listCalls["ARCHIVED"] != calls {
+		t.Fatalf("不到周期不应再核对：%d → %d", calls, api.listCalls["ARCHIVED"])
+	}
+}
+
+// failRootAPI 模拟这个员工本轮云空间扫描失败。
+type failRootAPI struct {
+	*mailAPI
+	fail bool
+}
+
+func (a *failRootAPI) RootFolderMeta(tok string) (string, error) {
+	if a.fail {
+		return "", errors.New("飞书错误 code=131001 msg=rpc fail")
+	}
+	return a.mailAPI.RootFolderMeta(tok)
+}
+
+// 员工本轮扫描失败时不核对邮件删除，恢复后下一轮再核对。
+func TestMailVerifySkippedWhenScanFailed(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	inner := newMailAPI()
+	inner.folders = []feishuapi.MailFolder{{ID: "INBOX", Type: 1}, {ID: "TRASH", Type: 1}}
+	inner.pages["INBOX"] = [][]string{{"m1"}, {"m2"}}
+	inner.addMail("m1", "m1")
+	inner.addMail("m2", "m2")
+	api := &failRootAPI{mailAPI: inner}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	inner.move("m1", "TRASH")
+	api.fail = true
+	if dels := deleteRecs(round(t, c)); len(dels) != 0 {
+		t.Fatalf("扫描失败时不应删除，实际 %v", kinds(dels))
+	}
+	api.fail = false
+	if dels := deleteRecs(round(t, c)); len(dels) != 1 {
+		t.Fatalf("恢复后应继续核对，实际 %v", kinds(dels))
 	}
 }

@@ -416,6 +416,58 @@ func TestMailSeen(t *testing.T) {
 }
 
 // 死信表：同一 (source, record_id) 只保留一条，重复写入更新 record/last_error。
+// 旧库没有 feishu_mail_file 表：打开时自动建表，能写能读。
+func TestMigrateAddsMailFileTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE feishu_mail_file`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("旧库重新打开: %v", err)
+	}
+	defer s.Close()
+	if err := s.AddMailFiles("p1", "mail_m1", []string{"a.html", "b.pdf", "a.html"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListMailFiles("p1", "mail_m1"); len(got) != 2 || got[0] != "a.html" || got[1] != "b.pdf" {
+		t.Fatalf("文件名记录不符: %v", got)
+	}
+}
+
+func TestMailDeleteRecords(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.AddMailSeen("p1", "i1", "smtp1")
+	s.AddMailSeen("p1", "s1", "smtp1")
+	s.AddMailSeen("p1", "x1", "")
+	s.AddMailSeen("p2", "i1", "smtp1")
+	s.AddMailFiles("p1", "mail_i1", []string{"a.html"})
+	if got := s.MailCopyIDs("p1", "i1"); len(got) != 2 {
+		t.Fatalf("同一封邮件应有两份拷贝，实际 %v", got)
+	}
+	if got := s.MailCopyIDs("p1", "x1"); len(got) != 1 {
+		t.Fatalf("没有 RFC 邮件 ID 时只有自己，实际 %v", got)
+	}
+	if err := s.DeleteMailSeen("p1", "i1", "mail_i1"); err != nil {
+		t.Fatal(err)
+	}
+	if s.MailSeen("p1", "i1") || s.MailSeen("p1", "s1") || len(s.ListMailFiles("p1", "mail_i1")) != 0 {
+		t.Fatalf("两份拷贝的记录都应清掉")
+	}
+	if !s.MailSeen("p1", "x1") || !s.MailSeen("p2", "i1") {
+		t.Fatalf("其他邮件和其他员工的记录不受影响")
+	}
+}
+
 func TestDeadLetter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dead.db")
 	s, err := Open(path)

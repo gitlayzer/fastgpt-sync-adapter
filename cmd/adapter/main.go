@@ -208,6 +208,8 @@ func main() {
 			WikiSpaceIDs: fc.WikiSpaceIDs, CollabRefresh: fc.CollabRefresh.D(),
 			SharedDiscover:  fc.SharedDiscover.D(),
 			MailMaxPerRound: fc.MailMaxPerRound,
+			WikiEnabled:     fc.WikiEnabled,
+			MinutesEnabled:  fc.MinutesEnabled,
 			SearchKeys:      fc.SearchKeys,
 		}, st)
 		eng.AddConnector(engine.ConnectorJob{
