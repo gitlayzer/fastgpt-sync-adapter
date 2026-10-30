@@ -32,9 +32,9 @@ type Config struct {
 
 // Connector 企微会话存档连接器。
 type Connector struct {
-	cfg     Config
-	arch    *Archiver
-	sdk     SDK
+	cfg      Config
+	arch     *Archiver
+	sdk      SDK
 	startSeq int64 // checkpoint 为空时的起始 seq（默认 0=从最早可得的拉）
 }
 

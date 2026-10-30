@@ -22,19 +22,27 @@ type Msg struct {
 	MsgTime int64    `json:"msgtime"` // 毫秒
 	MsgType string   `json:"msgtype"`
 
-	Text     *struct{ Content string `json:"content"` }     `json:"text"`
-	Markdown *struct{ Content string `json:"content"` }     `json:"markdown"`
-	Image    *struct{ SDKFileID string `json:"sdkfileid"` }   `json:"image"`
-	File     *struct {
+	Text *struct {
+		Content string `json:"content"`
+	} `json:"text"`
+	Markdown *struct {
+		Content string `json:"content"`
+	} `json:"markdown"`
+	Image *struct {
+		SDKFileID string `json:"sdkfileid"`
+	} `json:"image"`
+	File *struct {
 		SDKFileID string `json:"sdkfileid"`
 		FileName  string `json:"filename"`
 		FileSize  int64  `json:"filesize"`
 	} `json:"file"`
-	Voice   *struct {
+	Voice *struct {
 		SDKFileID string `json:"sdkfileid"`
 		VoiceSize int64  `json:"voice_size"`
 	} `json:"voice"`
-	Video   *struct{ SDKFileID string `json:"sdkfileid"` } `json:"video"`
+	Video *struct {
+		SDKFileID string `json:"sdkfileid"`
+	} `json:"video"`
 	Emotion *struct {
 		SDKFileID string `json:"sdkfileid"`
 		Type      int    `json:"type"`
@@ -52,31 +60,35 @@ type Msg struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 	} `json:"weapp"`
-		Card *struct {
-			CorpName string `json:"corpname"`
-			UserID   string `json:"userid"`
-		} `json:"card"`
-		Todo *struct{ Title string `json:"title"` } `json:"todo"`
-		Vote *struct{ Title string `json:"title"` } `json:"vote"`
-		ChatRecord *struct {
-			Title string           `json:"title"`
-			Item  []ChatRecordItem `json:"item"`
-		} `json:"chatrecord"`
-		Mixed *struct {
-			Item []struct {
-				Type    string `json:"type"`
-				Content string `json:"content"`
-			} `json:"item"`
-		} `json:"mixed"`
-	}
+	Card *struct {
+		CorpName string `json:"corpname"`
+		UserID   string `json:"userid"`
+	} `json:"card"`
+	Todo *struct {
+		Title string `json:"title"`
+	} `json:"todo"`
+	Vote *struct {
+		Title string `json:"title"`
+	} `json:"vote"`
+	ChatRecord *struct {
+		Title string           `json:"title"`
+		Item  []ChatRecordItem `json:"item"`
+	} `json:"chatrecord"`
+	Mixed *struct {
+		Item []struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		} `json:"item"`
+	} `json:"mixed"`
+}
 
-	// ChatRecordItem 企微合并转发消息中的子项。
-	type ChatRecordItem struct {
-		Type         string `json:"type"`
-		MsgTime      int64  `json:"msgtime"`
-		Content      string `json:"content"`
-		FromChatroom bool   `json:"from_chatroom"`
-	}
+// ChatRecordItem 企微合并转发消息中的子项。
+type ChatRecordItem struct {
+	Type         string `json:"type"`
+	MsgTime      int64  `json:"msgtime"`
+	Content      string `json:"content"`
+	FromChatroom bool   `json:"from_chatroom"`
+}
 
 // Parse 解析消息原始 JSON。
 func Parse(raw json.RawMessage) (*Msg, error) {
@@ -177,15 +189,15 @@ func (m *Msg) contentText() string {
 		//      —— 直接写进会话文件会变成一堆 <!DOCTYPE html> 和 base64 乱码
 		// 这里检测到 HTML 就剥离标签只留文本，base64 图片替换成占位符。
 		return sanitizeMarkdown(m.Markdown.Content)
-		case m.Image != nil:
-			if m.MsgID != "" {
-				dateFolder := time.UnixMilli(m.MsgTime).Format("2006-01-02")
-				if dateFolder == "" || m.MsgTime <= 0 {
-					dateFolder = time.Now().Format("2006-01-02")
-				}
-				return fmt.Sprintf("![图片](images/%s/image_%s.jpg)", dateFolder, m.MsgID)
+	case m.Image != nil:
+		if m.MsgID != "" {
+			dateFolder := time.UnixMilli(m.MsgTime).Format("2006-01-02")
+			if dateFolder == "" || m.MsgTime <= 0 {
+				dateFolder = time.Now().Format("2006-01-02")
 			}
-			return "[图片]"
+			return fmt.Sprintf("![图片](images/%s/image_%s.jpg)", dateFolder, m.MsgID)
+		}
+		return "[图片]"
 	case m.File != nil:
 		name := m.File.FileName
 		if name == "" {
