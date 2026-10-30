@@ -1050,7 +1050,7 @@ func (c *Connector) refreshCollaborators(st *scanState, userToken string, owned 
 				fresh := map[string]bool{}
 				members = members[:0]
 				for _, m := range items {
-					if m.MemberType == "openid" && st.holders[m.MemberID] { // 协作者也只算纳管且已授权的
+					if m.MemberType == "openid" && m.MemberID != "" {
 						fresh[m.MemberID] = true
 						members = append(members, m.MemberID)
 					}
@@ -1246,7 +1246,7 @@ func (c *Connector) emitDeletes(st *scanState) {
 	for token, fresh := range st.collabFresh {
 		if copies, err := c.store.ListCopies(token); err == nil {
 			for _, cp := range copies {
-				if cp.Via == viaCollab && !fresh[cp.PersonID] && !st.inactiveUsers[cp.PersonID] {
+				if cp.Via == viaCollab && !fresh[cp.PersonID] {
 					del(cp)
 				}
 			}

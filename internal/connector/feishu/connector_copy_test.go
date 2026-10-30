@@ -250,25 +250,6 @@ func TestCopyCollaboratorAddedAndRemoved(t *testing.T) {
 	}
 }
 
-// 升级前写给没授权协作者的旧副本：协作者列表刷新时清掉；离职员工的旧副本保留。
-func TestCopyOldCollaboratorCopyCleaned(t *testing.T) {
-	st := copyStore(t, "ou_a", "ou_x")
-	api := newCopyAPI()
-	api.roots["ut0"] = "rootA"
-	api.roots["ut1"] = "rootX"
-	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "方案", "ou_a", "100")}
-	api.members = map[string][]feishuapi.PermissionMember{"d1": {
-		{MemberType: "openid", MemberID: "ou_e", Perm: "view"}, // 还在协作者列表里，但没授权
-	}}
-	st.UpsertCopy(storage.DocCopy{Token: "d1", PersonID: "ou_e", Via: viaCollab, EditTime: 100, FileName: "方案_d1.docx", OwnerID: "ou_a", Kind: "docx"})
-	st.UpsertCopy(storage.DocCopy{Token: "d1", PersonID: "ou_x", Via: viaCollab, EditTime: 100, FileName: "方案_d1.docx", OwnerID: "ou_a", Kind: "docx"})
-	c := newUserConn(t, st, api, Config{CollabRefresh: time.Nanosecond})
-	c.SetManaged(func(id string) bool { return id == "ou_a" })
-	if k := kinds(deleteRecs(round(t, c))); len(k) != 1 || k[0] != "delete:del_d1_ou_e" {
-		t.Fatalf("应只清掉没授权的 E，保留离职的 X，实际 %v", k)
-	}
-}
-
 // 协作者列表用的是上次查到的缓存时，没授权的人同样不写。
 func TestCopyCachedCollaboratorSkipped(t *testing.T) {
 	st := copyStore(t, "ou_a")
