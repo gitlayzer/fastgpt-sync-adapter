@@ -172,15 +172,15 @@ func TestTenantScanAndChangeDetection(t *testing.T) {
 	for i, r := range recs {
 		byID[r.ID] = i
 	}
-		docRec := recs[byID["docx1"]]
-		// docx 走导出，归档名是 .docx（源文件），末尾带唯一 token 避免同名覆盖
-		if docRec.Attachments[0].FileID != "docx:docx1" || docRec.Attachments[0].Name != "产品方案_docx1.docx" {
-			t.Fatalf("docx 附件映射不对: %+v", docRec.Attachments[0])
-		}
-		fileRec := recs[byID["f1"]]
-		if fileRec.Attachments[0].FileID != "file:f1" || fileRec.Attachments[0].Name != "采购合同_f1.pdf" {
-			t.Fatalf("file 附件映射不对: %+v", fileRec.Attachments[0])
-		}
+	docRec := recs[byID["docx1"]]
+	// docx 走导出，归档名是 .docx（源文件），末尾带唯一 token 避免同名覆盖
+	if docRec.Attachments[0].FileID != "docx:docx1" || docRec.Attachments[0].Name != "产品方案_docx1.docx" {
+		t.Fatalf("docx 附件映射不对: %+v", docRec.Attachments[0])
+	}
+	fileRec := recs[byID["f1"]]
+	if fileRec.Attachments[0].FileID != "file:f1" || fileRec.Attachments[0].Name != "采购合同_f1.pdf" {
+		t.Fatalf("file 附件映射不对: %+v", fileRec.Attachments[0])
+	}
 
 	// 附件拉取
 	rc, err := c.FetchAttachment(context.Background(), &docRec.Attachments[0])
@@ -295,26 +295,26 @@ func TestUserModeWikiOnly(t *testing.T) {
 	if byID["doccn1"].Attachments[0].FileID != "docx:doccn1" {
 		t.Fatalf("docx 附件标识错误: %s", byID["doccn1"].Attachments[0].FileID)
 	}
-		// sheet 归档名应为 .xlsx 且带唯一 token 短码防同名覆盖
-		if got := byID["sht1"].Attachments[0].Name; got != "员工名册_sht1.xlsx" {
-			t.Fatalf("sheet 归档名应为 员工名册_sht1.xlsx，实际 %q", got)
-		}
-		// file 应带唯一 token 短码防同名覆盖
-		if got := byID["pdf1"].Attachments[0].Name; got != "迁移文档_pdf1.pdf" {
-			t.Fatalf("file 归档名应为 迁移文档_pdf1.pdf，实际 %q", got)
-		}
+	// sheet 归档名应为 .xlsx 且带唯一 token 短码防同名覆盖
+	if got := byID["sht1"].Attachments[0].Name; got != "员工名册_sht1.xlsx" {
+		t.Fatalf("sheet 归档名应为 员工名册_sht1.xlsx，实际 %q", got)
+	}
+	// file 应带唯一 token 短码防同名覆盖
+	if got := byID["pdf1"].Attachments[0].Name; got != "迁移文档_pdf1.pdf" {
+		t.Fatalf("file 归档名应为 迁移文档_pdf1.pdf，实际 %q", got)
+	}
 
-		// 第二轮应无新增（Ack 之后 doc_state 才记录）
-		for _, r := range recs {
-			if err := c.Ack(r.ID); err != nil {
-				t.Fatal(err)
-			}
-		}
-		recs2, _, err := c.Fetch(context.Background(), "", 10)
-		if err != nil || len(recs2) != 0 {
-			t.Fatalf("第二轮应无新数据: n=%d err=%v", len(recs2), err)
+	// 第二轮应无新增（Ack 之后 doc_state 才记录）
+	for _, r := range recs {
+		if err := c.Ack(r.ID); err != nil {
+			t.Fatal(err)
 		}
 	}
+	recs2, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil || len(recs2) != 0 {
+		t.Fatalf("第二轮应无新数据: n=%d err=%v", len(recs2), err)
+	}
+}
 
 func TestFeishuCloudDeleteEmitsDeleteRecord(t *testing.T) {
 	st, _ := storage.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -374,7 +374,6 @@ func TestFeishuCloudDeleteEmitsDeleteRecord(t *testing.T) {
 	}
 }
 
-
 // TestNotAckedMeansRetry 验证幂等性的关键语义：
 // 没有 Ack 的记录（模拟写入 Sink 失败）下一轮必须重新产出，
 // 否则数据会静默丢失。
@@ -415,15 +414,15 @@ func TestNotAckedMeansRetry(t *testing.T) {
 		t.Fatalf("未 Ack 的记录应重新产出, 实际 n=%d", len(recs2))
 	}
 
-		// Ack 之后不再产出
-		if err := c.Ack("doc1"); err != nil {
-			t.Fatal(err)
-		}
-		recs3, _, err := c.Fetch(context.Background(), "", 10)
-		if err != nil || len(recs3) != 0 {
-			t.Fatalf("Ack 后应无产出, 实际 n=%d err=%v", len(recs3), err)
-		}
+	// Ack 之后不再产出
+	if err := c.Ack("doc1"); err != nil {
+		t.Fatal(err)
 	}
+	recs3, _, err := c.Fetch(context.Background(), "", 10)
+	if err != nil || len(recs3) != 0 {
+		t.Fatalf("Ack 后应无产出, 实际 n=%d err=%v", len(recs3), err)
+	}
+}
 
 type mockSearchAPI struct {
 	*mockAPI
@@ -627,5 +626,3 @@ func TestMailAttachmentsSync(t *testing.T) {
 		t.Fatalf("下载内容不符合预期: %s", string(data))
 	}
 }
-
-

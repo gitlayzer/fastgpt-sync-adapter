@@ -23,9 +23,9 @@ type Client struct {
 	HTTP      *http.Client
 
 	// 解析参数（对应 FastGPT web 界面的上传选项）
-	ImageIndex     bool // 图片索引（图片向量化）
-	AutoIndexes    bool // 自动生成索引
-	CustomPdfParse bool // 自定义 PDF 解析（需服务端配置解析服务）
+	ImageIndex       bool // 图片索引（图片向量化）
+	AutoIndexes      bool // 自动生成索引
+	CustomPdfParse   bool // 自定义 PDF 解析（需服务端配置解析服务）
 	IndexPrefixTitle bool // 索引前缀标题
 	// Tags 上传时打的标签（FastGPT 源码确认 create/localFile 支持；元素为字符串或 {"tag","value"} 对象）
 	Tags []any
