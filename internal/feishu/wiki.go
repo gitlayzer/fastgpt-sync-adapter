@@ -14,30 +14,30 @@ import (
 
 // WikiSpace 知识库空间。
 type WikiSpace struct {
-	SpaceID   string `json:"space_id"`
-	Name      string `json:"name"`
-	SpaceType string `json:"space_type"` // team / person
+	SpaceID    string `json:"space_id"`
+	Name       string `json:"name"`
+	SpaceType  string `json:"space_type"` // team / person
 	Visibility string `json:"visibility"`
 }
 
 // WikiNode 知识库节点（文档或子目录）。
 type WikiNode struct {
-	Token      string `json:"node_token"`  // 节点 token（遍历子节点用）
-	ObjToken   string `json:"obj_token"`   // 实际文档 token（下载内容用）
-	ObjType    string `json:"obj_type"`    // doc/docx/sheet/bitable/file/slides/mindnote
+	Token      string `json:"node_token"` // 节点 token（遍历子节点用）
+	ObjToken   string `json:"obj_token"`  // 实际文档 token（下载内容用）
+	ObjType    string `json:"obj_type"`   // doc/docx/sheet/bitable/file/slides/mindnote
 	Title      string `json:"title"`
 	ParentNode string `json:"parent_node_token"`
 	HasChild   bool   `json:"has_child"`
 	NodeType   string `json:"node_type"` // origin / shortcut
 
-		// 节点与内容时间：obj_edit_time 为飞书服务端真实返回的文档修改时间
-		NodeCreateTime string `json:"node_create_time"`
-		NodeEditTime   string `json:"node_edit_time"`
-		ObjCreateTime  string `json:"obj_create_time"`
-		ObjEditTime    string `json:"obj_edit_time"` // 关键：飞书实际返回的文档内容更新时间
-		Creator        string `json:"creator"`       // 节点创建人（open_id）
-		Owner          string `json:"owner"`         // 节点归属人（open_id）
-	}
+	// 节点与内容时间：obj_edit_time 为飞书服务端真实返回的文档修改时间
+	NodeCreateTime string `json:"node_create_time"`
+	NodeEditTime   string `json:"node_edit_time"`
+	ObjCreateTime  string `json:"obj_create_time"`
+	ObjEditTime    string `json:"obj_edit_time"` // 关键：飞书实际返回的文档内容更新时间
+	Creator        string `json:"creator"`       // 节点创建人（open_id）
+	Owner          string `json:"owner"`         // 节点归属人（open_id）
+}
 
 // ListWikiSpaces 列出调用者可访问的知识库空间（自动翻页）。
 func (c *Client) ListWikiSpaces(token string) ([]WikiSpace, error) {

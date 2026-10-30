@@ -229,11 +229,15 @@ func (c *Client) TenantAccessToken() (string, error) {
 // wiki:wiki:readonly          知识库节点（「我的文档库」归属 wiki 体系）
 // docx:document:readonly      新版文档正文（docx/v1/documents/{id}/raw_content）
 // space:document:retrieve     用户云空间文件夹下的云文档清单
-//                             —— drive/v1/files 在个人云空间上实测还额外要求它，
-//                             仅有 drive:drive 时接口返回 code=0 但列表为空
+//
+//	—— drive/v1/files 在个人云空间上实测还额外要求它，
+//	仅有 drive:drive 时接口返回 code=0 但列表为空
+//
 // drive:export:readonly       导出云文档为源文件（docx/xlsx）
-//                             —— 缺它时 export_tasks 报 99991679；
-//                             drive:drive 不覆盖导出，必须单独申请
+//
+//	—— 缺它时 export_tasks 报 99991679；
+//	drive:drive 不覆盖导出，必须单独申请
+//
 // contact:user.employee_id:readonly  user_id_type=user_id 时取 owner_id 需要
 // search:docs:read            云文档搜索
 // auth:user.id:read           识别授权人身份
@@ -289,11 +293,11 @@ func (c *Client) ExchangeCode(code, redirectURI string) (*UserTokenResp, error) 
 		UserTokenResp
 	}
 	err := c.post("/authen/v2/oauth/token", map[string]string{
-		"grant_type":   "authorization_code",
-		"client_id":    c.AppID,
+		"grant_type":    "authorization_code",
+		"client_id":     c.AppID,
 		"client_secret": c.AppSecret,
-		"code":         code,
-		"redirect_uri": redirectURI,
+		"code":          code,
+		"redirect_uri":  redirectURI,
 	}, &out)
 	if err != nil {
 		return nil, err

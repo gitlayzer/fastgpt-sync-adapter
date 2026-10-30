@@ -16,8 +16,8 @@ import (
 // Crypto 企业微信会话内容存档的加解密。
 //
 // 企微加密流程（每条消息）：
-//   1. encrypt_random_key：用企业 RSA 公钥加密的「随机会话密钥」，企业用 RSA 私钥解密得到会话密钥
-//   2. encrypt_chat_msg：用会话密钥（AES-GCM）加密的消息体
+//  1. encrypt_random_key：用企业 RSA 公钥加密的「随机会话密钥」，企业用 RSA 私钥解密得到会话密钥
+//  2. encrypt_chat_msg：用会话密钥（AES-GCM）加密的消息体
 type Crypto struct {
 	privateKey *rsa.PrivateKey
 }

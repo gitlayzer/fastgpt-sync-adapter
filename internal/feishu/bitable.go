@@ -135,4 +135,3 @@ func FieldUser(v interface{}) (id, name string) {
 	}
 	return id, name
 }
-

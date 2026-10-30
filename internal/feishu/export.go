@@ -1,13 +1,14 @@
 // 飞书云文档导出：把 docx/doc/sheet/bitable 导出成源文件（.docx/.xlsx）。
 //
 // 为什么用导出而不是 raw_content：
-//   raw_content 只返回纯文本，会丢掉图片、表格样式、内嵌附件。
-//   导出得到的是完整源文件，可原样归档，不丢内容。
+//
+//	raw_content 只返回纯文本，会丢掉图片、表格样式、内嵌附件。
+//	导出得到的是完整源文件，可原样归档，不丢内容。
 //
 // 导出是异步三步：
-//   1. POST /drive/v1/export_tasks          创建任务，拿 ticket
-//   2. GET  /drive/v1/export_tasks/{ticket} 轮询，job_status=0 表示完成，拿 file_token
-//   3. GET  /drive/v1/export_tasks/file/{file_token}/download  下载字节流
+//  1. POST /drive/v1/export_tasks          创建任务，拿 ticket
+//  2. GET  /drive/v1/export_tasks/{ticket} 轮询，job_status=0 表示完成，拿 file_token
+//  3. GET  /drive/v1/export_tasks/file/{file_token}/download  下载字节流
 package feishu
 
 import (
@@ -20,10 +21,10 @@ import (
 
 // 导出任务状态：0 成功，1 初始化，2 处理中，3 失败
 const (
-	exportStatusDone  = 0
-	exportStatusFail  = 3
-	exportPollTimes   = 60                      // 最多轮询次数（120秒，适应大表格导出）
-	exportPollEvery   = 2 * time.Second         // 轮询间隔
+	exportStatusDone = 0
+	exportStatusFail = 3
+	exportPollTimes  = 60              // 最多轮询次数（120秒，适应大表格导出）
+	exportPollEvery  = 2 * time.Second // 轮询间隔
 )
 
 // ExportFile 创建导出任务并等待完成，返回可下载的 file_token。
@@ -61,9 +62,9 @@ func (c *Client) ExportFile(tok, token, docType string) (string, error) {
 			apiResp
 			Data struct {
 				Result struct {
-					JobStatus  int    `json:"job_status"`
-					JobError   string `json:"job_error_msg"`
-					FileToken  string `json:"file_token"`
+					JobStatus int    `json:"job_status"`
+					JobError  string `json:"job_error_msg"`
+					FileToken string `json:"file_token"`
 				} `json:"result"`
 			} `json:"data"`
 		}

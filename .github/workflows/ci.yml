@@ -91,54 +91,28 @@ jobs:
       - name: go mod verify
         run: go mod verify
 
-  # 只检查本次改动涉及的 .go 文件是否 gofmt 干净
+  # 所有被跟踪的 .go 文件都必须 gofmt 干净
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: gofmt check (changed files)
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          BEFORE: ${{ github.event.before }}
+      - name: gofmt check
         run: |
-          if [ "$EVENT" = "pull_request" ]; then
-            base="origin/$BASE_REF"
-          else
-            base="$BEFORE"
-          fi
-          # 新分支首次 push 时 before 全是 0：base 不可用就退回上一个提交，再不行就查全部 .go 文件
-          if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
-            if git rev-parse --verify --quiet 'HEAD~1^{commit}' >/dev/null; then base=HEAD~1; else base=; fi
-          fi
-          changed="$RUNNER_TEMP/changed-go-files"
-          if [ -n "$base" ]; then
-            git diff --name-only --diff-filter=ACMR "$base...HEAD" -- '*.go' >"$changed"
-          else
-            git ls-files -- '*.go' >"$changed"
-          fi
-          bad=0; n=0
-          # 逐行读，文件名含空格也不会被拆开
-          while IFS= read -r f; do
-            [ -f "$f" ] || continue
-            n=$((n + 1))
-            out=$(gofmt -l -- "$f")
-            if [ -n "$out" ]; then
+          unformatted=$(git ls-files -z -- '*.go' | xargs -0 gofmt -l --)
+          if [ -n "$unformatted" ]; then
+            while IFS= read -r f; do
               echo "::error file=$f::未格式化，请执行 gofmt -w \"$f\" 后提交"
-              bad=1
-            fi
-          done <"$changed"
-          [ "$bad" -eq 0 ] || exit 1
-          echo "gofmt: OK ($n files)"
+            done <<<"$unformatted"
+            exit 1
+          fi
+          echo "gofmt: OK"
 
   # 禁止提交的敏感文件 + 密钥扫描
   secrets:
