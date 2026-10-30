@@ -202,10 +202,13 @@ func TestMailMaxPerRound(t *testing.T) {
 	}
 }
 
-// 扫哪些文件夹：只扫收件箱、已发送；已归档、自建文件夹、草稿、垃圾、已删除都不扫，也不再列文件夹。
+// 扫哪些文件夹：收件箱、已发送 + 自建文件夹；已归档、草稿、垃圾、已删除不扫。列文件夹失败时只扫收件箱和已发送。
 func TestMailFolders(t *testing.T) {
 	st := copyStore(t, "ou_a")
 	api := newMailAPI()
+	api.folders = []feishuapi.MailFolder{
+		{ID: "INBOX", Type: 1}, {ID: "ARCHIVED", Type: 1}, {ID: "DRAFT", Type: 1}, {ID: "TRASH", Type: 1}, {ID: "SPAM", Type: 1}, {ID: "77", Type: 2, Name: "客户"},
+	}
 	api.pages["INBOX"] = [][]string{{"i1"}}
 	api.pages["SENT"] = [][]string{{"s1"}}
 	api.pages["ARCHIVED"] = [][]string{{"a1"}}
@@ -215,13 +218,20 @@ func TestMailFolders(t *testing.T) {
 	}
 	c := newUserConn(t, st, api, Config{})
 	got := mailRecs(round(t, c))
-	if fmt.Sprint(kinds(got)) != "[mail:mail_i1 mail:mail_s1]" {
-		t.Fatalf("应只存收件箱和已发送的邮件，实际 %v", kinds(got))
+	if fmt.Sprint(kinds(got)) != "[mail:mail_c1 mail:mail_i1 mail:mail_s1]" {
+		t.Fatalf("应存收件箱、已发送、自建文件夹的邮件，实际 %v", kinds(got))
 	}
-	for _, f := range []string{"ARCHIVED", "77", "DRAFT", "TRASH", "SPAM"} {
+	for _, f := range []string{"ARCHIVED", "DRAFT", "TRASH", "SPAM"} {
 		if api.listCalls[f] != 0 {
 			t.Fatalf("不应扫文件夹 %s，调用次数 %v", f, api.listCalls)
 		}
+	}
+
+	api.foldersErr = errors.New("99991679 no permission")
+	api.listCalls = map[string]int{}
+	round(t, c)
+	if api.listCalls["77"] != 0 || api.listCalls["INBOX"] == 0 || api.listCalls["SENT"] == 0 {
+		t.Fatalf("列文件夹失败时应只扫收件箱和已发送，实际 %v", api.listCalls)
 	}
 }
 

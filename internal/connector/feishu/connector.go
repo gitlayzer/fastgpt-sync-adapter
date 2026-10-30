@@ -77,6 +77,7 @@ type API interface {
 	DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error)
 
 	// 邮箱邮件与附件接口
+	ListMailFolders(userToken string) ([]feishuapi.MailFolder, error)
 	ListMailboxMessages(userToken, folderID, pageToken string) ([]string, string, bool, error)
 	GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error)
 	DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error)

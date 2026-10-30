@@ -23,14 +23,15 @@ const (
 	// 已补齐的文件夹平时只翻到“整页都存过”为止；每天完整翻一遍，兜住移进旧位置的邮件。
 	mailFullScanEvery = int64(24 * 3600)
 	// 列邮件 10 次/秒、邮件详情 100 次/分钟、附件下载链接 1 次/秒（官方文档）。
-	mailListMinInterval = 100 * time.Millisecond
-	mailGetMinInterval  = 600 * time.Millisecond
-	mailURLMinInterval  = time.Second
+	mailListMinInterval   = 100 * time.Millisecond
+	mailFolderMinInterval = 200 * time.Millisecond // 文件夹列表 5 次/秒
+	mailGetMinInterval    = 600 * time.Millisecond
+	mailURLMinInterval    = time.Second
 	// 正文文件名里的主题最多保留的字数，避免文件名过长。
 	mailSubjectMaxRunes = 60
 )
 
-// 要存的文件夹：收件箱、已发送（客户要求的范围）；已归档、自建文件夹、草稿箱、垃圾邮件、已删除不存。
+// 要存的系统文件夹：收件箱、已发送（客户要求的范围）；已归档、草稿箱、垃圾邮件、已删除不存。用户自建文件夹另外从文件夹列表里取。
 var mailSystemFolders = []string{"INBOX", "SENT"}
 
 // mailTZ 邮件时间统一按北京时间显示和命名（服务器容器里一般是 UTC）。
@@ -52,7 +53,7 @@ func (c *Connector) scanMail(st *scanState, userToken, userID string, now int64)
 	}
 	var perFolder [][]string // 每个文件夹里没处理过的邮件，从新到旧
 	queued := map[string]bool{}
-	for _, folder := range mailSystemFolders {
+	for _, folder := range c.mailFolders(userToken, userID) {
 		full := now-c.store.MailFolderScannedAt(userID, folder) >= mailFullScanEvery
 		var list []string
 		pageToken, unknown, complete := "", 0, false
@@ -172,6 +173,24 @@ func (c *Connector) ackMail(recordID, personID string) error {
 	delete(c.mailPending, recordID)
 	c.mailMu.Unlock()
 	return nil
+}
+
+// mailFolders 要扫的文件夹：收件箱、已发送 + 用户自建文件夹。
+// 列文件夹失败（旧授权没有 mail:user_mailbox.folder:read）时只扫收件箱和已发送。
+func (c *Connector) mailFolders(userToken, userID string) []string {
+	out := append([]string(nil), mailSystemFolders...)
+	pace(&c.lastMailList, mailFolderMinInterval)
+	folders, err := c.api.ListMailFolders(userToken)
+	if err != nil {
+		log.Printf("[feishu] 列 %s 邮箱文件夹失败（本轮只扫收件箱、已发送）: %v", userID, err)
+		return out
+	}
+	for _, f := range folders {
+		if f.Type == 2 && f.ID != "" {
+			out = append(out, f.ID)
+		}
+	}
+	return out
 }
 
 // mailShortID 文件名后缀：邮件 ID 去掉末尾 = 补位后的最后 8 位，区分同名附件和同主题邮件。

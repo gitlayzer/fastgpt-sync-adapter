@@ -37,6 +37,7 @@ func TestAuthorizeURL(t *testing.T) {
 			"auth%3Auser.id%3Aread",
 			"mail%3Auser_mailbox.message%3Areadonly",
 			"mail%3Auser_mailbox.message.body%3Aread",
+			"mail%3Auser_mailbox.folder%3Aread",
 			"minutes%3Aminutes",
 			"minutes%3Aminutes.search%3Aread",
 			"minutes%3Aminutes.transcript%3Aexport",
