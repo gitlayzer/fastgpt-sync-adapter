@@ -178,11 +178,10 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:v8.21.2 git --redact -v /repo
 
-  # 漏洞扫描（信息性，不阻塞合并）
+  # 漏洞扫描（信息性，不阻塞合并：step 级 continue-on-error，job 保持绿色，结果看 warning）
   vuln:
     name: vuln
     runs-on: ubuntu-24.04
-    continue-on-error: true
     env:
       CGO_ENABLED: "0"
     steps:
@@ -194,4 +193,7 @@ jobs:
           cache: true
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        run: |
+          if ! go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...; then
+            echo "::warning::govulncheck 发现漏洞（不阻塞合并），详见本步骤日志"
+          fi
