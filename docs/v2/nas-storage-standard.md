@@ -69,7 +69,7 @@
     │   ├── 我参与的/<YYYY-MM>/...
     │   └── 与我共享/<YYYY-MM>/...
     └── 邮件/
-        ├── 收件箱/<YYYY-MM>/<YYYYMMDD-HHMMSS>_<主题>/   # 收到的邮件（含已归档、自建文件夹里的）
+        ├── 收件箱/<YYYY-MM>/<YYYYMMDD-HHMMSS>_<主题>/   # 收到的邮件
         │   ├── 正文.html
         │   └── <附件原文件名>
         └── 已发送/<YYYY-MM>/<YYYYMMDD-HHMMSS>_<主题>/   # 本人发出的邮件，结构同上

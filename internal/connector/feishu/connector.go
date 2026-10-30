@@ -36,6 +36,10 @@ type Config struct {
 	SharedDiscover time.Duration `yaml:"shared_discover_interval"`
 	// MailMaxPerRound 每人每轮最多处理多少封还没存过的邮件（0 = 默认 100）。
 	MailMaxPerRound int `yaml:"mail_max_per_round"`
+	// WikiEnabled 是否拉知识库（团队知识库 + 个人“我的文档库”），默认不拉：不在客户要求的范围内。
+	WikiEnabled bool `yaml:"wiki_enabled"`
+	// MinutesEnabled 是否拉妙记逐字稿，默认不拉：不在客户要求的范围内（智能纪要文档另由搜索发现，不受影响）。
+	MinutesEnabled bool `yaml:"minutes_enabled"`
 }
 
 // API 抽象（便于测试替换；feishuapi.Client 适配实现）。
@@ -73,7 +77,6 @@ type API interface {
 	DownloadMinutesTranscript(userToken, minuteToken string) (io.ReadCloser, error)
 
 	// 邮箱邮件与附件接口
-	ListMailFolders(userToken string) ([]feishuapi.MailFolder, error)
 	ListMailboxMessages(userToken, folderID, pageToken string) ([]string, string, bool, error)
 	GetMailMessage(userToken, messageID string) (*feishuapi.MailMessage, error)
 	DownloadMailAttachment(userToken, messageID, attachmentID string) (io.ReadCloser, error)
@@ -350,24 +353,26 @@ func (c *Connector) scan(ctx context.Context) error {
 					}
 				}
 
-				// b) 团队知识库空间 + 个人“我的文档库”自动发现。
+				// b) 团队知识库空间 + 个人“我的文档库”自动发现（WikiEnabled 关闭时不拉，默认关闭）。
 				// 用户模式不再使用 cfg.WikiSpaceIDs：别人的个人文档库会报无权限，
 				// 被算作扫描失败后会让这个人的删除同步永远不执行。
 				spaceIDs := []string{}
-				myLib, err := c.api.GetMyLibrarySpace(g.AccessToken)
-				if err != nil {
-					log.Printf("[feishu] 取 %s 的我的文档库失败: %v", g.ExternalUserID, err)
-					userScanFailed = true
-				} else if myLib != nil && myLib.SpaceID != "" {
-					spaceIDs = append(spaceIDs, myLib.SpaceID)
-				}
-				spaces, err := c.api.ListWikiSpaces(g.AccessToken)
-				if err != nil {
-					log.Printf("[feishu] 列 %s 知识库失败: %v", g.ExternalUserID, err)
-					userScanFailed = true
-				} else {
-					for _, sp := range spaces {
-						spaceIDs = append(spaceIDs, sp.SpaceID)
+				if c.cfg.WikiEnabled {
+					myLib, err := c.api.GetMyLibrarySpace(g.AccessToken)
+					if err != nil {
+						log.Printf("[feishu] 取 %s 的我的文档库失败: %v", g.ExternalUserID, err)
+						userScanFailed = true
+					} else if myLib != nil && myLib.SpaceID != "" {
+						spaceIDs = append(spaceIDs, myLib.SpaceID)
+					}
+					spaces, err := c.api.ListWikiSpaces(g.AccessToken)
+					if err != nil {
+						log.Printf("[feishu] 列 %s 知识库失败: %v", g.ExternalUserID, err)
+						userScanFailed = true
+					} else {
+						for _, sp := range spaces {
+							spaceIDs = append(spaceIDs, sp.SpaceID)
+						}
 					}
 				}
 
@@ -444,12 +449,18 @@ func (c *Connector) scan(ctx context.Context) error {
 
 				// d) 智能纪要/妙记扫描（SearchMinutes 会翻完所有页，列表完整，可参与删除判断）。
 				// 接口失败时不算整个人扫描失败（没开通妙记的账号可能一直报错），只是本轮不判断妙记的删除。
-				minutesList, err := c.api.SearchMinutes(g.AccessToken)
-				minutesOK := err == nil
-				if err != nil {
-					log.Printf("[feishu] 取 %s 的妙记失败（本轮不判断妙记删除）: %v", g.ExternalUserID, err)
+				// MinutesEnabled 关闭时不拉（默认关闭），也不判断妙记的删除。
+				var minutesList []feishuapi.MinuteItem
+				minutesOK := false
+				if c.cfg.MinutesEnabled {
+					var err error
+					minutesList, err = c.api.SearchMinutes(g.AccessToken)
+					minutesOK = err == nil
+					if err != nil {
+						log.Printf("[feishu] 取 %s 的妙记失败（本轮不判断妙记删除）: %v", g.ExternalUserID, err)
+					}
 				}
-				if err == nil && len(minutesList) > 0 {
+				if minutesOK && len(minutesList) > 0 {
 					for _, m := range minutesList {
 						if m.MinuteToken == "" {
 							continue

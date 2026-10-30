@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -201,37 +202,26 @@ func TestMailMaxPerRound(t *testing.T) {
 	}
 }
 
-// 扫哪些文件夹：收件箱、已发送、已归档 + 自建文件夹；草稿、垃圾、已删除不扫。列文件夹失败时只扫三个系统文件夹。
+// 扫哪些文件夹：只扫收件箱、已发送；已归档、自建文件夹、草稿、垃圾、已删除都不扫，也不再列文件夹。
 func TestMailFolders(t *testing.T) {
 	st := copyStore(t, "ou_a")
 	api := newMailAPI()
-	api.folders = []feishuapi.MailFolder{
-		{ID: "INBOX", Type: 1}, {ID: "DRAFT", Type: 1}, {ID: "TRASH", Type: 1}, {ID: "SPAM", Type: 1}, {ID: "77", Type: 2, Name: "客户"},
-	}
-	api.pages["77"] = [][]string{{"c1"}}
+	api.pages["INBOX"] = [][]string{{"i1"}}
 	api.pages["SENT"] = [][]string{{"s1"}}
-	api.addMail("c1", "客户来信")
-	api.addMail("s1", "我发的")
+	api.pages["ARCHIVED"] = [][]string{{"a1"}}
+	api.pages["77"] = [][]string{{"c1"}}
+	for _, id := range []string{"i1", "s1", "a1", "c1"} {
+		api.addMail(id, id)
+	}
 	c := newUserConn(t, st, api, Config{})
-	if got := mailRecs(round(t, c)); len(got) != 2 {
-		t.Fatalf("应存自建文件夹和已发送里的邮件，实际 %v", kinds(got))
+	got := mailRecs(round(t, c))
+	if fmt.Sprint(kinds(got)) != "[mail:mail_i1 mail:mail_s1]" {
+		t.Fatalf("应只存收件箱和已发送的邮件，实际 %v", kinds(got))
 	}
-	for _, f := range []string{"INBOX", "SENT", "ARCHIVED", "77"} {
-		if api.listCalls[f] == 0 {
-			t.Fatalf("应扫文件夹 %s，调用次数 %v", f, api.listCalls)
-		}
-	}
-	for _, f := range []string{"DRAFT", "TRASH", "SPAM"} {
+	for _, f := range []string{"ARCHIVED", "77", "DRAFT", "TRASH", "SPAM"} {
 		if api.listCalls[f] != 0 {
-			t.Fatalf("不应扫文件夹 %s", f)
+			t.Fatalf("不应扫文件夹 %s，调用次数 %v", f, api.listCalls)
 		}
-	}
-
-	api.foldersErr = errors.New("99991679 no permission")
-	api.listCalls = map[string]int{}
-	round(t, c)
-	if api.listCalls["77"] != 0 || api.listCalls["INBOX"] == 0 || api.listCalls["SENT"] == 0 || api.listCalls["ARCHIVED"] == 0 {
-		t.Fatalf("列文件夹失败时应只扫三个系统文件夹，实际 %v", api.listCalls)
 	}
 }
 
