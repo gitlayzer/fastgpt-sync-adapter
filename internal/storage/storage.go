@@ -196,6 +196,12 @@ CREATE TABLE IF NOT EXISTS feishu_mail_seen (
   PRIMARY KEY (person_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_feishu_mail_seen_smtp ON feishu_mail_seen(person_id, smtp_id);
+CREATE TABLE IF NOT EXISTS feishu_mail_file (
+  person_id  TEXT NOT NULL,
+  token      TEXT NOT NULL,
+  file_name  TEXT NOT NULL,
+  PRIMARY KEY (person_id, token, file_name)
+);
 CREATE TABLE IF NOT EXISTS api_tokens (
   token_hash   TEXT PRIMARY KEY,
   display      TEXT NOT NULL DEFAULT '',
@@ -953,6 +959,66 @@ func (s *Store) MailSeenSMTP(personID, smtpID string) bool {
 // AddMailSeen 记录一封已处理的邮件。
 func (s *Store) AddMailSeen(personID, messageID, smtpID string) error {
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO feishu_mail_seen (person_id, message_id, smtp_id) VALUES (?, ?, ?)`, personID, messageID, smtpID)
+	return err
+}
+
+// MailCopyIDs 一封已处理邮件的全部拷贝（按 RFC 邮件 ID 找同一封）；没有 RFC 邮件 ID 时只有它自己。
+func (s *Store) MailCopyIDs(personID, messageID string) []string {
+	ids := []string{messageID}
+	var smtpID string
+	_ = s.db.QueryRow(`SELECT smtp_id FROM feishu_mail_seen WHERE person_id=? AND message_id=?`, personID, messageID).Scan(&smtpID)
+	if smtpID == "" {
+		return ids
+	}
+	rows, err := s.db.Query(`SELECT message_id FROM feishu_mail_seen WHERE person_id=? AND smtp_id=? AND message_id!=?`, personID, smtpID, messageID)
+	if err != nil {
+		return ids
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// AddMailFiles 记录一封邮件写到 NAS 的全部文件名（正文和附件）。
+func (s *Store) AddMailFiles(personID, token string, names []string) error {
+	for _, name := range names {
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO feishu_mail_file (person_id, token, file_name) VALUES (?, ?, ?)`, personID, token, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListMailFiles 一封邮件写到 NAS 的全部文件名；这张表加入之前存的邮件没有记录，返回空。
+func (s *Store) ListMailFiles(personID, token string) []string {
+	rows, err := s.db.Query(`SELECT file_name FROM feishu_mail_file WHERE person_id=? AND token=? ORDER BY file_name`, personID, token)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// DeleteMailSeen 清掉一封邮件所有拷贝的已处理记录和文件名记录。
+func (s *Store) DeleteMailSeen(personID, messageID, token string) error {
+	for _, id := range s.MailCopyIDs(personID, messageID) {
+		if _, err := s.db.Exec(`DELETE FROM feishu_mail_seen WHERE person_id=? AND message_id=?`, personID, id); err != nil {
+			return err
+		}
+	}
+	_, err := s.db.Exec(`DELETE FROM feishu_mail_file WHERE person_id=? AND token=?`, personID, token)
 	return err
 }
 
