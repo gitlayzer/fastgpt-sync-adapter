@@ -162,8 +162,10 @@ func main() {
 	}
 	log.Printf("[OK] 群晖 NAS 登录成功（root=%s）", cfg.Sinks.NAS.RootPath)
 	if wcfg := cfg.Connectors.WeCom; wcfg.Enabled && wcfg.WeCom.ContactSecret != "" {
-		nas.SetExternalNamer(wecomcontact.NewResolver(st, wecomcontact.New(wcfg.WeCom.CorpID, wcfg.WeCom.ContactSecret)))
-		log.Printf("[OK] 企微外部联系人名字解析已启用")
+		cli := wecomcontact.New(wcfg.WeCom.CorpID, wcfg.WeCom.ContactSecret)
+		nas.SetExternalNamer(wecomcontact.NewResolver(st, cli))
+		nas.SetGroupNamer(wecomcontact.NewGroupResolver(st, cli))
+		log.Printf("[OK] 企微外部联系人名字、客户群名解析已启用")
 	}
 	eng.AddSink(nas)
 

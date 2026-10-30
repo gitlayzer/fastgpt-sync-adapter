@@ -743,3 +743,134 @@ func TestExternalContactCache(t *testing.T) {
 		t.Fatalf("notfound 记录不符: %+v", got)
 	}
 }
+
+// 迁移：旧版 room_names（无 source 列）升级后补列，旧记录照常可读。
+func TestMigrateRoomNamesSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy_room.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE room_names;
+CREATE TABLE room_names (
+  room_id    TEXT PRIMARY KEY,
+  name       TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO room_names (room_id, name, updated_at) VALUES ('wrTESTLEGACY', '老群名', 100);`); err != nil {
+		t.Fatalf("准备旧结构: %v", err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("迁移重开失败: %v", err)
+	}
+	defer s.Close()
+
+	if !s.hasColumn("room_names", "source") {
+		t.Fatal("迁移后应存在 room_names.source 列")
+	}
+	name, source, ok := s.GetRoomNameWithSource("wrTESTLEGACY")
+	if !ok || name != "老群名" || source != "" {
+		t.Fatalf("旧记录读回不符: %q %q %v", name, source, ok)
+	}
+	// 无记录：ok=false，不报错
+	if n, src, ok := s.GetRoomNameWithSource("wrTESTNONE"); ok || n != "" || src != "" {
+		t.Fatalf("无记录应返回 ok=false: %q %q %v", n, src, ok)
+	}
+}
+
+// 推断名只在首次写入时生效，之后同一群沿用旧名字（不再随成员变化）。
+func TestSetInferredRoomNameKeepsFirst(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	const room = "wrTESTINFER01"
+	got, err := s.SetInferredRoomName(room, "张三、李四的群聊")
+	if err != nil {
+		t.Fatalf("SetInferredRoomName: %v", err)
+	}
+	if got != "张三、李四的群聊" {
+		t.Fatalf("首次写入应生效，得到 %q", got)
+	}
+	name, source, ok := s.GetRoomNameWithSource(room)
+	if !ok || name != "张三、李四的群聊" || source != RoomNameSourceInferred {
+		t.Fatalf("首次写入记录不符: %q %q %v", name, source, ok)
+	}
+
+	// 第二次传不同名字：不覆盖，返回第一次的名字
+	got, err = s.SetInferredRoomName(room, "张三、李四、王五的群聊")
+	if err != nil {
+		t.Fatalf("SetInferredRoomName 二次: %v", err)
+	}
+	if got != "张三、李四的群聊" {
+		t.Fatalf("已有记录不应被覆盖，返回 %q", got)
+	}
+	if name, _, _ := s.GetRoomNameWithSource(room); name != "张三、李四的群聊" {
+		t.Fatalf("库里的名字不应变化，得到 %q", name)
+	}
+
+	// 库里记录的名字为空（例如外部写入空串）时允许补写
+	if err := s.SetRoomName(room, ""); err != nil {
+		t.Fatalf("SetRoomName: %v", err)
+	}
+	got, err = s.SetInferredRoomName(room, "张三、李四、王五的群聊")
+	if err != nil {
+		t.Fatalf("SetInferredRoomName 空记录补写: %v", err)
+	}
+	if got != "张三、李四、王五的群聊" {
+		t.Fatalf("名字为空时应允许补写，得到 %q", got)
+	}
+}
+
+// 客户群名缓存：全字段覆盖读写。
+func TestGroupChatCache(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "group.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	const room = "wrTESTGROUP01"
+	if g, ok, err := s.GetGroupChat(room); err != nil || ok || g.RoomID != "" {
+		t.Fatalf("空库应返回 ok=false: %+v %v %v", g, ok, err)
+	}
+	if err := s.SaveGroupChat(GroupChat{RoomID: room, Name: "江湾测试群", Status: "ok", FetchedAt: 100}); err != nil {
+		t.Fatalf("SaveGroupChat: %v", err)
+	}
+	g, ok, err := s.GetGroupChat(room)
+	if err != nil || !ok {
+		t.Fatalf("GetGroupChat: %v ok=%v", err, ok)
+	}
+	if g.RoomID != room || g.Name != "江湾测试群" || g.Status != "ok" || g.FetchedAt != 100 {
+		t.Fatalf("首次保存不符: %+v", g)
+	}
+
+	// 第二次：群改名 → 全字段覆盖
+	if err := s.SaveGroupChat(GroupChat{RoomID: room, Name: "江湾新群", Status: "ok", FetchedAt: 200}); err != nil {
+		t.Fatalf("SaveGroupChat 覆盖: %v", err)
+	}
+	g, _, err = s.GetGroupChat(room)
+	if err != nil {
+		t.Fatalf("GetGroupChat: %v", err)
+	}
+	if g.Name != "江湾新群" || g.FetchedAt != 200 {
+		t.Fatalf("应全字段覆盖: %+v", g)
+	}
+
+	// notfound 覆盖 ok（name 清空属正常）
+	if err := s.SaveGroupChat(GroupChat{RoomID: room, Name: "", Status: "notfound", FetchedAt: 300}); err != nil {
+		t.Fatalf("SaveGroupChat notfound: %v", err)
+	}
+	g, ok, err = s.GetGroupChat(room)
+	if err != nil || !ok {
+		t.Fatalf("读 notfound 记录: %v ok=%v", err, ok)
+	}
+	if g.Status != "notfound" || g.Name != "" || g.FetchedAt != 300 {
+		t.Fatalf("notfound 记录不符: %+v", g)
+	}
+}

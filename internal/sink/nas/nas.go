@@ -78,6 +78,7 @@ type Sink struct {
 	ids    identity.Resolver
 	store  *storage.Store
 	ext    ExternalNamer // 企微外部联系人（客户）名字解析；nil=不解析（直接用 ID）
+	groups GroupNamer    // 企微客户群真实群名；nil=只用配置/推断名
 
 	mu           sync.Mutex
 	batchMode    bool
@@ -120,6 +121,18 @@ type ExternalNamer interface {
 
 // SetExternalNamer 注入外部联系人名字解析器（nil=不解析，保持用 ID 的旧行为）。
 func (s *Sink) SetExternalNamer(n ExternalNamer) { s.ext = n }
+
+// GroupNamer 企微客户群真实群名（*wecomcontact.GroupResolver 满足）。
+// GroupName：查到群名返回名字，查不到/群没起名返回空串。
+type GroupNamer interface {
+	GroupName(ctx context.Context, roomID string) string
+}
+
+// SetGroupNamer 注入客户群名解析器（nil=只用配置名与推断名）。
+func (s *Sink) SetGroupNamer(n GroupNamer) { s.groups = n }
+
+// groupNameLimit 推断群名最多取几个成员姓名。
+const groupNameLimit = 3
 
 // isExternalID 是否企微外部联系人 ID（wm/wo 开头，微信客户/企微客户）。
 // 与 wecomcontact.IsExternal 同义，这里本地实现避免 nas → wecomcontact 的包依赖。
@@ -441,7 +454,14 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 
 // convFileName 计算查看者视角的会话文件名。
 // 单聊：以对方姓名命名（与李四的单聊.md；对方是企微外部联系人时用固定标签，如 与张三@某公司_ab12的单聊.md）；
-// 群聊：优先使用配置或数据库中的群名；若无则智能提取群内实名员工姓名（如 群聊_罗静怡、王永国等人的群聊.md）；未解析出员工时兜底使用 roomid。
+// 群聊（按顺序取第一个可用的）：
+//  1. 配置里的群名映射；
+//  2. 企微客户联系接口查到的真实群名（群改名后新消息进新名字的文件）；
+//  3. 库里已固定的推断名（source=inferred，写定后不再随成员变化）；
+//  4. 现场推断（已知成员里的内部实名员工，前 3 个）并写库固定；
+//  5. 兜底：群聊_未命名群聊_<roomID 后6位>.md。
+//
+// 任何情况下都不输出完整 roomID。
 func (s *Sink) convFileName(ctx context.Context, m *render.Msg, forUser string, nameOf func(string) string) string {
 	if m.RoomID == "" {
 		counterpart := ""
@@ -476,51 +496,107 @@ func (s *Sink) convFileName(ctx context.Context, m *render.Msg, forUser string, 
 		}
 	}
 
-	// 2. 查数据库记录的群名
-	if s.store != nil {
-		if gn := s.store.GetRoomName(m.RoomID); gn != "" {
+	// 2. 客户群接口查到的真实群名
+	if s.groups != nil {
+		if gn := s.groups.GroupName(ctx, m.RoomID); gn != "" {
 			return fmt.Sprintf("群聊_%s.md", sanitize(gn))
 		}
 	}
 
-	// 3. 智能推断：根据已知群成员姓名生成自然语言群名（如 "群聊_罗静怡、王永国、张建丰等人的群聊.md"）
+	// 3. 库里已固定的推断名（只认 source=inferred；source 为空的历史记录也照用）
 	if s.store != nil {
-		members, err := s.store.ListRoomParticipants(m.RoomID)
-		if err == nil && len(members) > 0 {
-			var memberNames []string
-			seenNames := map[string]bool{}
-			for _, uid := range members {
-				if strings.HasPrefix(uid, "wm") || strings.HasPrefix(uid, "wo") {
-					continue
-				}
-				name := uid
-				if nameOf != nil {
-					name = nameOf(uid)
-				}
-				if strings.HasPrefix(name, "wm") || strings.HasPrefix(name, "wo") || name == "" {
-					continue
-				}
-				if !seenNames[name] {
-					seenNames[name] = true
-					memberNames = append(memberNames, name)
-				}
-			}
-			if len(memberNames) > 0 {
-				limit := 3
-				if len(memberNames) < limit {
-					limit = len(memberNames)
-				}
-				joined := strings.Join(memberNames[:limit], "、")
-				if len(memberNames) > limit {
-					return fmt.Sprintf("群聊_%s等人的群聊.md", sanitize(joined))
-				}
-				return fmt.Sprintf("群聊_%s的群聊.md", sanitize(joined))
+		if gn, source, ok := s.store.GetRoomNameWithSource(m.RoomID); ok && (source == "" || source == storage.RoomNameSourceInferred) {
+			if gn = strings.TrimSpace(gn); gn != "" {
+				return fmt.Sprintf("群聊_%s.md", sanitize(gn))
 			}
 		}
 	}
 
-	// 4. 最终兜底使用 roomid
-	return fmt.Sprintf("群聊_%s.md", sanitize(m.RoomID))
+	// 4. 现场推断：只取能解析出名字的内部成员，前 3 个；写库后固定，之后同一个群一直用这个名字
+	if names := s.inferGroupMemberNames(m, nameOf); len(names) > 0 {
+		combined := joinedGroupName(names)
+		final := combined
+		if s.store != nil {
+			if saved, err := s.store.SetInferredRoomName(m.RoomID, combined); err == nil && strings.TrimSpace(saved) != "" {
+				final = strings.TrimSpace(saved)
+			}
+		}
+		return fmt.Sprintf("群聊_%s.md", sanitize(final))
+	}
+
+	// 5. 兜底：不写库，下次还有机会查到真名或推断出成员
+	return fmt.Sprintf("群聊_未命名群聊_%s.md", sanitize(roomIDSuffix(m.RoomID)))
+}
+
+// inferGroupMemberNames 现场推断群名用的成员姓名：
+// 本条消息的参与者 + 库里已学到的群成员，按出现顺序去重，只留内部实名员工。
+// 最多返回 groupNameLimit+1 个（多出来的那个只用来判断是否该加"等人"）。
+func (s *Sink) inferGroupMemberNames(m *render.Msg, nameOf func(string) string) []string {
+	seenUID := map[string]bool{}
+	seenName := map[string]bool{}
+	var names []string
+
+	consider := func(uid string) {
+		if len(names) > groupNameLimit {
+			return
+		}
+		if uid == "" || seenUID[uid] {
+			return
+		}
+		seenUID[uid] = true
+		if !usableGroupMemberID(uid) {
+			return
+		}
+		name := uid
+		if nameOf != nil {
+			name = nameOf(uid)
+		}
+		name = strings.TrimSpace(name)
+		// 解析不出名字（空、还是 ID 本身）不算
+		if name == "" || name == uid || !usableGroupMemberID(name) {
+			return
+		}
+		if seenName[name] {
+			return
+		}
+		seenName[name] = true
+		names = append(names, name)
+	}
+
+	for _, uid := range m.Participants() {
+		consider(uid)
+	}
+	if s.store != nil {
+		if members, err := s.store.ListRoomParticipants(m.RoomID); err == nil {
+			for _, uid := range members {
+				consider(uid)
+			}
+		}
+	}
+	return names
+}
+
+// usableGroupMemberID 能否用来推断群名：跳过外部联系人（wm/wo）与机器人（wb 开头）。
+func usableGroupMemberID(id string) bool {
+	return id != "" && !isExternalID(id) && !strings.HasPrefix(id, "wb")
+}
+
+// joinedGroupName 把姓名列表拼成自然语言群名：
+// 超过 groupNameLimit 个用 "<A、B、C>等人的群聊"，否则 "<A、B>的群聊"。
+func joinedGroupName(names []string) string {
+	if len(names) > groupNameLimit {
+		return strings.Join(names[:groupNameLimit], "、") + "等人的群聊"
+	}
+	return strings.Join(names, "、") + "的群聊"
+}
+
+// roomIDSuffix 兜底文件名里的 ID 片段：只取后 6 位，绝不输出完整 roomID。
+func roomIDSuffix(roomID string) string {
+	rs := []rune(roomID)
+	if len(rs) <= 6 {
+		return string(rs)
+	}
+	return string(rs[len(rs)-6:])
 }
 
 // appendFile 滚动追加（保持旧签名兼容测试）。

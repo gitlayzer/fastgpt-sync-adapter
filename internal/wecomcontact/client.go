@@ -4,6 +4,7 @@
 package wecomcontact
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,21 @@ const defaultBaseURL = "https://qyapi.weixin.qq.com/cgi-bin"
 
 // ErrNotFound 对应 84061：查不到这个外部联系人（正常结果，可缓存）。
 var ErrNotFound = errors.New("外部联系人不存在或不在可见范围内")
+
+// ErrGroupNotFound 客户群查不到（92002 无权限、90501 非客户群、以及 errcode 在 [90000,99999] 之间的业务错误），正常结果可缓存。
+var ErrGroupNotFound = errors.New("客户群不存在或无权限")
+
+// errcodeGroupNoPerm 92002：群主不在应用可见范围，查不到群。
+const errcodeGroupNoPerm = 92002
+
+// errcodeNotGroupChat 90501：不是客户群（内部群等）。
+const errcodeNotGroupChat = 90501
+
+// 客户群查不到的 errcode 区间：90000-99999 都是业务错误（无权限、非客户群等），视为正常结果。
+const (
+	groupErrNotFoundMin = 90000
+	groupErrNotFoundMax = 99999
+)
 
 // 需要重新取 token 的错误码：token 无效 / 过期 / corpid 与 token 不匹配。
 const (
@@ -165,6 +181,60 @@ func (c *Client) Get(ctx context.Context, externalUserID string) (Contact, error
 	}
 }
 
+// groupChatResp groupchat/get 响应。
+type groupChatResp struct {
+	ErrCode   int    `json:"errcode"`
+	ErrMsg    string `json:"errmsg"`
+	GroupChat struct {
+		ChatID string `json:"chat_id"`
+		Name   string `json:"name"`
+		Owner  string `json:"owner"`
+	} `json:"group_chat"`
+}
+
+// GroupChatName 查客户群真实群名（群没起名时返回空字符串，不是错误）。
+// 查不到（92002 无权限 / 90501 非客户群 / 90000-99999 业务错误）返回 ErrGroupNotFound；
+// token 失效（40014/42001/40001）清缓存后重试一次。
+func (c *Client) GroupChatName(ctx context.Context, chatID string) (string, error) {
+	for attempt := 0; ; attempt++ {
+		token, err := c.getToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		name, code, msg, err := c.groupChatOnce(ctx, token, chatID)
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case code == 0:
+			return name, nil
+		case code == errcodeGroupNoPerm || code == errcodeNotGroupChat:
+			return "", ErrGroupNotFound
+		case code == errcodeTokenInvalid || code == errcodeTokenExpired || code == errcodeTokenWrongCorp:
+			c.invalidateToken()
+			if attempt >= 1 {
+				return "", fmt.Errorf("externalcontact/groupchat/get errcode=%d: %s（access_token 失效，重取后仍失败）", code, msg)
+			}
+		case code >= groupErrNotFoundMin && code <= groupErrNotFoundMax:
+			return "", ErrGroupNotFound
+		default:
+			// 错误信息只放 errcode/errmsg，不放 URL（URL 里有 access_token）
+			return "", fmt.Errorf("externalcontact/groupchat/get errcode=%d: %s", code, msg)
+		}
+	}
+}
+
+// groupChatOnce 调一次 externalcontact/groupchat/get。
+func (c *Client) groupChatOnce(ctx context.Context, token, chatID string) (string, int, string, error) {
+	u := c.baseURL + "/externalcontact/groupchat/get?access_token=" + url.QueryEscape(token)
+	body := map[string]any{"chat_id": chatID, "need_name": 1}
+	var resp groupChatResp
+	if err := c.postJSON(ctx, u, body, &resp); err != nil {
+		return "", 0, "", fmt.Errorf("externalcontact/groupchat/get 请求失败: %w", err)
+	}
+	return resp.GroupChat.Name, resp.ErrCode, resp.ErrMsg, nil
+}
+
 // getOnce 调一次 externalcontact/get。
 func (c *Client) getOnce(ctx context.Context, token, externalUserID string) (Contact, int, string, error) {
 	u := c.baseURL + "/externalcontact/get?access_token=" + url.QueryEscape(token) +
@@ -179,9 +249,31 @@ func (c *Client) getOnce(ctx context.Context, token, externalUserID string) (Con
 
 // getJSON GET 并解析 JSON。错误只带状态码/原因，不含 URL（URL 里带 corpsecret / access_token）。
 func (c *Client) getJSON(ctx context.Context, u string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	return c.doJSON(ctx, http.MethodGet, u, nil, out)
+}
+
+// postJSON POST 并解析 JSON（错误处理同 getJSON）。
+func (c *Client) postJSON(ctx context.Context, u string, body any, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return errors.New("编码请求失败")
+	}
+	return c.doJSON(ctx, http.MethodPost, u, data, out)
+}
+
+// doJSON 发请求并解析 JSON 响应。
+// 错误信息只带状态码/原因，不含 URL（URL 里带 corpsecret / access_token）。
+func (c *Client) doJSON(ctx context.Context, method, u string, body []byte, out any) error {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
 	if err != nil {
 		return errors.New("构造请求失败")
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -193,14 +285,14 @@ func (c *Client) getJSON(ctx context.Context, u string, out any) error {
 		return errors.New("请求失败")
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("读取响应失败（HTTP %d）", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP 状态码 %d", resp.StatusCode)
 	}
-	if err := json.Unmarshal(body, out); err != nil {
+	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("解析响应失败: %v", err)
 	}
 	return nil

@@ -144,7 +144,14 @@ CREATE TABLE IF NOT EXISTS room_members (
 CREATE TABLE IF NOT EXISTS room_names (
   room_id    TEXT PRIMARY KEY,
   name       TEXT NOT NULL DEFAULT '',
+  source     TEXT NOT NULL DEFAULT '',   -- inferred=现场按成员推断出来的固定名；空=旧记录/外部写入
   updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS wecom_groupchats (
+  room_id    TEXT PRIMARY KEY,
+  name       TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT '',   -- ok | notfound
+  fetched_at INTEGER NOT NULL DEFAULT 0  -- unix 秒
 );
 CREATE TABLE IF NOT EXISTS feishu_doc_state (
   token      TEXT PRIMARY KEY,
@@ -234,6 +241,12 @@ CREATE TABLE IF NOT EXISTS external_contacts (
 	if !s.hasColumn("feishu_shared_root", "doc_type") {
 		if _, err := s.db.Exec(`ALTER TABLE feishu_shared_root ADD COLUMN doc_type TEXT NOT NULL DEFAULT 'folder'`); err != nil {
 			return fmt.Errorf("补充 feishu_shared_root.doc_type 列: %w", err)
+		}
+	}
+	// 兼容已有表升级：旧版 room_names 没有 source 列，补上（旧记录视为空来源，仍按群名使用）
+	if !s.hasColumn("room_names", "source") {
+		if _, err := s.db.Exec(`ALTER TABLE room_names ADD COLUMN source TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("补充 room_names.source 列: %w", err)
 		}
 	}
 	// 从旧版升级：副本表为空时，用 feishu_doc_state 给所有者回填一份副本记录（只做一次），
@@ -667,6 +680,15 @@ func (s *Store) GetRoomName(roomID string) string {
 	return name
 }
 
+// GetRoomNameWithSource 返回群名和来源（inferred / ""），无记录返回 "", "", false。
+func (s *Store) GetRoomNameWithSource(roomID string) (name, source string, ok bool) {
+	err := s.db.QueryRow(`SELECT name, source FROM room_names WHERE room_id=?`, roomID).Scan(&name, &source)
+	if err != nil {
+		return "", "", false
+	}
+	return name, source, true
+}
+
 // SetRoomName 记录群聊名称。
 func (s *Store) SetRoomName(roomID, name string) error {
 	_, err := s.db.Exec(`
@@ -674,6 +696,33 @@ INSERT INTO room_names (room_id, name, updated_at) VALUES (?, ?, ?)
 ON CONFLICT(room_id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at`,
 		roomID, name, time.Now().Unix())
 	return err
+}
+
+// 群名来源取值。
+const RoomNameSourceInferred = "inferred" // 现场按已知成员推断出来的名字，首次写入后固定
+
+// SetInferredRoomName 只在库里没有该群记录（或 name 为空）时写入 name + source=inferred；已有则不改。
+// 返回最终生效的名字（已有记录时是库里原来的名字）。
+func (s *Store) SetInferredRoomName(roomID, name string) (string, error) {
+	if strings.TrimSpace(roomID) == "" {
+		return "", errors.New("记录推断群名需要 roomID")
+	}
+	if _, err := s.db.Exec(`
+INSERT INTO room_names (room_id, name, source, updated_at) VALUES (?, ?, ?, ?)
+ON CONFLICT(room_id) DO UPDATE SET name=excluded.name, source=excluded.source, updated_at=excluded.updated_at
+WHERE room_names.name=''`,
+		roomID, name, RoomNameSourceInferred, time.Now().Unix()); err != nil {
+		return "", err
+	}
+	// 回读：已有非空记录时返回原名字，保证同一个群的文件名不再变化
+	var final string
+	if err := s.db.QueryRow(`SELECT name FROM room_names WHERE room_id=?`, roomID).Scan(&final); err != nil {
+		return name, nil
+	}
+	if final == "" {
+		return name, nil
+	}
+	return final, nil
 }
 
 // DocState 飞书文档状态记录。
@@ -1115,6 +1164,42 @@ ON CONFLICT(external_userid) DO UPDATE SET
   name=excluded.name, corp_name=excluded.corp_name, status=excluded.status, fetched_at=excluded.fetched_at,
   label = CASE WHEN external_contacts.label='' THEN excluded.label ELSE external_contacts.label END`,
 		c.ExternalUserID, c.Name, c.CorpName, c.Label, c.Status, c.FetchedAt)
+	return err
+}
+
+// ===== 企微客户群（groupchat/get）结果缓存 =====
+
+// GroupChat 客户群真实群名缓存。
+// Status：ok（查到了，name 可能为空=群没起名）| notfound（92002 无权限 / 90501 非客户群等，正常结果）。
+// FetchedAt 为 unix 秒，用来决定多久之后重新查。
+type GroupChat struct {
+	RoomID    string
+	Name      string
+	Status    string
+	FetchedAt int64
+}
+
+// GetGroupChat 读取某个客户群的缓存；没有记录返回 ok=false。
+func (s *Store) GetGroupChat(roomID string) (GroupChat, bool, error) {
+	g := GroupChat{RoomID: roomID}
+	err := s.db.QueryRow(`SELECT name, status, fetched_at FROM wecom_groupchats WHERE room_id=?`, roomID).
+		Scan(&g.Name, &g.Status, &g.FetchedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GroupChat{}, false, nil
+	}
+	if err != nil {
+		return GroupChat{}, false, err
+	}
+	return g, true, nil
+}
+
+// SaveGroupChat upsert 全字段覆盖。
+func (s *Store) SaveGroupChat(g GroupChat) error {
+	_, err := s.db.Exec(`
+INSERT INTO wecom_groupchats (room_id, name, status, fetched_at) VALUES (?, ?, ?, ?)
+ON CONFLICT(room_id) DO UPDATE SET
+  name=excluded.name, status=excluded.status, fetched_at=excluded.fetched_at`,
+		g.RoomID, g.Name, g.Status, g.FetchedAt)
 	return err
 }
 
