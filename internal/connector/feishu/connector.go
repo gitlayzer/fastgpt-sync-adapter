@@ -1,6 +1,6 @@
 // 飞书云文档连接器：tenant（共享文件夹遍历）+ user（已授权用户云空间）双模式。
 // 变更检测：feishu_doc_copy(token × person)，某人还没有这一份、或文档/文件名变了才写给他。
-// 归属：所有者 + 扫描时能看到的授权员工 + 协作者列表里的人，各存一份；谁看不到了只删谁的那份。
+// 归属：只落纳管且已授权的员工：所有者、扫描时能看到的人、协作者列表里的人，各存一份；谁看不到了只删谁的那份。
 package feishu
 
 import (
@@ -114,6 +114,14 @@ type Connector struct {
 	mailMu       sync.Mutex
 	mailCache    map[string]*feishuapi.MailMessage // 扫描时取到的邮件详情，生成正文时复用，用完即删
 	mailPending  map[string]*mailAck               // 待 Ack 的邮件记录 → 要记为已处理的邮件拷贝
+	managed      func(feishuID string) bool        // 纳管判定，nil 时全部算纳管
+}
+
+// SetManaged 设置纳管判定：只有纳管员工（名单内、在职、姓名唯一）才拉取、才落副本。不设置时全部算纳管。
+func (c *Connector) SetManaged(fn func(feishuID string) bool) { c.managed = fn }
+
+func (c *Connector) isManaged(feishuID string) bool {
+	return c.managed == nil || c.managed(feishuID)
 }
 
 func New(cfg Config, store *storage.Store) *Connector {
@@ -318,6 +326,14 @@ func (c *Connector) scan(ctx context.Context) error {
 		// 每个员工每隔 SharedDiscover 搜一次别人共享给他的文件夹，平时只搜最近新建的，每隔 SharedFullEvery 按全部时间搜一次；
 		// “创建人”取全公司员工和名单（授权了的所有者也要搜：协作者列表只含个人，分享给群/部门的拿不到）。
 		// 按员工计时、搜完整才计时：授权失效或搜索失败的员工，重新授权/恢复后下一轮就搜。
+		for _, g := range grants {
+			if g.Status == "authorized" && c.isManaged(g.ExternalUserID) {
+				st.holders[g.ExternalUserID] = true
+			}
+		}
+		if len(grants) > 0 && len(st.holders) == 0 {
+			log.Printf("[feishu] 警告：%d 个授权员工都不是纳管员工，本轮不采集任何人，请检查员工名单", len(grants))
+		}
 		discoverNow := c.pickDiscover(grants, now)
 		var creators []string
 		creatorsLoaded := false
@@ -325,6 +341,11 @@ func (c *Connector) scan(ctx context.Context) error {
 			// 一轮可能很长，用轮到这个人时最新的令牌（开头读到的可能已经过期）
 			if fresh, err := c.store.GetOAuthGrant("feishu", g.ExternalUserID); err == nil && fresh != nil {
 				g = *fresh
+			}
+			if !c.isManaged(g.ExternalUserID) { // 不在名单、已离职或重名：不拉取，已有的副本先留着
+				log.Printf("[feishu] 用户 %s 不是纳管员工，跳过", g.ExternalUserID)
+				st.inactiveUsers[g.ExternalUserID] = true
+				continue
 			}
 			if g.Status != "authorized" || g.AccessToken == "" {
 				log.Printf("[feishu] 用户 %s 未处于已授权状态（status=%s），跳过", g.ExternalUserID, g.Status)
@@ -639,7 +660,7 @@ func (c *Connector) pickDiscover(grants []storage.OAuthGrant, now int64) map[str
 	every := int64(c.sharedDiscoverEvery() / time.Second)
 	var due []string
 	for _, g := range grants {
-		if g.Status == "authorized" && g.AccessToken != "" && g.ExpireAt > now && now-c.discoveredAt[g.ExternalUserID] >= every {
+		if g.Status == "authorized" && g.AccessToken != "" && g.ExpireAt > now && c.isManaged(g.ExternalUserID) && now-c.discoveredAt[g.ExternalUserID] >= every {
 			due = append(due, g.ExternalUserID)
 		}
 	}
@@ -954,6 +975,7 @@ type scannedUser struct {
 
 // scanState 一轮扫描的汇总结果。
 type scanState struct {
+	holders       map[string]bool // 可以落副本的人：纳管且已授权
 	want          map[string]*wantDoc
 	order         []string                   // 文档首次出现的顺序（产出顺序）
 	scanned       []scannedUser              // 本轮扫描完全成功的授权员工
@@ -965,6 +987,7 @@ type scanState struct {
 
 func newScanState() *scanState {
 	return &scanState{
+		holders:       map[string]bool{},
 		want:          map[string]*wantDoc{},
 		globalSeen:    map[string]bool{},
 		failedUsers:   map[string]bool{},
@@ -985,7 +1008,10 @@ func (c *Connector) collect(st *scanState, rec model.Record, viewer string) {
 	if ts := rec.Timestamp / 1000; ts > w.editTs {
 		w.editTs = ts
 	}
-	w.addPerson(w.owner, viaOwner)
+	// 只落纳管且已授权的员工：所有者没授权时不给他写（否则 NAS 上出现以 open_id 命名的目录）
+	if st.holders[w.owner] || (viewer == "" && c.isManaged(w.owner)) {
+		w.addPerson(w.owner, viaOwner)
+	}
 	if viewer != "" && viewer != w.owner {
 		w.addPerson(viewer, viaScan)
 	}
@@ -1024,7 +1050,7 @@ func (c *Connector) refreshCollaborators(st *scanState, userToken string, owned 
 				fresh := map[string]bool{}
 				members = members[:0]
 				for _, m := range items {
-					if m.MemberType == "openid" && m.MemberID != "" {
+					if m.MemberType == "openid" && st.holders[m.MemberID] { // 协作者也只算纳管且已授权的
 						fresh[m.MemberID] = true
 						members = append(members, m.MemberID)
 					}
@@ -1036,7 +1062,9 @@ func (c *Connector) refreshCollaborators(st *scanState, userToken string, owned 
 			}
 		}
 		for _, p := range members {
-			w.addPerson(p, viaCollab)
+			if st.holders[p] {
+				w.addPerson(p, viaCollab)
+			}
 		}
 	}
 }
@@ -1191,11 +1219,14 @@ func (c *Connector) emitDeletes(st *scanState) {
 		if err != nil {
 			continue
 		}
-		blocked := false
+		blocked, unscanned := false, false
 		for _, cp := range copies {
 			if (cp.Via == viaOwner || cp.Via == viaScan) && st.failedUsers[cp.PersonID] {
 				blocked = true // 有持有人本轮没扫成功：可能只是没扫到，下轮再判断
 				break
+			}
+			if cp.Via == viaScan && st.inactiveUsers[cp.PersonID] {
+				unscanned = true
 			}
 		}
 		if blocked {
@@ -1205,6 +1236,9 @@ func (c *Connector) emitDeletes(st *scanState) {
 			if (cp.Via == viaOwner || cp.Via == viaScan) && st.inactiveUsers[cp.PersonID] {
 				continue // 授权失效的员工本轮没扫，分不清是文档被删还是别人失去权限：他那份先留着
 			}
+			if cp.Via == viaOwner && unscanned {
+				continue // 文档可能在没扫描的人的文件夹里，所有者本人云盘列不到，不能因此删掉所有者那份
+			}
 			del(cp)
 		}
 	}
@@ -1212,7 +1246,7 @@ func (c *Connector) emitDeletes(st *scanState) {
 	for token, fresh := range st.collabFresh {
 		if copies, err := c.store.ListCopies(token); err == nil {
 			for _, cp := range copies {
-				if cp.Via == viaCollab && !fresh[cp.PersonID] {
+				if cp.Via == viaCollab && !fresh[cp.PersonID] && !st.inactiveUsers[cp.PersonID] {
 					del(cp)
 				}
 			}
