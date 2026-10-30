@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -452,5 +453,424 @@ func TestDeadLetter(t *testing.T) {
 	}
 	if n, _ := s.CountDeadLetters("feishu"); n != 0 {
 		t.Fatalf("其它 source 应为 0 条: %d", n)
+	}
+}
+
+// 旧库 identities 没有 status/leave_date/offboarded_at 列：重开后自动补列，旧记录按在职处理。
+func TestMigrateIdentityRosterColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE identities;
+CREATE TABLE identities (
+  wecom_user_id  TEXT PRIMARY KEY,
+  feishu_user_id TEXT NOT NULL DEFAULT '',
+  person_name    TEXT NOT NULL DEFAULT '',
+  updated_at     INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO identities (wecom_user_id, feishu_user_id, person_name, updated_at)
+VALUES ('legacy_user', 'ou_legacy', '老王', 100);`); err != nil {
+		t.Fatalf("准备旧结构: %v", err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("迁移重开失败: %v", err)
+	}
+	defer s.Close()
+
+	for _, col := range []string{"status", "leave_date", "offboarded_at"} {
+		if !s.hasColumn("identities", col) {
+			t.Fatalf("迁移后应存在 identities.%s 列", col)
+		}
+	}
+	id, err := s.GetIdentityByWeCom("legacy_user")
+	if err != nil {
+		t.Fatalf("GetIdentityByWeCom: %v", err)
+	}
+	if id.Status != IdentityActive || id.LeaveDate != "" || id.OffboardedAt != 0 {
+		t.Fatalf("旧记录应视为在职且未处理: %+v", id)
+	}
+	// 旧记录也能被纳管（姓名非空、唯一）
+	if _, ok, err := s.ManagedByWeCom("legacy_user"); err != nil || !ok {
+		t.Fatalf("旧记录应纳管: ok=%v err=%v", ok, err)
+	}
+}
+
+// 状态流转：active→offboarded 保留 offboarded_at；offboarded→active（复职）清零。
+func TestIdentityStatusTransitions(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertIdentity(&Identity{WeComUserID: "u1", PersonName: "张三"}); err != nil {
+		t.Fatal(err)
+	}
+	// 空状态按在职存库
+	if id, _ := s.GetIdentityByWeCom("u1"); id.Status != IdentityActive {
+		t.Fatalf("空 status 应存为 active，得到 %q", id.Status)
+	}
+	if err := s.SetOffboarded("u1", 1700000000); err != nil {
+		t.Fatalf("SetOffboarded: %v", err)
+	}
+	// 改离职（不带 offboarded_at）不应覆盖已记录的离职处理时间
+	if err := s.UpsertIdentity(&Identity{WeComUserID: "u1", PersonName: "张三", Status: IdentityOffboarded, LeaveDate: "2024-01-31"}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.GetIdentityByWeCom("u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Status != IdentityOffboarded || id.LeaveDate != "2024-01-31" || id.OffboardedAt != 1700000000 {
+		t.Fatalf("离职状态不符: %+v", id)
+	}
+	// 复职：状态回 active，offboarded_at 清零
+	if err := s.UpsertIdentity(&Identity{WeComUserID: "u1", PersonName: "张三", Status: IdentityActive}); err != nil {
+		t.Fatal(err)
+	}
+	id, _ = s.GetIdentityByWeCom("u1")
+	if id.Status != IdentityActive || id.OffboardedAt != 0 {
+		t.Fatalf("复职后应清空 offboarded_at: %+v", id)
+	}
+	// 复职前再写一次 offboarded_at 验证不会被 active 之外的更新误清
+	if err := s.SetOffboarded("u1", 42); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertIdentity(&Identity{WeComUserID: "u1", PersonName: "张三", Status: IdentityOffboarded}); err != nil {
+		t.Fatal(err)
+	}
+	if id, _ = s.GetIdentityByWeCom("u1"); id.OffboardedAt != 42 {
+		t.Fatalf("非 active 更新不应覆盖 offboarded_at: %+v", id)
+	}
+	// ListIdentities 也要带出新字段
+	list, err := s.ListIdentities()
+	if err != nil {
+		t.Fatalf("ListIdentities: %v", err)
+	}
+	if len(list) != 1 || list[0].Status != IdentityOffboarded || list[0].OffboardedAt != 42 {
+		t.Fatalf("ListIdentities 未读出新字段: %+v", list)
+	}
+}
+
+// MarkIdentitiesRemoved：只动不在 keep 里且尚未移出的行；重复调用不再计入。
+func TestMarkIdentitiesRemoved(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	for _, id := range []*Identity{
+		{WeComUserID: "keep1", PersonName: "张三"},
+		{WeComUserID: "gone1", PersonName: "李四"},
+		{WeComUserID: "gone2", PersonName: "王五", Status: IdentityOffboarded},
+	} {
+		if err := s.UpsertIdentity(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := s.MarkIdentitiesRemoved([]string{"keep1", "gone2"})
+	if err != nil {
+		t.Fatalf("MarkIdentitiesRemoved: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("应只标记 1 行，实际 %d", n)
+	}
+	if id, _ := s.GetIdentityByWeCom("keep1"); id.Status != IdentityActive {
+		t.Fatalf("keep 内的人不应被改状态: %+v", id)
+	}
+	if id, _ := s.GetIdentityByWeCom("gone2"); id.Status != IdentityOffboarded {
+		t.Fatalf("名单内已离职的人应保持 offboarded: %+v", id)
+	}
+	if id, _ := s.GetIdentityByWeCom("gone1"); id.Status != IdentityRemoved {
+		t.Fatalf("不在名单内的人应标记 removed: %+v", id)
+	}
+
+	// 再次调用：已 removed 的行不再计入
+	if n, err = s.MarkIdentitiesRemoved([]string{"keep1", "gone2"}); err != nil || n != 0 {
+		t.Fatalf("重复标记应为 0 行: n=%d err=%v", n, err)
+	}
+	// 名单为空等效于全员不在名单内
+	if n, err = s.MarkIdentitiesRemoved(nil); err != nil || n != 2 {
+		t.Fatalf("空名单应把剩余 2 行标记移出: n=%d err=%v", n, err)
+	}
+}
+
+// 纳管判定：不存在 / 离职 / 移出 / 姓名空 / 重名。
+func TestManagedIdentity(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	// 不存在
+	if id, ok, err := s.ManagedByWeCom("nobody"); err != nil || ok || id != nil {
+		t.Fatalf("不存在的企微 ID 不应纳管: %+v,%v,%v", id, ok, err)
+	}
+	if id, ok, err := s.ManagedByFeishu("ou_nobody"); err != nil || ok || id != nil {
+		t.Fatalf("不存在的飞书 ID 不应纳管: %+v,%v,%v", id, ok, err)
+	}
+	// openID 为空直接 false
+	if id, ok, err := s.ManagedByFeishu("  "); err != nil || ok || id != nil {
+		t.Fatalf("空 openID 不应纳管: %+v,%v,%v", id, ok, err)
+	}
+
+	for _, id := range []*Identity{
+		{WeComUserID: "active1", FeishuUserID: "ou_active1", PersonName: "张三"},
+		{WeComUserID: "left1", FeishuUserID: "ou_left1", PersonName: "李四", Status: IdentityOffboarded},
+		{WeComUserID: "gone1", FeishuUserID: "ou_gone1", PersonName: "王五", Status: IdentityRemoved},
+		{WeComUserID: "noname", FeishuUserID: "ou_noname", PersonName: "   "},
+		// 重名两人
+		{WeComUserID: "dup1", FeishuUserID: "ou_dup1", PersonName: "赵六"},
+		{WeComUserID: "dup2", FeishuUserID: "ou_dup2", PersonName: " 赵六 "},
+	} {
+		if err := s.UpsertIdentity(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if id, ok, err := s.ManagedByWeCom("active1"); err != nil || !ok || id.PersonName != "张三" {
+		t.Fatalf("在职且姓名唯一应纳管: %+v,%v,%v", id, ok, err)
+	}
+	if _, ok, err := s.ManagedByFeishu("ou_active1"); err != nil || !ok {
+		t.Fatalf("按飞书 ID 应纳管: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := s.ManagedByWeCom("left1"); err != nil || ok {
+		t.Fatalf("离职员工不应纳管: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := s.ManagedByWeCom("gone1"); err != nil || ok {
+		t.Fatalf("已移出员工不应纳管: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := s.ManagedByWeCom("noname"); err != nil || ok {
+		t.Fatalf("姓名为空（去空格）不应纳管: ok=%v err=%v", ok, err)
+	}
+
+	// 重名：两人都 false
+	for _, uid := range []string{"dup1", "dup2"} {
+		if _, ok, err := s.ManagedByWeCom(uid); err != nil || ok {
+			t.Fatalf("重名 %s 不应纳管: ok=%v err=%v", uid, ok, err)
+		}
+	}
+	dups, err := s.DuplicateActiveNames()
+	if err != nil {
+		t.Fatalf("DuplicateActiveNames: %v", err)
+	}
+	if ids := dups["赵六"]; len(ids) != 2 {
+		t.Fatalf("应报告赵六重名 2 人，实际 %v", dups)
+	}
+	if _, ok := dups["张三"]; ok {
+		t.Fatalf("唯一姓名不应出现在重名表: %v", dups)
+	}
+
+	// 其中一人离职后，另一人恢复纳管且不再重名
+	if err := s.UpsertIdentity(&Identity{WeComUserID: "dup1", FeishuUserID: "ou_dup1", PersonName: "赵六", Status: IdentityOffboarded}); err != nil {
+		t.Fatal(err)
+	}
+	if id, ok, err := s.ManagedByWeCom("dup2"); err != nil || !ok || strings.TrimSpace(id.PersonName) != "赵六" {
+		t.Fatalf("重名者之一离职后另一人应纳管: %+v,%v,%v", id, ok, err)
+	}
+	if dups, err = s.DuplicateActiveNames(); err != nil || len(dups) != 0 {
+		t.Fatalf("重名表应为空: %v %v", dups, err)
+	}
+}
+
+// 外部联系人缓存：首次保存 label 生效；改名后再存 name 更新、label 不变；notfound 记录可读出。
+func TestExternalContactCache(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "contact.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	const id = "woCORP001"
+	// 没有记录：ok=false，不报错
+	if c, ok, err := s.GetExternalContact(id); err != nil || ok || c.ExternalUserID != "" {
+		t.Fatalf("空库应返回 ok=false: %+v,%v,%v", c, ok, err)
+	}
+
+	first := ExternalContact{
+		ExternalUserID: id, Name: "张三", CorpName: "某公司",
+		Label: "张三@某公司_RP001", Status: "ok", FetchedAt: 100,
+	}
+	if err := s.SaveExternalContact(first); err != nil {
+		t.Fatalf("SaveExternalContact: %v", err)
+	}
+	got, ok, err := s.GetExternalContact(id)
+	if err != nil || !ok {
+		t.Fatalf("GetExternalContact: %v ok=%v", err, ok)
+	}
+	if got.Label != "张三@某公司_RP001" || got.Name != "张三" || got.Status != "ok" || got.FetchedAt != 100 {
+		t.Fatalf("首次保存不符: %+v", got)
+	}
+
+	// 第二次：名字变了、传新 label → name/status/fetched_at 覆盖，label 保持旧值
+	if err := s.SaveExternalContact(ExternalContact{
+		ExternalUserID: id, Name: "张三丰", CorpName: "某某公司",
+		Label: "张三丰@某某公司_RP001", Status: "ok", FetchedAt: 200,
+	}); err != nil {
+		t.Fatalf("SaveExternalContact 更新: %v", err)
+	}
+	got, _, err = s.GetExternalContact(id)
+	if err != nil {
+		t.Fatalf("GetExternalContact: %v", err)
+	}
+	if got.Name != "张三丰" || got.CorpName != "某某公司" || got.FetchedAt != 200 {
+		t.Fatalf("name/corp_name/fetched_at 应被覆盖: %+v", got)
+	}
+	if got.Label != "张三@某公司_RP001" {
+		t.Fatalf("label 首次写入后不应再变，实际 %q", got.Label)
+	}
+
+	// notfound：name 保留旧值（不清空），label 不动
+	if err := s.SaveExternalContact(ExternalContact{
+		ExternalUserID: id, Name: got.Name, CorpName: got.CorpName,
+		Status: "notfound", FetchedAt: 300,
+	}); err != nil {
+		t.Fatalf("SaveExternalContact notfound: %v", err)
+	}
+	got, ok, err = s.GetExternalContact(id)
+	if err != nil || !ok {
+		t.Fatalf("读 notfound 记录: %v ok=%v", err, ok)
+	}
+	if got.Status != "notfound" || got.Name != "张三丰" || got.Label != "张三@某公司_RP001" || got.FetchedAt != 300 {
+		t.Fatalf("notfound 记录不符: %+v", got)
+	}
+}
+
+// 迁移：旧版 room_names（无 source 列）升级后补列，旧记录照常可读。
+func TestMigrateRoomNamesSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy_room.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE room_names;
+CREATE TABLE room_names (
+  room_id    TEXT PRIMARY KEY,
+  name       TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO room_names (room_id, name, updated_at) VALUES ('wrTESTLEGACY', '老群名', 100);`); err != nil {
+		t.Fatalf("准备旧结构: %v", err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("迁移重开失败: %v", err)
+	}
+	defer s.Close()
+
+	if !s.hasColumn("room_names", "source") {
+		t.Fatal("迁移后应存在 room_names.source 列")
+	}
+	name, source, ok := s.GetRoomNameWithSource("wrTESTLEGACY")
+	if !ok || name != "老群名" || source != "" {
+		t.Fatalf("旧记录读回不符: %q %q %v", name, source, ok)
+	}
+	// 无记录：ok=false，不报错
+	if n, src, ok := s.GetRoomNameWithSource("wrTESTNONE"); ok || n != "" || src != "" {
+		t.Fatalf("无记录应返回 ok=false: %q %q %v", n, src, ok)
+	}
+}
+
+// 推断名只在首次写入时生效，之后同一群沿用旧名字（不再随成员变化）。
+func TestSetInferredRoomNameKeepsFirst(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	const room = "wrTESTINFER01"
+	got, err := s.SetInferredRoomName(room, "张三、李四的群聊")
+	if err != nil {
+		t.Fatalf("SetInferredRoomName: %v", err)
+	}
+	if got != "张三、李四的群聊" {
+		t.Fatalf("首次写入应生效，得到 %q", got)
+	}
+	name, source, ok := s.GetRoomNameWithSource(room)
+	if !ok || name != "张三、李四的群聊" || source != RoomNameSourceInferred {
+		t.Fatalf("首次写入记录不符: %q %q %v", name, source, ok)
+	}
+
+	// 第二次传不同名字：不覆盖，返回第一次的名字
+	got, err = s.SetInferredRoomName(room, "张三、李四、王五的群聊")
+	if err != nil {
+		t.Fatalf("SetInferredRoomName 二次: %v", err)
+	}
+	if got != "张三、李四的群聊" {
+		t.Fatalf("已有记录不应被覆盖，返回 %q", got)
+	}
+	if name, _, _ := s.GetRoomNameWithSource(room); name != "张三、李四的群聊" {
+		t.Fatalf("库里的名字不应变化，得到 %q", name)
+	}
+
+	// 库里记录的名字为空（例如外部写入空串）时允许补写
+	if err := s.SetRoomName(room, ""); err != nil {
+		t.Fatalf("SetRoomName: %v", err)
+	}
+	got, err = s.SetInferredRoomName(room, "张三、李四、王五的群聊")
+	if err != nil {
+		t.Fatalf("SetInferredRoomName 空记录补写: %v", err)
+	}
+	if got != "张三、李四、王五的群聊" {
+		t.Fatalf("名字为空时应允许补写，得到 %q", got)
+	}
+}
+
+// 客户群名缓存：全字段覆盖读写。
+func TestGroupChatCache(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "group.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	const room = "wrTESTGROUP01"
+	if g, ok, err := s.GetGroupChat(room); err != nil || ok || g.RoomID != "" {
+		t.Fatalf("空库应返回 ok=false: %+v %v %v", g, ok, err)
+	}
+	if err := s.SaveGroupChat(GroupChat{RoomID: room, Name: "江湾测试群", Status: "ok", FetchedAt: 100}); err != nil {
+		t.Fatalf("SaveGroupChat: %v", err)
+	}
+	g, ok, err := s.GetGroupChat(room)
+	if err != nil || !ok {
+		t.Fatalf("GetGroupChat: %v ok=%v", err, ok)
+	}
+	if g.RoomID != room || g.Name != "江湾测试群" || g.Status != "ok" || g.FetchedAt != 100 {
+		t.Fatalf("首次保存不符: %+v", g)
+	}
+
+	// 第二次：群改名 → 全字段覆盖
+	if err := s.SaveGroupChat(GroupChat{RoomID: room, Name: "江湾新群", Status: "ok", FetchedAt: 200}); err != nil {
+		t.Fatalf("SaveGroupChat 覆盖: %v", err)
+	}
+	g, _, err = s.GetGroupChat(room)
+	if err != nil {
+		t.Fatalf("GetGroupChat: %v", err)
+	}
+	if g.Name != "江湾新群" || g.FetchedAt != 200 {
+		t.Fatalf("应全字段覆盖: %+v", g)
+	}
+
+	// notfound 覆盖 ok（name 清空属正常）
+	if err := s.SaveGroupChat(GroupChat{RoomID: room, Name: "", Status: "notfound", FetchedAt: 300}); err != nil {
+		t.Fatalf("SaveGroupChat notfound: %v", err)
+	}
+	g, ok, err = s.GetGroupChat(room)
+	if err != nil || !ok {
+		t.Fatalf("读 notfound 记录: %v ok=%v", err, ok)
+	}
+	if g.Status != "notfound" || g.Name != "" || g.FetchedAt != 300 {
+		t.Fatalf("notfound 记录不符: %+v", g)
 	}
 }

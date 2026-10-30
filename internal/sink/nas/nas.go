@@ -2,11 +2,13 @@
 // 目录结构（用户决策，第一层人名以身份解析器查出的姓名为准）：
 //
 // 企微（消息）：
-//   <root>/<人名>/企微/conversations/<会话>.md         会话正文（滚动追加，去重）
-//   <root>/<人名>/企微/<msgid>_<附件名>                 附件原件（平铺）
+//
+//	<root>/<人名>/企微/conversations/<会话>.md         会话正文（滚动追加，去重）
+//	<root>/<人名>/企微/<msgid>_<附件名>                 附件原件（平铺）
 //
 // 飞书（文件）：
-//   <root>/<人名>/飞书/<文件名>                        源文件平铺（.docx/.xlsx/.pdf/.md 等）
+//
+//	<root>/<人名>/飞书/<文件名>                        源文件平铺（.docx/.xlsx/.pdf/.md 等）
 //
 // 说明：
 //   - 企微不再落 messages/*.json。原始 JSON 混有大量协议字段（encrypt_*、seq 等），
@@ -40,9 +42,9 @@ type Config struct {
 	URL           string            `yaml:"url"`
 	Username      string            `yaml:"username"`
 	Password      string            `yaml:"password"`
-	RootPath      string            `yaml:"root_path"`         // 落盘根路径，如 /FastGPT-test
-	GroupNames    map[string]string `yaml:"group_names"`       // 显式配置的群聊 ID -> 群名称映射
-	MaxFileSizeMB int64             `yaml:"max_file_size_mb"`  // 单附件上限（MB），默认 200MB，防大文件打爆内存 OOM
+	RootPath      string            `yaml:"root_path"`        // 落盘根路径，如 /FastGPT-test
+	GroupNames    map[string]string `yaml:"group_names"`      // 显式配置的群聊 ID -> 群名称映射
+	MaxFileSizeMB int64             `yaml:"max_file_size_mb"` // 单附件上限（MB），默认 200MB，防大文件打爆内存 OOM
 }
 
 const defaultMaxFileSizeMB = 200
@@ -77,6 +79,8 @@ type Sink struct {
 	clf    *classifier.Classifier
 	ids    identity.Resolver
 	store  *storage.Store
+	ext    ExternalNamer // 企微外部联系人（客户）名字解析；nil=不解析（直接用 ID）
+	groups GroupNamer    // 企微客户群真实群名；nil=只用配置/推断名
 
 	mu           sync.Mutex
 	batchMode    bool
@@ -109,6 +113,34 @@ func New(cfg Config, clf *classifier.Classifier, ids identity.Resolver, store *s
 }
 
 func (s *Sink) Name() string { return "nas" }
+
+// ExternalNamer 企微外部联系人名字解析（*wecomcontact.Resolver 满足）。
+// Display：会话正文里的发送人名字；FileLabel：单聊文件名用的固定标签。
+type ExternalNamer interface {
+	Display(ctx context.Context, id string) string
+	FileLabel(ctx context.Context, id string) string
+}
+
+// SetExternalNamer 注入外部联系人名字解析器（nil=不解析，保持用 ID 的旧行为）。
+func (s *Sink) SetExternalNamer(n ExternalNamer) { s.ext = n }
+
+// GroupNamer 企微客户群真实群名（*wecomcontact.GroupResolver 满足）。
+// GroupName：查到群名返回名字，查不到/群没起名返回空串。
+type GroupNamer interface {
+	GroupName(ctx context.Context, roomID string) string
+}
+
+// SetGroupNamer 注入客户群名解析器（nil=只用配置名与推断名）。
+func (s *Sink) SetGroupNamer(n GroupNamer) { s.groups = n }
+
+// groupNameLimit 推断群名最多取几个成员姓名。
+const groupNameLimit = 3
+
+// isExternalID 是否企微外部联系人 ID（wm/wo 开头，微信客户/企微客户）。
+// 与 wecomcontact.IsExternal 同义，这里本地实现避免 nas → wecomcontact 的包依赖。
+func isExternalID(id string) bool {
+	return strings.HasPrefix(id, "wm") || strings.HasPrefix(id, "wo")
+}
 
 // SetBatchMode 开启/关闭批次缓冲模式。
 // 开启后，对会话 Markdown 的追加会缓存在内存中并去重合并，避免频繁读写群晖 WebAPI。
@@ -168,8 +200,8 @@ type Meta struct {
 	SenderID     string   `json:"sender_id"`
 	GroupID      string   `json:"group_id"`
 	Category     string   `json:"category"`
-	OwnerIDs     []string `json:"owner_ids"`           // 权限快照：可见人（原始 id）
-	Persons      []string `json:"persons,omitempty"`   // 解析后的人名
+	OwnerIDs     []string `json:"owner_ids"`         // 权限快照：可见人（原始 id）
+	Persons      []string `json:"persons,omitempty"` // 解析后的人名
 	MsgTime      int64    `json:"msg_time"`
 	ArchivedAt   string   `json:"archived_at"`
 	Frozen       bool     `json:"frozen"`
@@ -186,39 +218,39 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 	m, parseErr := render.Parse(r.Body)
 
 	// 附件字节缓存：一条记录 fan-out 到多人时，同一附件只拉一次（飞书文档 owner+可见人场景省一半下载）
-		attCache := map[string][]byte{}
-		cachedRead := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
-			if a.FileID != "" {
-				if data, ok := attCache[a.FileID]; ok {
-					return io.NopCloser(bytes.NewReader(data)), nil
-				}
+	attCache := map[string][]byte{}
+	cachedRead := func(ctx context.Context, a *model.Attachment) (io.ReadCloser, error) {
+		if a.FileID != "" {
+			if data, ok := attCache[a.FileID]; ok {
+				return io.NopCloser(bytes.NewReader(data)), nil
 			}
-			maxSize := s.maxFileSize()
-			if a.Size > maxSize {
-				log.Printf("[nas] 附件 %s 大小超出限制（%.1f MB > %d MB），跳过读取以保护内存",
-					a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
-				return nil, ErrOversized
-			}
-			rc, err := read(ctx, a)
-			if err != nil {
-				return nil, err
-			}
-			lr := io.LimitReader(rc, maxSize+1)
-			data, err := io.ReadAll(lr)
-			rc.Close()
-			if err != nil {
-				return nil, err
-			}
-			if int64(len(data)) > maxSize {
-				log.Printf("[nas] 附件 %s 实际内容超出限制（> %d MB），已跳过归档以保护内存",
-					a.Name, maxSize/(1024*1024))
-				return nil, ErrOversized
-			}
-			if a.FileID != "" {
-				attCache[a.FileID] = data
-			}
-			return io.NopCloser(bytes.NewReader(data)), nil
 		}
+		maxSize := s.maxFileSize()
+		if a.Size > maxSize {
+			log.Printf("[nas] 附件 %s 大小超出限制（%.1f MB > %d MB），跳过读取以保护内存",
+				a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
+			return nil, ErrOversized
+		}
+		rc, err := read(ctx, a)
+		if err != nil {
+			return nil, err
+		}
+		lr := io.LimitReader(rc, maxSize+1)
+		data, err := io.ReadAll(lr)
+		rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(data)) > maxSize {
+			log.Printf("[nas] 附件 %s 实际内容超出限制（> %d MB），已跳过归档以保护内存",
+				a.Name, maxSize/(1024*1024))
+			return nil, ErrOversized
+		}
+		if a.FileID != "" {
+			attCache[a.FileID] = data
+		}
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
 
 	// 群成员学习：企微群聊 tolist 为空，靠发言记录逐步积累成员
 	if parseErr == nil && m.RoomID != "" {
@@ -227,22 +259,22 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 		}
 	}
 
-		// 参与者集合：OwnerIDs（可见人集合：企微=from+tolist / 飞书=owner+可见授权用户）
-		// + 消息解析出的参与者 + 已知群成员
-		var users []string
-		seen := map[string]bool{}
-		add := func(u string) {
-			if u == "" || seen[u] {
-				return
-			}
-			// 企微外部联系人/客户（以 wm/wo 开头）不建独立的员工归档根目录，
-			// 避免在 NAS 产生海量客户空目录与冗余附件上传，但内部员工目录内依然完整保留与客户的对话
-			if r.Source == "wecom" && (strings.HasPrefix(u, "wm") || strings.HasPrefix(u, "wo")) {
-				return
-			}
-			seen[u] = true
-			users = append(users, u)
+	// 参与者集合：OwnerIDs（可见人集合：企微=from+tolist / 飞书=owner+可见授权用户）
+	// + 消息解析出的参与者 + 已知群成员
+	var users []string
+	seen := map[string]bool{}
+	add := func(u string) {
+		if u == "" || seen[u] {
+			return
 		}
+		// 企微外部联系人/客户（以 wm/wo 开头）不建独立的员工归档根目录，
+		// 避免在 NAS 产生海量客户空目录与冗余附件上传，但内部员工目录内依然完整保留与客户的对话
+		if r.Source == "wecom" && (strings.HasPrefix(u, "wm") || strings.HasPrefix(u, "wo")) {
+			return
+		}
+		seen[u] = true
+		users = append(users, u)
+	}
 	for _, u := range r.OwnerIDs {
 		add(u)
 	}
@@ -262,40 +294,52 @@ func (s *Sink) WriteRecord(ctx context.Context, r model.Record, read sink.Attach
 		add(r.SenderID) // 解析失败兜底：至少写发送者目录
 	}
 
-		nameOf := func(uid string) string {
-			if s.ids == nil {
-				return uid
+	nameOf := func(uid string) string {
+		// 企微外部联系人（客户）：只用于显示，不建员工目录
+		if r.Source == "wecom" && isExternalID(uid) {
+			if s.ext == nil {
+				return uid // 没配客户联系应用：保持旧行为
 			}
-			return s.ids.PersonName(r.Source, uid)
+			return s.ext.Display(ctx, uid)
 		}
+		if s.ids == nil {
+			return uid
+		}
+		// T1 之后非纳管员工（不在名单/离职/重名）PersonName 返回空串，这里兜底用 ID，
+		// 否则会出现 "与的单聊.md" 和空发送人
+		if n := s.ids.PersonName(r.Source, uid); n != "" {
+			return n
+		}
+		return uid
+	}
 
-		// 飞书云端删除事件：同步清理 NAS 物理文件
-		if r.Kind == "delete" {
-			for _, uid := range users {
-				person := sanitize(nameOf(uid))
-				if person == "" {
-					continue
+	// 飞书云端删除事件：同步清理 NAS 物理文件
+	if r.Kind == "delete" {
+		for _, uid := range users {
+			person := sanitize(nameOf(uid))
+			if person == "" {
+				continue
+			}
+			base := path.Join(s.cfg.RootPath, person, platform)
+			for _, a := range r.Attachments {
+				cleanName := sanitize(a.Name)
+				if cleanName == "" || cleanName == "." || cleanName == ".." {
+					continue // 文件名为空或特殊相对路径时绝对禁止删除，防止 path.Join 返回目录本身造成整目录误删
 				}
-				base := path.Join(s.cfg.RootPath, person, platform)
-					for _, a := range r.Attachments {
-						cleanName := sanitize(a.Name)
-						if cleanName == "" || cleanName == "." || cleanName == ".." {
-							continue // 文件名为空或特殊相对路径时绝对禁止删除，防止 path.Join 返回目录本身造成整目录误删
-						}
-						for _, sub := range []string{"云文档", "邮件", ""} {
-							targetFile := path.Join(base, sub, cleanName)
-							// 删除失败要返回错误：不 Ack，下一轮重试（文件不存在已在 Delete 内视为成功）
-							if err := s.fs.Delete(targetFile); err != nil {
-								return err
-							}
-						}
-						log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s/%s", base, cleanName)
+				for _, sub := range []string{"云文档", "邮件", ""} {
+					targetFile := path.Join(base, sub, cleanName)
+					// 删除失败要返回错误：不 Ack，下一轮重试（文件不存在已在 Delete 内视为成功）
+					if err := s.fs.Delete(targetFile); err != nil {
+						return err
 					}
+				}
+				log.Printf("[nas] 飞书端已删除，同步清理 NAS: %s/%s", base, cleanName)
 			}
-			return nil
 		}
+		return nil
+	}
 
-		var firstErr error
+	var firstErr error
 	for _, uid := range users {
 		if ctx.Err() != nil {
 			return ctx.Err() // 停止信号：剩余用户目录由下轮（消息去重保证幂等）补齐
@@ -337,83 +381,90 @@ func (s *Sink) writeForPerson(ctx context.Context, r model.Record, m *render.Msg
 	// 对下游（NAS 归档 / FastGPT 检索）没有价值，反而占空间、干扰阅读。
 	// 只保留：会话正文 Markdown（滚动追加）+ 附件原件。
 
-		// 1) 会话正文 Markdown 滚动追加（按 消息×人 去重）
-		if msgOK && r.Source == "wecom" {
-			if logged, err := s.store.IsMessageLogged(r.ID, person); err == nil && !logged {
-				if line, skip := render.RenderLine(m, nameOf); !skip {
-					convFile := s.convFileName(m, uid, nameOf)
-					if err := s.appendFileWithMeta(path.Join(base, "群聊记录"), convFile, line, r.ID, person, r.Timestamp); err != nil {
-						return fmt.Errorf("追加会话 markdown: %w", err)
-					}
-				} else {
-					_ = s.store.LogMessage(r.ID, person, r.Timestamp)
+	// 1) 会话正文 Markdown 滚动追加（按 消息×人 去重）
+	if msgOK && r.Source == "wecom" {
+		if logged, err := s.store.IsMessageLogged(r.ID, person); err == nil && !logged {
+			if line, skip := render.RenderLine(m, nameOf); !skip {
+				convFile := s.convFileName(ctx, m, uid, nameOf)
+				if err := s.appendFileWithMeta(path.Join(base, "群聊记录"), convFile, line, r.ID, person, r.Timestamp); err != nil {
+					return fmt.Errorf("追加会话 markdown: %w", err)
 				}
+			} else {
+				_ = s.store.LogMessage(r.ID, person, r.Timestamp)
 			}
 		}
+	}
 
-		// 2) 附件：普通文件按发送日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A）；
-		// 图片消息则归档至 <人名>/企微/群聊记录/images/<YYYY-MM-DD>/ 下，供会话 Markdown 相对路径出图。
-		dateFolder := time.UnixMilli(r.Timestamp).Format("2006-01-02")
-		if dateFolder == "" || r.Timestamp <= 0 {
-			dateFolder = time.Now().Format("2006-01-02")
+	// 2) 附件：普通文件按发送日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A）；
+	// 图片消息则归档至 <人名>/企微/群聊记录/images/<YYYY-MM-DD>/ 下，供会话 Markdown 相对路径出图。
+	dateFolder := time.UnixMilli(r.Timestamp).Format("2006-01-02")
+	if dateFolder == "" || r.Timestamp <= 0 {
+		dateFolder = time.Now().Format("2006-01-02")
+	}
+	targetDir := path.Join(base, dateFolder)
+	if r.Kind == "image" {
+		targetDir = path.Join(base, "群聊记录", "images", dateFolder)
+	}
+
+	for i := range r.Attachments {
+		if ctx.Err() != nil {
+			return ctx.Err() // 停止信号：附件下载是耗时大头，必须能中断
 		}
-		targetDir := path.Join(base, dateFolder)
-		if r.Kind == "image" {
-			targetDir = path.Join(base, "群聊记录", "images", dateFolder)
+		a := &r.Attachments[i]
+		maxSize := s.maxFileSize()
+		if a.Size > maxSize {
+			log.Printf("[nas] 附件 %s 超出大小限制（%.1f MB > %d MB），跳过归档以保护内存",
+				a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
+			continue
 		}
-
-			for i := range r.Attachments {
-				if ctx.Err() != nil {
-					return ctx.Err() // 停止信号：附件下载是耗时大头，必须能中断
-				}
-				a := &r.Attachments[i]
-				maxSize := s.maxFileSize()
-				if a.Size > maxSize {
-					log.Printf("[nas] 附件 %s 超出大小限制（%.1f MB > %d MB），跳过归档以保护内存",
-						a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
-					continue
-				}
-					rc, err := read(ctx, a)
-					if err != nil {
-						if ctx.Err() != nil {
-							return ctx.Err()
-						}
-						if errors.Is(err, ErrOversized) {
-							continue
-						}
-						log.Printf("[nas] 附件拉取失败 %s（%s）: %v", a.Name, a.FileID, err)
-						continue
-					}
-				lr := io.LimitReader(rc, maxSize+1)
-				data, err := io.ReadAll(lr)
-				rc.Close()
-				if err != nil {
-					log.Printf("[nas] 附件读取失败 %s: %v", a.Name, err)
-					continue
-				}
-				if int64(len(data)) > maxSize {
-					log.Printf("[nas] 附件 %s 实际内容超出大小限制（> %d MB），已跳过归档以保护内存",
-						a.Name, maxSize/(1024*1024))
-					continue
-				}
-
-				cleanName := sanitize(a.Name)
-			if cleanName == "" {
-				cleanName = a.FileID
+		rc, err := read(ctx, a)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			if err := s.fs.UploadBytes(cleanName, targetDir, data); err != nil {
-				log.Printf("[nas] 附件上传失败 %s: %v", a.Name, err)
+			if errors.Is(err, ErrOversized) {
 				continue
 			}
-			log.Printf("[nas] 已归档 %s/%s（%.1f KB）", targetDir, cleanName, float64(len(data))/1024)
+			log.Printf("[nas] 附件拉取失败 %s（%s）: %v", a.Name, a.FileID, err)
+			continue
 		}
-		return nil
+		lr := io.LimitReader(rc, maxSize+1)
+		data, err := io.ReadAll(lr)
+		rc.Close()
+		if err != nil {
+			log.Printf("[nas] 附件读取失败 %s: %v", a.Name, err)
+			continue
+		}
+		if int64(len(data)) > maxSize {
+			log.Printf("[nas] 附件 %s 实际内容超出大小限制（> %d MB），已跳过归档以保护内存",
+				a.Name, maxSize/(1024*1024))
+			continue
+		}
+
+		cleanName := sanitize(a.Name)
+		if cleanName == "" {
+			cleanName = a.FileID
+		}
+		if err := s.fs.UploadBytes(cleanName, targetDir, data); err != nil {
+			log.Printf("[nas] 附件上传失败 %s: %v", a.Name, err)
+			continue
+		}
+		log.Printf("[nas] 已归档 %s/%s（%.1f KB）", targetDir, cleanName, float64(len(data))/1024)
+	}
+	return nil
 }
 
 // convFileName 计算查看者视角的会话文件名。
-// 单聊：以对方姓名命名（与李四的单聊.md）；
-// 群聊：优先使用配置或数据库中的群名；若无则智能提取群内实名员工姓名（如 群聊_罗静怡、王永国等人的群聊.md）；未解析出员工时兜底使用 roomid。
-func (s *Sink) convFileName(m *render.Msg, forUser string, nameOf func(string) string) string {
+// 单聊：以对方姓名命名（与李四的单聊.md；对方是企微外部联系人时用固定标签，如 与张三@某公司_ab12的单聊.md）；
+// 群聊（按顺序取第一个可用的）：
+//  1. 配置里的群名映射；
+//  2. 企微客户联系接口查到的真实群名（群改名后新消息进新名字的文件）；
+//  3. 库里已固定的推断名（source=inferred，写定后不再随成员变化）；
+//  4. 现场推断（已知成员里的内部实名员工，前 3 个）并写库固定；
+//  5. 兜底：群聊_未命名群聊_<roomID 后6位>.md。
+//
+// 任何情况下都不输出完整 roomID。
+func (s *Sink) convFileName(ctx context.Context, m *render.Msg, forUser string, nameOf func(string) string) string {
 	if m.RoomID == "" {
 		counterpart := ""
 		for _, u := range m.Participants() {
@@ -424,6 +475,14 @@ func (s *Sink) convFileName(m *render.Msg, forUser string, nameOf func(string) s
 		}
 		if counterpart == "" {
 			counterpart = m.From
+		}
+		// 员工给自己发的消息（tolist 只有本人，常用作备忘）
+		if counterpart == forUser {
+			return "与自己的单聊.md"
+		}
+		// 外部联系人：文件名用首次查到时定下的固定标签，客户改名也不产生新文件
+		if s.ext != nil && isExternalID(counterpart) {
+			return fmt.Sprintf("与%s的单聊.md", sanitize(s.ext.FileLabel(ctx, counterpart)))
 		}
 		name := counterpart
 		if nameOf != nil {
@@ -439,51 +498,107 @@ func (s *Sink) convFileName(m *render.Msg, forUser string, nameOf func(string) s
 		}
 	}
 
-	// 2. 查数据库记录的群名
-	if s.store != nil {
-		if gn := s.store.GetRoomName(m.RoomID); gn != "" {
+	// 2. 客户群接口查到的真实群名
+	if s.groups != nil {
+		if gn := s.groups.GroupName(ctx, m.RoomID); gn != "" {
 			return fmt.Sprintf("群聊_%s.md", sanitize(gn))
 		}
 	}
 
-	// 3. 智能推断：根据已知群成员姓名生成自然语言群名（如 "群聊_罗静怡、王永国、张建丰等人的群聊.md"）
+	// 3. 库里已固定的推断名（只认 source=inferred；source 为空的历史记录也照用）
 	if s.store != nil {
-		members, err := s.store.ListRoomParticipants(m.RoomID)
-		if err == nil && len(members) > 0 {
-			var memberNames []string
-			seenNames := map[string]bool{}
-			for _, uid := range members {
-				if strings.HasPrefix(uid, "wm") || strings.HasPrefix(uid, "wo") {
-					continue
-				}
-				name := uid
-				if nameOf != nil {
-					name = nameOf(uid)
-				}
-				if strings.HasPrefix(name, "wm") || strings.HasPrefix(name, "wo") || name == "" {
-					continue
-				}
-				if !seenNames[name] {
-					seenNames[name] = true
-					memberNames = append(memberNames, name)
-				}
-			}
-			if len(memberNames) > 0 {
-				limit := 3
-				if len(memberNames) < limit {
-					limit = len(memberNames)
-				}
-				joined := strings.Join(memberNames[:limit], "、")
-				if len(memberNames) > limit {
-					return fmt.Sprintf("群聊_%s等人的群聊.md", sanitize(joined))
-				}
-				return fmt.Sprintf("群聊_%s的群聊.md", sanitize(joined))
+		if gn, source, ok := s.store.GetRoomNameWithSource(m.RoomID); ok && (source == "" || source == storage.RoomNameSourceInferred) {
+			if gn = strings.TrimSpace(gn); gn != "" {
+				return fmt.Sprintf("群聊_%s.md", sanitize(gn))
 			}
 		}
 	}
 
-	// 4. 最终兜底使用 roomid
-	return fmt.Sprintf("群聊_%s.md", sanitize(m.RoomID))
+	// 4. 现场推断：只取能解析出名字的内部成员，前 3 个；写库后固定，之后同一个群一直用这个名字
+	if names := s.inferGroupMemberNames(m, nameOf); len(names) > 0 {
+		combined := joinedGroupName(names)
+		final := combined
+		if s.store != nil {
+			if saved, err := s.store.SetInferredRoomName(m.RoomID, combined); err == nil && strings.TrimSpace(saved) != "" {
+				final = strings.TrimSpace(saved)
+			}
+		}
+		return fmt.Sprintf("群聊_%s.md", sanitize(final))
+	}
+
+	// 5. 兜底：不写库，下次还有机会查到真名或推断出成员
+	return fmt.Sprintf("群聊_未命名群聊_%s.md", sanitize(roomIDSuffix(m.RoomID)))
+}
+
+// inferGroupMemberNames 现场推断群名用的成员姓名：
+// 本条消息的参与者 + 库里已学到的群成员，按出现顺序去重，只留内部实名员工。
+// 最多返回 groupNameLimit+1 个（多出来的那个只用来判断是否该加"等人"）。
+func (s *Sink) inferGroupMemberNames(m *render.Msg, nameOf func(string) string) []string {
+	seenUID := map[string]bool{}
+	seenName := map[string]bool{}
+	var names []string
+
+	consider := func(uid string) {
+		if len(names) > groupNameLimit {
+			return
+		}
+		if uid == "" || seenUID[uid] {
+			return
+		}
+		seenUID[uid] = true
+		if !usableGroupMemberID(uid) {
+			return
+		}
+		name := uid
+		if nameOf != nil {
+			name = nameOf(uid)
+		}
+		name = strings.TrimSpace(name)
+		// 解析不出名字（空、还是 ID 本身）不算
+		if name == "" || name == uid || !usableGroupMemberID(name) {
+			return
+		}
+		if seenName[name] {
+			return
+		}
+		seenName[name] = true
+		names = append(names, name)
+	}
+
+	for _, uid := range m.Participants() {
+		consider(uid)
+	}
+	if s.store != nil {
+		if members, err := s.store.ListRoomParticipants(m.RoomID); err == nil {
+			for _, uid := range members {
+				consider(uid)
+			}
+		}
+	}
+	return names
+}
+
+// usableGroupMemberID 能否用来推断群名：跳过外部联系人（wm/wo）与机器人（wb 开头）。
+func usableGroupMemberID(id string) bool {
+	return id != "" && !isExternalID(id) && !strings.HasPrefix(id, "wb")
+}
+
+// joinedGroupName 把姓名列表拼成自然语言群名：
+// 超过 groupNameLimit 个用 "<A、B、C>等人的群聊"，否则 "<A、B>的群聊"。
+func joinedGroupName(names []string) string {
+	if len(names) > groupNameLimit {
+		return strings.Join(names[:groupNameLimit], "、") + "等人的群聊"
+	}
+	return strings.Join(names, "、") + "的群聊"
+}
+
+// roomIDSuffix 兜底文件名里的 ID 片段：只取后 6 位，绝不输出完整 roomID。
+func roomIDSuffix(roomID string) string {
+	rs := []rune(roomID)
+	if len(rs) <= 6 {
+		return string(rs)
+	}
+	return string(rs[len(rs)-6:])
 }
 
 // appendFile 滚动追加（保持旧签名兼容测试）。
@@ -632,20 +747,20 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 				a.Name, float64(a.Size)/(1024*1024), maxSize/(1024*1024))
 			continue
 		}
-			rc, err := read(ctx, a)
-			if err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if errors.Is(err, ErrOversized) {
-					continue
-				}
-				log.Printf("[nas] 飞书文件拉取失败 %s: %v", a.Name, err)
-				if firstErr == nil {
-					firstErr = err
-				}
+		rc, err := read(ctx, a)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, ErrOversized) {
 				continue
 			}
+			log.Printf("[nas] 飞书文件拉取失败 %s: %v", a.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		lr := io.LimitReader(rc, maxSize+1)
 		data, err := io.ReadAll(lr)
 		rc.Close()
@@ -663,30 +778,30 @@ func (s *Sink) writeFeishuFiles(ctx context.Context, r model.Record, base string
 		}
 
 		// 飞书统一两大归档目录：所有云文档/表格/知识库/纪要全部归于 云文档/，邮件附件归于 邮件/
-			destDir := path.Join(base, "云文档")
-			if r.Kind == "mail" {
-				destDir = path.Join(base, "邮件")
+		destDir := path.Join(base, "云文档")
+		if r.Kind == "mail" {
+			destDir = path.Join(base, "邮件")
+		}
+		if err := s.fs.UploadBytes(sanitize(a.Name), destDir, data); err != nil {
+			log.Printf("[nas] 飞书文件上传失败 %s: %v", a.Name, err)
+			if firstErr == nil {
+				firstErr = err
 			}
-			if err := s.fs.UploadBytes(sanitize(a.Name), destDir, data); err != nil {
-				log.Printf("[nas] 飞书文件上传失败 %s: %v", a.Name, err)
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			log.Printf("[nas] 已归档 %s/%s（%.1f KB）", destDir, a.Name, float64(len(data))/1024)
-				// 文档改名：新文件写成功后再删旧文件，中途失败也不会丢文件
-				if a.PrevName != "" && a.PrevName != a.Name {
-					cleanName := sanitize(a.Name)
-					if cleanPrev := sanitize(a.PrevName); cleanPrev != "" && cleanPrev != cleanName && cleanPrev != "." && cleanPrev != ".." {
-						if err := s.fs.Delete(path.Join(destDir, cleanPrev)); err != nil {
-							log.Printf("[nas] 删除改名前的旧文件失败 %s: %v", a.PrevName, err)
-							if firstErr == nil {
-								firstErr = err
-							}
-						}
+			continue
+		}
+		log.Printf("[nas] 已归档 %s/%s（%.1f KB）", destDir, a.Name, float64(len(data))/1024)
+		// 文档改名：新文件写成功后再删旧文件，中途失败也不会丢文件
+		if a.PrevName != "" && a.PrevName != a.Name {
+			cleanName := sanitize(a.Name)
+			if cleanPrev := sanitize(a.PrevName); cleanPrev != "" && cleanPrev != cleanName && cleanPrev != "." && cleanPrev != ".." {
+				if err := s.fs.Delete(path.Join(destDir, cleanPrev)); err != nil {
+					log.Printf("[nas] 删除改名前的旧文件失败 %s: %v", a.PrevName, err)
+					if firstErr == nil {
+						firstErr = err
 					}
 				}
+			}
+		}
 	}
 	return firstErr
 }

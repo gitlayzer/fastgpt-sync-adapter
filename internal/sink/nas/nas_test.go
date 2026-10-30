@@ -56,6 +56,15 @@ func (r fakeResolver) ResolveFeishu(u string) (*storage.Identity, error) {
 	return &storage.Identity{FeishuUserID: u, PersonName: r.PersonName("feishu", u)}, nil
 }
 
+// Managed 测试用：假解析器里所有人都是在职员工。
+func (r fakeResolver) Managed(source, id string) (*storage.Identity, bool) {
+	name := r.PersonName(source, id)
+	if name == "" {
+		return nil, false
+	}
+	return &storage.Identity{WeComUserID: id, PersonName: name, Status: storage.IdentityActive}, true
+}
+
 type errorFS struct {
 	*fakeFS
 	err error
@@ -87,6 +96,16 @@ func dmRecord(msgid, from, to, content string) model.Record {
 	}
 }
 
+func TestSelfChatFileName(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	if err := s.WriteRecord(context.Background(), dmRecord("m1", "u1", "u1", "备忘"), nil); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	if _, ok := fs.files["/FastGPT-test/张三/企微/群聊记录/与自己的单聊.md"]; !ok {
+		t.Fatalf("自己给自己发的消息应写入 与自己的单聊.md，实际文件: %v", fs.files)
+	}
+}
+
 func TestSingleChatFanOut(t *testing.T) {
 	s, fs, _ := newTestSink(t)
 	rec := dmRecord("m1", "u1", "u2", "合同看一下")
@@ -98,73 +117,73 @@ func TestSingleChatFanOut(t *testing.T) {
 		if _, ok := fs.files["/FastGPT-test/"+p+"/企微/messages/m1.json"]; ok {
 			t.Fatalf("%s 不应再写 messages/m1.json（已改为只存正文与附件）", p)
 		}
-			if _, ok := fs.files["/FastGPT-test/"+p+"/企微/群聊记录/与"+map[string]string{"张三": "李四", "李四": "张三"}[p]+"的单聊.md"]; !ok {
-				t.Fatalf("%s 缺会话 md", p)
-			}
-		}
-		md1 := string(fs.files["/FastGPT-test/张三/企微/群聊记录/与李四的单聊.md"])
-		md2 := string(fs.files["/FastGPT-test/李四/企微/群聊记录/与张三的单聊.md"])
-		if !strings.Contains(md1, "合同看一下") || !strings.Contains(md1, "张三") {
-			t.Fatalf("张三 md 内容不对:\n%s", md1)
-		}
-		if !strings.Contains(md2, "合同看一下") {
-			t.Fatalf("李四 md 内容不对:\n%s", md2)
-		}
-		md1 = strings.TrimPrefix(md1, "\xef\xbb\xbf")
-		if !strings.HasPrefix(md1, "# 与李四的单聊") {
-			t.Fatalf("md 缺标题:\n%s", md1)
+		if _, ok := fs.files["/FastGPT-test/"+p+"/企微/群聊记录/与"+map[string]string{"张三": "李四", "李四": "张三"}[p]+"的单聊.md"]; !ok {
+			t.Fatalf("%s 缺会话 md", p)
 		}
 	}
-
-	func TestMarkdownRollingAppendAndDedup(t *testing.T) {
-		s, fs, _ := newTestSink(t)
-		r1 := dmRecord("m1", "u1", "u2", "第一条")
-		r2 := dmRecord("m2", "u2", "u1", "第二条")
-		s.WriteRecord(context.Background(), r1, nil)
-		s.WriteRecord(context.Background(), r2, nil)
-		// 重复投递 m1（模拟崩溃重拉）：不应重复追加
-		s.WriteRecord(context.Background(), r1, nil)
-
-		md := string(fs.files["/FastGPT-test/张三/企微/群聊记录/与李四的单聊.md"])
-		if c := strings.Count(md, "第一条"); c != 1 {
-			t.Fatalf("去重失败, 第一条出现 %d 次:\n%s", c, md)
-		}
-		if !strings.Contains(md, "第二条") {
-			t.Fatalf("滚动追加失败:\n%s", md)
-		}
-		// 顺序：第一条在第二条前
-		if strings.Index(md, "第一条") > strings.Index(md, "第二条") {
-			t.Fatalf("顺序不对:\n%s", md)
-		}
+	md1 := string(fs.files["/FastGPT-test/张三/企微/群聊记录/与李四的单聊.md"])
+	md2 := string(fs.files["/FastGPT-test/李四/企微/群聊记录/与张三的单聊.md"])
+	if !strings.Contains(md1, "合同看一下") || !strings.Contains(md1, "张三") {
+		t.Fatalf("张三 md 内容不对:\n%s", md1)
 	}
+	if !strings.Contains(md2, "合同看一下") {
+		t.Fatalf("李四 md 内容不对:\n%s", md2)
+	}
+	md1 = strings.TrimPrefix(md1, "\xef\xbb\xbf")
+	if !strings.HasPrefix(md1, "# 与李四的单聊") {
+		t.Fatalf("md 缺标题:\n%s", md1)
+	}
+}
 
-	func TestGroupChatLearnsMembers(t *testing.T) {
-		s, fs, _ := newTestSink(t)
-		s.cfg.GroupNames = map[string]string{"roomA": "项目组"}
-		room := `{"msgid":"%s","action":"send","from":"%s","roomid":"roomA","msgtime":1760000000000,"msgtype":"text","text":{"content":"%s"}}`
-		// u1 先发言：此时已知成员只有 u1，只有 u1 目录有
-		s.WriteRecord(context.Background(), model.Record{
-			Source: "wecom", Kind: "text", ID: "g1", Timestamp: 1760000000000, SenderID: "u1",
-			OwnerIDs: []string{"u1"}, Body: []byte(fmt.Sprintf(room, "g1", "u1", "群消息1")),
-		}, nil)
-		// u2 发言：学到 u2，u2 目录开始有这个群的记录
-		s.WriteRecord(context.Background(), model.Record{
-			Source: "wecom", Kind: "text", ID: "g2", Timestamp: 1760000001000, SenderID: "u2",
-			OwnerIDs: []string{"u2"}, Body: []byte(fmt.Sprintf(room, "g2", "u2", "群消息2")),
-		}, nil)
+func TestMarkdownRollingAppendAndDedup(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	r1 := dmRecord("m1", "u1", "u2", "第一条")
+	r2 := dmRecord("m2", "u2", "u1", "第二条")
+	s.WriteRecord(context.Background(), r1, nil)
+	s.WriteRecord(context.Background(), r2, nil)
+	// 重复投递 m1（模拟崩溃重拉）：不应重复追加
+	s.WriteRecord(context.Background(), r1, nil)
 
-		md1 := string(fs.files["/FastGPT-test/张三/企微/群聊记录/群聊_项目组.md"])
-		md2 := string(fs.files["/FastGPT-test/李四/企微/群聊记录/群聊_项目组.md"])
-		if !strings.Contains(md1, "群消息1") || !strings.Contains(md1, "群消息2") {
-			t.Fatalf("张三应有两条群消息:\n%s", md1)
-		}
-			// u2 目录只有 g2（g1 时群成员未知 u2）
-			if !strings.Contains(md2, "群消息2") || strings.Contains(md2, "群消息1") {
-				t.Fatalf("李四应只有群消息2:\n%s", md2)
-			}
-		}
+	md := string(fs.files["/FastGPT-test/张三/企微/群聊记录/与李四的单聊.md"])
+	if c := strings.Count(md, "第一条"); c != 1 {
+		t.Fatalf("去重失败, 第一条出现 %d 次:\n%s", c, md)
+	}
+	if !strings.Contains(md, "第二条") {
+		t.Fatalf("滚动追加失败:\n%s", md)
+	}
+	// 顺序：第一条在第二条前
+	if strings.Index(md, "第一条") > strings.Index(md, "第二条") {
+		t.Fatalf("顺序不对:\n%s", md)
+	}
+}
 
-	func TestAttachmentArchive(t *testing.T) {
+func TestGroupChatLearnsMembers(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	s.cfg.GroupNames = map[string]string{"roomA": "项目组"}
+	room := `{"msgid":"%s","action":"send","from":"%s","roomid":"roomA","msgtime":1760000000000,"msgtype":"text","text":{"content":"%s"}}`
+	// u1 先发言：此时已知成员只有 u1，只有 u1 目录有
+	s.WriteRecord(context.Background(), model.Record{
+		Source: "wecom", Kind: "text", ID: "g1", Timestamp: 1760000000000, SenderID: "u1",
+		OwnerIDs: []string{"u1"}, Body: []byte(fmt.Sprintf(room, "g1", "u1", "群消息1")),
+	}, nil)
+	// u2 发言：学到 u2，u2 目录开始有这个群的记录
+	s.WriteRecord(context.Background(), model.Record{
+		Source: "wecom", Kind: "text", ID: "g2", Timestamp: 1760000001000, SenderID: "u2",
+		OwnerIDs: []string{"u2"}, Body: []byte(fmt.Sprintf(room, "g2", "u2", "群消息2")),
+	}, nil)
+
+	md1 := string(fs.files["/FastGPT-test/张三/企微/群聊记录/群聊_项目组.md"])
+	md2 := string(fs.files["/FastGPT-test/李四/企微/群聊记录/群聊_项目组.md"])
+	if !strings.Contains(md1, "群消息1") || !strings.Contains(md1, "群消息2") {
+		t.Fatalf("张三应有两条群消息:\n%s", md1)
+	}
+	// u2 目录只有 g2（g1 时群成员未知 u2）
+	if !strings.Contains(md2, "群消息2") || strings.Contains(md2, "群消息1") {
+		t.Fatalf("李四应只有群消息2:\n%s", md2)
+	}
+}
+
+func TestAttachmentArchive(t *testing.T) {
 	s, fs, _ := newTestSink(t)
 	rec := dmRecord("m9", "u1", "u2", "看这个文件")
 	rec.Kind = "file"
@@ -176,17 +195,17 @@ func TestSingleChatFanOut(t *testing.T) {
 	if err := s.WriteRecord(context.Background(), rec, read); err != nil {
 		t.Fatalf("WriteRecord: %v", err)
 	}
-		// 附件按日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A），保持原始文件名无 msgid 前缀
-			dateFolder := time.UnixMilli(rec.Timestamp).Format("2006-01-02")
-			for _, p := range []string{"张三", "李四"} {
-				att := fmt.Sprintf("/FastGPT-test/%s/企微/%s/采购合同V1.docx", p, dateFolder)
-				if string(fs.files[att]) != "PDF" {
-					t.Fatalf("%s 附件内容不对（路径应为: %s）", p, att)
-				}
-				if _, ok := fs.files[att+".meta.json"]; ok {
-					t.Fatalf("%s 不应再写 .meta.json 侧边车", p)
-				}
-			}
+	// 附件按日期组织在 <人名>/企微/<YYYY-MM-DD>/ 下（方案 A），保持原始文件名无 msgid 前缀
+	dateFolder := time.UnixMilli(rec.Timestamp).Format("2006-01-02")
+	for _, p := range []string{"张三", "李四"} {
+		att := fmt.Sprintf("/FastGPT-test/%s/企微/%s/采购合同V1.docx", p, dateFolder)
+		if string(fs.files[att]) != "PDF" {
+			t.Fatalf("%s 附件内容不对（路径应为: %s）", p, att)
+		}
+		if _, ok := fs.files[att+".meta.json"]; ok {
+			t.Fatalf("%s 不应再写 .meta.json 侧边车", p)
+		}
+	}
 }
 
 func TestImageAttachmentArchive(t *testing.T) {
@@ -213,11 +232,11 @@ func TestImageAttachmentArchive(t *testing.T) {
 		// 会话 markdown 应包含相对路径出图语法
 		convPath := fmt.Sprintf("/FastGPT-test/%s/企微/群聊记录/与%s的单聊.md", p, map[string]string{"张三": "李四", "李四": "张三"}[p])
 		md := string(fs.files[convPath])
-			expectedImgSyntax := fmt.Sprintf("![图片](images/%s/image_img101.jpg)", dateFolder)
-			if !strings.Contains(md, expectedImgSyntax) {
-				t.Fatalf("%s 会话记录中应包含相对图片链接 %q, 实际: %s", p, expectedImgSyntax, md)
-			}
+		expectedImgSyntax := fmt.Sprintf("![图片](images/%s/image_img101.jpg)", dateFolder)
+		if !strings.Contains(md, expectedImgSyntax) {
+			t.Fatalf("%s 会话记录中应包含相对图片链接 %q, 实际: %s", p, expectedImgSyntax, md)
 		}
+	}
 }
 
 func TestOversizedAttachmentSkipped(t *testing.T) {
@@ -445,5 +464,288 @@ func TestNASDeletesFileOnCloudDelete(t *testing.T) {
 	}
 }
 
+// fakeExternalNamer 假外部联系人解析器（Display/FileLabel 直接查表）。
+type fakeExternalNamer struct {
+	display map[string]string
+	labels  map[string]string
+}
 
+func (n fakeExternalNamer) Display(_ context.Context, id string) string {
+	if v, ok := n.display[id]; ok {
+		return v
+	}
+	return "外部:" + id
+}
 
+func (n fakeExternalNamer) FileLabel(_ context.Context, id string) string {
+	if v, ok := n.labels[id]; ok {
+		return v
+	}
+	return "外部联系人_" + id
+}
+
+// emptyNameResolver 内部员工姓名解析统一返回空串（模拟 T1 之后的非纳管员工）。
+type emptyNameResolver struct{}
+
+func (emptyNameResolver) PersonName(string, string) string                 { return "" }
+func (emptyNameResolver) Managed(string, string) (*storage.Identity, bool) { return nil, false }
+func (emptyNameResolver) ResolveWeCom(u string) (*storage.Identity, error) {
+	return &storage.Identity{WeComUserID: u}, nil
+}
+func (emptyNameResolver) ResolveFeishu(u string) (*storage.Identity, error) {
+	return &storage.Identity{FeishuUserID: u}, nil
+}
+
+// 外部联系人单聊：文件名用固定标签，正文发送人显示"外部:名字@公司"。
+func TestSingleChatWithExternalContact(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	s.SetExternalNamer(fakeExternalNamer{
+		display: map[string]string{"wmABCDEF12": "外部:张三@某公司"},
+		labels:  map[string]string{"wmABCDEF12": "张三@某公司_EF12"},
+	})
+
+	// 客户发来消息：发送人是外部联系人
+	rec := dmRecord("e1", "wmABCDEF12", "u1", "报价单发我一下")
+	if err := s.WriteRecord(context.Background(), rec, nil); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+
+	// 外部联系人自身不建员工目录
+	for p := range fs.files {
+		if strings.Contains(p, "/wmABCDEF12/") || strings.Contains(p, "/外部:") {
+			t.Fatalf("不应给外部联系人或显示名建目录: %s", p)
+		}
+	}
+
+	const mdPath = "/FastGPT-test/张三/企微/群聊记录/与张三@某公司_EF12的单聊.md"
+	md, ok := fs.files[mdPath]
+	if !ok {
+		t.Fatalf("缺会话 md %s，实际文件: %v", mdPath, keysOf(fs.files))
+	}
+	if !strings.Contains(string(md), "外部:张三@某公司") {
+		t.Fatalf("发送人应显示外部联系人名字:\n%s", md)
+	}
+	if strings.Contains(string(md), "**wmABCDEF12**") {
+		t.Fatalf("发送人不应再显示 ID:\n%s", md)
+	}
+}
+
+// 没注入 ExternalNamer 时保持旧行为：外部联系人仍用 ID。
+func TestSingleChatExternalWithoutNamer(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	if err := s.WriteRecord(context.Background(), dmRecord("e2", "wmABCDEF12", "u1", "hi"), nil); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	const mdPath = "/FastGPT-test/张三/企微/群聊记录/与wmABCDEF12的单聊.md"
+	if _, ok := fs.files[mdPath]; !ok {
+		t.Fatalf("未配置客户联系时应沿用 ID 文件名，实际: %v", keysOf(fs.files))
+	}
+}
+
+// 内部员工 PersonName 返回空串时用 uid 兜底（不能出现"与的单聊.md"和空发送人）。
+func TestEmptyPersonNameFallsBackToUID(t *testing.T) {
+	st, err := storage.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer st.Close()
+	fs := newFakeFS()
+	s := New(Config{RootPath: "/FastGPT-test"}, classifier.New(classifier.Config{}), emptyNameResolver{}, st)
+	s.fs = fs
+
+	if err := s.WriteRecord(context.Background(), dmRecord("m5", "u1", "u2", "正文"), nil); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	const mdPath = "/FastGPT-test/u1/企微/群聊记录/与u2的单聊.md"
+	md, ok := fs.files[mdPath]
+	if !ok {
+		t.Fatalf("空姓名应兜底用 uid，实际: %v", keysOf(fs.files))
+	}
+	if !strings.Contains(string(md), "] u1**：正文") {
+		t.Fatalf("发送人应兜底显示 uid:\n%s", md)
+	}
+}
+
+// keysOf 便于失败时打印实际文件列表。
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// fakeGroupNamer 可换返回值的客户群名解析器（模拟"先查不到、后查到真名"）。
+type fakeGroupNamer struct {
+	name  string
+	calls int
+}
+
+func (f *fakeGroupNamer) GroupName(ctx context.Context, roomID string) string {
+	f.calls++
+	return f.name
+}
+
+// groupRecord 构造一条群聊消息（from + roomid）。
+func groupRecord(msgid, roomID, from, content string, participants ...string) model.Record {
+	to := ""
+	if len(participants) > 0 {
+		to = `,"tolist":["` + strings.Join(participants, `","`) + `"]`
+	}
+	owners := append([]string{from}, participants...)
+	return model.Record{
+		Source: "wecom", Kind: "text", ID: msgid, Timestamp: 1760000000000,
+		SenderID: from, OwnerIDs: owners,
+		Body: []byte(fmt.Sprintf(`{"msgid":"%s","action":"send","from":"%s","roomid":"%s"%s,"msgtime":1760000000000,"msgtype":"text","text":{"content":"%s"}}`,
+			msgid, from, roomID, to, content)),
+	}
+}
+
+// GroupNamer 返回真名 → 文件名用真名（外部联系人 ID / 推断都不参与）。
+func TestGroupFileUsesRealName(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	gn := &fakeGroupNamer{name: "江湾测试群"}
+	s.SetGroupNamer(gn)
+
+	rec := groupRecord("gn1", "wrTESTREALNAME", "u1", "群里的第一句话", "u2")
+	if err := s.WriteRecord(context.Background(), rec, nil); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	const want = "/FastGPT-test/张三/企微/群聊记录/群聊_江湾测试群.md"
+	if _, ok := fs.files[want]; !ok {
+		t.Fatalf("应使用真实群名，实际文件: %v", keys(fs.files))
+	}
+	if gn.calls == 0 {
+		t.Fatal("应调用 GroupNamer")
+	}
+	// 不会写推断名到 room_names
+	if name, _, ok := s.store.GetRoomNameWithSource("wrTESTREALNAME"); ok && name != "" {
+		t.Fatalf("有真实群名时不应写推断名: %q", name)
+	}
+}
+
+// 推断名首次写定后不再变化：后续消息参与者变多，文件名不变。
+func TestGroupFileInferredNameIsStable(t *testing.T) {
+	s, fs, st := newTestSink(t)
+	const room = "wrTESTINFER02"
+
+	// 第一条：u1/u2 → "张三、李四的群聊"
+	if err := s.WriteRecord(context.Background(), groupRecord("gi1", room, "u1", "消息1", "u2"), nil); err != nil {
+		t.Fatalf("WriteRecord 1: %v", err)
+	}
+	const want = "群聊_张三、李四的群聊.md"
+	dir := "/FastGPT-test/张三/企微/群聊记录"
+	if _, ok := fs.files[path.Join(dir, want)]; !ok {
+		t.Fatalf("首条消息应推断为 %q，实际文件: %v", want, keys(fs.files))
+	}
+	if name, source, ok := st.GetRoomNameWithSource(room); !ok || name != "张三、李四的群聊" || source != storage.RoomNameSourceInferred {
+		t.Fatalf("推断名应写库固定: %q %q %v", name, source, ok)
+	}
+
+	// 后续：参与者变多（u3 王五）→ 文件名必须不变
+	if err := s.WriteRecord(context.Background(), groupRecord("gi2", room, "u3", "消息2", "u1", "u2"), nil); err != nil {
+		t.Fatalf("WriteRecord 2: %v", err)
+	}
+	for _, p := range []string{"张三", "李四", "王五"} {
+		f := fmt.Sprintf("/FastGPT-test/%s/企微/群聊记录/%s", p, want)
+		md, ok := fs.files[f]
+		if !ok {
+			t.Fatalf("%s 目录下应有固定文件 %q，实际: %v", p, want, keys(fs.files))
+		}
+		if !strings.Contains(string(md), "消息2") {
+			t.Fatalf("%s 的文件应包含后续消息:\n%s", p, md)
+		}
+	}
+	for _, k := range keys(fs.files) {
+		if strings.Contains(k, "等人的群聊") || strings.Contains(k, "王五、") {
+			t.Fatalf("参与者变多后不应产生新文件: %s", k)
+		}
+	}
+}
+
+// 参与者超过 3 个实名员工 → "<A、B、C>等人的群聊"。
+func TestGroupFileInferredNameManyMembers(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	s.ids = fakeResolver{names: map[string]string{"u1": "张三", "u2": "李四", "u3": "王五", "u4": "赵六"}}
+	rec := groupRecord("gm1", "wrTESTMANY01", "u1", "消息", "u2", "u3", "u4")
+	if err := s.WriteRecord(context.Background(), rec, nil); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	const want = "/FastGPT-test/张三/企微/群聊记录/群聊_张三、李四、王五等人的群聊.md"
+	if _, ok := fs.files[want]; !ok {
+		t.Fatalf("超过 3 人应加“等人”，实际文件: %v", keys(fs.files))
+	}
+}
+
+// 参与者全是外部联系人 / 解析不出名字 → 兜底文件名，只带 roomID 后 6 位，不含完整 ID。
+func TestGroupFileFallbackName(t *testing.T) {
+	s, fs, st := newTestSink(t)
+	// 只保留外部联系人与机器人：都解析不出实名
+	s.ids = fakeResolver{names: map[string]string{"u1": "", "wbBOT001": ""}}
+	const room = "wrTESTFALLBACK0123456789"
+
+	rec := groupRecord("gf1", room, "wmEXT001", "客户说的话", "wbBOT001")
+	if err := s.WriteRecord(context.Background(), rec, nil); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	var found string
+	for k := range fs.files {
+		if strings.HasSuffix(k, ".md") {
+			found = k
+		}
+	}
+	if !strings.HasSuffix(found, "/群聊记录/群聊_未命名群聊_456789.md") {
+		t.Fatalf("兜底文件名应为 群聊_未命名群聊_<roomID 后6位>.md，实际 %q（全部文件: %v）", found, keys(fs.files))
+	}
+	for k := range fs.files {
+		if strings.Contains(k, room) {
+			t.Fatalf("文件名不得含完整 roomID: %s", k)
+		}
+	}
+	if name, _, ok := st.GetRoomNameWithSource(room); ok && name != "" {
+		t.Fatalf("兜底不应写库: %q", name)
+	}
+}
+
+// GroupNamer 先返回 ""（用推断名），之后返回真名 → 改用真名写入新文件。
+func TestGroupFileRealNameOverridesInferred(t *testing.T) {
+	s, fs, _ := newTestSink(t)
+	gn := &fakeGroupNamer{}
+	s.SetGroupNamer(gn)
+	const room = "wrTESTLATE01"
+	dir := "/FastGPT-test/张三/企微/群聊记录"
+
+	if err := s.WriteRecord(context.Background(), groupRecord("gl1", room, "u1", "早期消息", "u2"), nil); err != nil {
+		t.Fatalf("WriteRecord 1: %v", err)
+	}
+	const inferred = "群聊_张三、李四的群聊.md"
+	if _, ok := fs.files[path.Join(dir, inferred)]; !ok {
+		t.Fatalf("查不到真名时应先用推断名，实际文件: %v", keys(fs.files))
+	}
+
+	gn.name = "江湾测试群"
+	if err := s.WriteRecord(context.Background(), groupRecord("gl2", room, "u1", "后期消息", "u2"), nil); err != nil {
+		t.Fatalf("WriteRecord 2: %v", err)
+	}
+	const real = "群聊_江湾测试群.md"
+	md, ok := fs.files[path.Join(dir, real)]
+	if !ok {
+		t.Fatalf("查到真名后应改用真名，实际文件: %v", keys(fs.files))
+	}
+	if !strings.Contains(string(md), "后期消息") {
+		t.Fatalf("真名文件应包含新消息:\n%s", md)
+	}
+	// 旧推断名文件保留（标准：群改名后旧文件保留）
+	if _, ok := fs.files[path.Join(dir, inferred)]; !ok {
+		t.Fatal("旧文件应保留")
+	}
+}
+
+// keys 列出 fakeFS 里的文件路径（断言失败时便于排查）。
+func keys(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
