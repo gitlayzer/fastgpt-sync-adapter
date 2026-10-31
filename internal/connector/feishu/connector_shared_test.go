@@ -133,8 +133,8 @@ func TestSharedFolderFoundBySearch(t *testing.T) {
 	c := newUserConn(t, st, api, Config{})
 
 	round(t, c)
-	if got := copyPersons(t, st, "f1"); fmt.Sprint(got) != "[ou_a ou_b]" {
-		t.Fatalf("f1 副本应给 A 和所有者 B，实际 %v", got)
+	if got := copyPersons(t, st, "f1"); fmt.Sprint(got) != "[ou_a]" {
+		t.Fatalf("f1 副本只应给 A，所有者 B 没授权，实际 %v", got)
 	}
 	if got := copyPersons(t, st, "d1"); len(got) != 0 {
 		t.Fatalf("单篇共享文档不应存，实际 %v", got)
@@ -163,8 +163,8 @@ func TestSharedFolderRevoked(t *testing.T) {
 
 	api.failed["fld"] = codeMetaNoPerm
 	recs := round(t, c)
-	if fmt.Sprint(kinds(recs)) != "[delete:del_f1_ou_a delete:del_f1_ou_b]" {
-		t.Fatalf("应删除 A 和所有者的副本，实际 %v", kinds(recs))
+	if fmt.Sprint(kinds(recs)) != "[delete:del_f1_ou_a]" {
+		t.Fatalf("应删除 A 的副本，实际 %v", kinds(recs))
 	}
 	if roots, _ := st.ListSharedRoots("ou_a"); len(roots) != 0 {
 		t.Fatalf("应移出共享表，实际 %+v", roots)
@@ -298,8 +298,8 @@ func TestSharedSmartNoteFoundBySearch(t *testing.T) {
 	c := newUserConn(t, st, api, Config{})
 
 	round(t, c)
-	if got := copyPersons(t, st, "sn1"); fmt.Sprint(got) != "[ou_a ou_b]" {
-		t.Fatalf("智能纪要应给参会人 A 和所有者 B 各存一份，实际 %v", got)
+	if got := copyPersons(t, st, "sn1"); fmt.Sprint(got) != "[ou_a]" {
+		t.Fatalf("智能纪要只应给参会人 A，组织者 B 没授权，实际 %v", got)
 	}
 	if got := copyPersons(t, st, "d1"); len(got) != 0 {
 		t.Fatalf("普通单篇文档不应存，实际 %v", got)
@@ -315,7 +315,7 @@ func TestSharedSmartNoteFoundBySearch(t *testing.T) {
 
 	api.failed["sn1"] = codeMetaNoPerm
 	recs := round(t, c)
-	if fmt.Sprint(kinds(recs)) != "[delete:del_sn1_ou_a delete:del_sn1_ou_b]" {
+	if fmt.Sprint(kinds(recs)) != "[delete:del_sn1_ou_a]" {
 		t.Fatalf("看不到后应删除副本，实际 %v", kinds(recs))
 	}
 }
@@ -507,6 +507,31 @@ func TestSharedPerRoundFair(t *testing.T) {
 	}
 	if fresh != 2 {
 		t.Fatalf("第二轮应先轮到还没搜过的 2 个人，第一轮 %v，第二轮 %v", first, api.searchBy)
+	}
+}
+
+// 非纳管员工不占搜索名额：每轮只有 1 个名额时，纳管员工不管排第几都能搜到。
+func TestSharedUnmanagedTakesNoSlot(t *testing.T) {
+	for _, managed := range []string{"ou_a", "ou_x1", "ou_x2"} {
+		st, api := sharedSetup(t)
+		tokens := map[string]string{"ou_a": "ut0"}
+		for _, id := range []string{"ou_x1", "ou_x2"} {
+			tokens[id] = "ut_" + id
+			st.UpsertOAuthGrant(&storage.OAuthGrant{
+				Platform: "feishu", ExternalUserID: id, AccessToken: tokens[id], RefreshToken: "rt",
+				ExpireAt: time.Now().Unix() + 3600, RefreshExpireAt: time.Now().Unix() + 86400, Status: "authorized",
+			})
+			api.roots[tokens[id]] = "root_" + id
+		}
+		c := newUserConn(t, st, api, Config{SharedPerRound: 1})
+		c.SetManaged(func(id string) bool { return id == managed })
+		round(t, c)
+		if len(api.searchBy) != 1 {
+			t.Fatalf("只应有纳管员工 %s 搜索，实际 %v", managed, api.searchBy)
+		}
+		if got := rootTypes(st, managed); got["fld"] != "folder" {
+			t.Fatalf("纳管员工 %s 应记下共享文件夹，实际 %v", managed, got)
+		}
 	}
 }
 

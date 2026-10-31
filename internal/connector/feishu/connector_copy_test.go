@@ -200,7 +200,7 @@ func TestCopyForeignWikiSpaceIgnored(t *testing.T) {
 	}
 }
 
-// 第 4 条：团队库文档 A、B 都能看到，所有者 C（未授权）→ 三个人各一份。
+// 第 4 条：团队库文档 A、B 都能看到，所有者 C 没授权 → A、B 各一份，C 没有。
 func TestCopyTeamWikiEveryViewer(t *testing.T) {
 	st := copyStore(t, "ou_a", "ou_b")
 	api := newCopyAPI()
@@ -213,38 +213,166 @@ func TestCopyTeamWikiEveryViewer(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("应产出 1 条写入，实际 %v", kinds(got))
 	}
-	if ids := got[0].OwnerIDs; len(ids) != 3 || ids[0] != "ou_c" || ids[1] != "ou_a" || ids[2] != "ou_b" {
-		t.Fatalf("应写给 所有者 C、A、B，实际 %v", ids)
+	if ids := got[0].OwnerIDs; len(ids) != 2 || ids[0] != "ou_a" || ids[1] != "ou_b" {
+		t.Fatalf("应写给 A、B，实际 %v", ids)
 	}
-	if p := copyPersons(t, st, "teamdoc"); len(p) != 3 {
-		t.Fatalf("Ack 后应有 3 份副本，实际 %v", p)
+	if p := copyPersons(t, st, "teamdoc"); len(p) != 2 {
+		t.Fatalf("Ack 后应有 2 份副本，实际 %v", p)
 	}
 }
 
-// 第 4 条：A 共享给未授权的 D → D 有一份；把 D 移出协作者 → 只删 D 的。
+// 协作者：纳管且已授权的 D 有一份，移出协作者后只删 D 的；没授权的 E 和群都没有。
 func TestCopyCollaboratorAddedAndRemoved(t *testing.T) {
-	st := copyStore(t, "ou_a")
+	st := copyStore(t, "ou_a", "ou_d")
 	api := newCopyAPI()
 	api.roots["ut0"] = "rootA"
+	api.roots["ut1"] = "rootD"
 	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "方案", "ou_a", "100")}
 	api.members = map[string][]feishuapi.PermissionMember{"d1": {
 		{MemberType: "openid", MemberID: "ou_a", Perm: "full_access"},
 		{MemberType: "openid", MemberID: "ou_d", Perm: "view"},
+		{MemberType: "openid", MemberID: "ou_e", Perm: "view"},
 		{MemberType: "openchat", MemberID: "oc_group", Perm: "view"},
 	}}
 	c := newUserConn(t, st, api, Config{CollabRefresh: time.Nanosecond}) // 每轮都刷新
 
 	round(t, c)
-	if p := copyPersons(t, st, "d1"); len(p) != 2 || p[0] != "ou_a" || p[1] != "ou_d" {
-		t.Fatalf("应只有 A、D 两份（群不展开），实际 %v", p)
+	if p := copyPersons(t, st, "d1"); fmt.Sprint(p) != "[ou_a ou_d]" {
+		t.Fatalf("应只有 A、D 两份，实际 %v", p)
 	}
 	api.members["d1"] = api.members["d1"][:1] // 移除 D
 	got := round(t, c)
 	if len(got) != 1 || got[0].ID != "del_d1_ou_d" {
 		t.Fatalf("应只删 D 的那份，实际 %v", kinds(got))
 	}
-	if p := copyPersons(t, st, "d1"); len(p) != 1 || p[0] != "ou_a" {
+	if p := copyPersons(t, st, "d1"); fmt.Sprint(p) != "[ou_a]" {
 		t.Fatalf("应只剩 A 的副本，实际 %v", p)
+	}
+}
+
+// 协作者列表用的是上次查到的缓存时，没授权的人同样不写。
+func TestCopyCachedCollaboratorSkipped(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "方案", "ou_a", "100")}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if err := st.SetDocMembers("d1", time.Now().Unix(), []string{"ou_e"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := round(t, c); len(got) != 0 {
+		t.Fatalf("不应写给没授权的协作者，实际 %v", kinds(got))
+	}
+}
+
+// 所有者没授权：只落看到文档的人，不给所有者写（否则 NAS 上出现以 open_id 命名的目录）。
+func TestCopyUnauthorizedOwnerGetsNothing(t *testing.T) {
+	st := copyStore(t, "ou_a")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "B 的文档", "ou_b", "100")}
+	c := newUserConn(t, st, api, Config{})
+	recs := round(t, c)
+	if len(recs) != 1 || fmt.Sprint(recs[0].OwnerIDs) != "[ou_a]" {
+		t.Fatalf("应只写给 A，实际 %+v", recs)
+	}
+	if p := copyPersons(t, st, "d1"); fmt.Sprint(p) != "[ou_a]" {
+		t.Fatalf("只应有 A 一份，实际 %v", p)
+	}
+
+	api.folders["rootA"] = nil
+	if got := round(t, c); len(got) != 1 || got[0].ID != "del_d1_ou_a" {
+		t.Fatalf("A 看不到后应删除 A 那份，实际 %v", kinds(got))
+	}
+}
+
+// 员工变成非纳管后没有扫描：别人那份整篇删除时，他的副本先留着（分不清是文档被删还是他失去权限）。
+func TestCopyUnmanagedHolderKept(t *testing.T) {
+	st := copyStore(t, "ou_a", "ou_b")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.roots["ut1"] = "rootB"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "第三人的文档", "ou_c", "100")}
+	api.folders["rootB"] = []feishuapi.DriveFile{doc("d1", "第三人的文档", "ou_c", "100")}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if p := copyPersons(t, st, "d1"); fmt.Sprint(p) != "[ou_a ou_b]" {
+		t.Fatalf("应有 A、B 两份，实际 %v", p)
+	}
+
+	c.SetManaged(func(id string) bool { return id == "ou_b" })
+	api.folders["rootB"] = nil
+	got := round(t, c)
+	if len(got) != 1 || got[0].ID != "del_d1_ou_b" {
+		t.Fatalf("应只删 B 的那份，实际 %v", kinds(got))
+	}
+	if p := copyPersons(t, st, "d1"); fmt.Sprint(p) != "[ou_a]" {
+		t.Fatalf("A 的副本应保留，实际 %v", p)
+	}
+}
+
+// 所有者已授权：文档放在别人文件夹里、本人云盘列不到时，所有者仍有一份；
+// 那个人变成非纳管后没有扫描，所有者这份也不能删。
+func TestCopyAuthorizedOwnerStillHolds(t *testing.T) {
+	st := copyStore(t, "ou_a", "ou_b")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.roots["ut1"] = "rootB"
+	api.folders["rootB"] = []feishuapi.DriveFile{doc("d1", "A 写在 B 文件夹", "ou_a", "100")}
+	c := newUserConn(t, st, api, Config{})
+	round(t, c)
+	if p := copyPersons(t, st, "d1"); fmt.Sprint(p) != "[ou_a ou_b]" {
+		t.Fatalf("应有 A、B 两份，实际 %v", p)
+	}
+	c.SetManaged(func(id string) bool { return id == "ou_a" })
+	if got := round(t, c); len(got) != 0 {
+		t.Fatalf("B 没扫描时不应删除，实际 %v", kinds(got))
+	}
+	if p := copyPersons(t, st, "d1"); fmt.Sprint(p) != "[ou_a ou_b]" {
+		t.Fatalf("A、B 的副本都应保留，实际 %v", p)
+	}
+}
+
+// tenant 模式：所有者不是纳管员工时同样不写。
+func TestCopyTenantModeUnmanagedOwner(t *testing.T) {
+	st := copyStore(t)
+	api := newCopyAPI()
+	api.folders["fld"] = []feishuapi.DriveFile{doc("d1", "我的", "ou_a", "100"), doc("d2", "别人的", "ou_x", "100")}
+	c := NewWithAPI(Config{Mode: "tenant", Folders: []string{"fld"}}, st, api)
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.SetManaged(func(id string) bool { return id == "ou_a" })
+	got := round(t, c)
+	if len(got) != 1 || got[0].ID != "d1" || fmt.Sprint(got[0].OwnerIDs) != "[ou_a]" {
+		t.Fatalf("应只写纳管所有者的文档，实际 %+v", got)
+	}
+}
+
+// 非纳管员工（不在名单、离职、重名）：已授权也不拉取、不落副本；他是所有者时同样不写。
+func TestCopyUnmanagedUserSkipped(t *testing.T) {
+	st := copyStore(t, "ou_a", "ou_b")
+	api := newCopyAPI()
+	api.roots["ut0"] = "rootA"
+	api.roots["ut1"] = "rootB"
+	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "A 的文档", "ou_a", "100"), doc("d2", "B 的文档", "ou_b", "100")}
+	api.folders["rootB"] = []feishuapi.DriveFile{doc("d3", "B 自己的", "ou_b", "100")}
+	c := newUserConn(t, st, api, Config{})
+	c.SetManaged(func(id string) bool { return id == "ou_a" })
+	round(t, c)
+	if p := copyPersons(t, st, "d2"); fmt.Sprint(p) != "[ou_a]" {
+		t.Fatalf("B 不是纳管员工，不应给他写，实际 %v", p)
+	}
+	if p := copyPersons(t, st, "d3"); len(p) != 0 {
+		t.Fatalf("不应扫描非纳管员工，实际 %v", p)
+	}
+
+	// 变成非纳管后：已有的副本留着，不删除
+	c.SetManaged(func(id string) bool { return id == "ou_b" })
+	api.folders["rootA"] = nil
+	if got := round(t, c); len(deleteRecs(got)) != 0 {
+		t.Fatalf("没扫描的人副本应保留，实际 %v", kinds(got))
 	}
 }
 
@@ -254,14 +382,13 @@ func TestCopyOwnerDeletesDoc(t *testing.T) {
 	api := newCopyAPI()
 	api.roots["ut0"] = "rootA"
 	api.folders["rootA"] = []feishuapi.DriveFile{doc("d1", "方案", "ou_a", "100")}
-	api.members = map[string][]feishuapi.PermissionMember{"d1": {{MemberType: "openid", MemberID: "ou_d", Perm: "view"}}}
 	c := newUserConn(t, st, api, Config{})
 	round(t, c)
 
 	api.folders["rootA"] = nil
 	got := round(t, c)
-	if k := kinds(got); len(k) != 2 || k[0] != "delete:del_d1_ou_a" || k[1] != "delete:del_d1_ou_d" {
-		t.Fatalf("应删除 A、D 两份，实际 %v", k)
+	if k := kinds(got); len(k) != 1 || k[0] != "delete:del_d1_ou_a" {
+		t.Fatalf("应删除 A 的副本，实际 %v", k)
 	}
 	if p := copyPersons(t, st, "d1"); len(p) != 0 {
 		t.Fatalf("副本应全部清除，实际 %v", p)
@@ -296,8 +423,8 @@ func TestCopyNobodySeesUnauthorizedOwnerDoc(t *testing.T) {
 
 	api.wikiNodes["team"] = nil
 	got := round(t, c)
-	if k := kinds(got); len(k) != 2 || k[0] != "delete:del_teamdoc_ou_a" || k[1] != "delete:del_teamdoc_ou_c" {
-		t.Fatalf("应删除 A、C 两份，实际 %v", k)
+	if k := kinds(got); len(k) != 1 || k[0] != "delete:del_teamdoc_ou_a" {
+		t.Fatalf("应删除 A 的副本，实际 %v", k)
 	}
 }
 
@@ -391,8 +518,8 @@ func TestCopyDocDeleteBlockedByFailedHolder(t *testing.T) {
 	api.walkErr["team2"] = false
 	api.wikiNodes["team2"] = nil // B 也看不到了
 	got := round(t, c)
-	if k := kinds(got); len(k) != 3 {
-		t.Fatalf("应删除 A、B、C 三份，实际 %v", k)
+	if k := kinds(got); len(k) != 2 {
+		t.Fatalf("应删除 A、B 两份，实际 %v", k)
 	}
 }
 

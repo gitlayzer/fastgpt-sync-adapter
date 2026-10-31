@@ -214,6 +214,10 @@ func main() {
 			MinutesEnabled:  fc.MinutesEnabled,
 			SearchKeys:      fc.SearchKeys,
 		}, st)
+		fcConn.SetManaged(func(feishuID string) bool {
+			_, ok := ids.Managed("feishu", feishuID)
+			return ok
+		})
 		eng.AddConnector(engine.ConnectorJob{
 			Conn:       fcConn,
 			Interval:   fc.Interval.D(),

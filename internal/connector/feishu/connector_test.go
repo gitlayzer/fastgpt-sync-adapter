@@ -245,9 +245,9 @@ func TestUserModeOwnerAndViewerBothStored(t *testing.T) {
 	if r.SenderID != "ou_owner" {
 		t.Fatalf("归属应以所有者为主: %s", r.SenderID)
 	}
-	// owner + viewer 都在 OwnerIDs（NAS fan-out 各存一份）
-	if len(r.OwnerIDs) != 2 || r.OwnerIDs[0] != "ou_owner" || r.OwnerIDs[1] != "ou_viewer" {
-		t.Fatalf("OwnerIDs 应含 owner+viewer: %v", r.OwnerIDs)
+	// 所有者没授权：只落 viewer 本人（A12）
+	if len(r.OwnerIDs) != 1 || r.OwnerIDs[0] != "ou_viewer" {
+		t.Fatalf("OwnerIDs 应只含 viewer: %v", r.OwnerIDs)
 	}
 }
 
@@ -472,19 +472,9 @@ func TestSharedWithMeSearchAndOwnerViewerStored(t *testing.T) {
 	if r.SenderID != "ou_luke" {
 		t.Fatalf("归属人(Owner)应为 ou_luke, 实际: %s", r.SenderID)
 	}
-	// OwnerIDs 必须同时包含所有者 ou_luke 和查看人 ou_viewer
-	hasOwner := false
-	hasViewer := false
-	for _, oid := range r.OwnerIDs {
-		if oid == "ou_luke" {
-			hasOwner = true
-		}
-		if oid == "ou_viewer" {
-			hasViewer = true
-		}
-	}
-	if !hasOwner || !hasViewer {
-		t.Fatalf("OwnerIDs 必须同时包含 Owner(ou_luke) 与 Viewer(ou_viewer), 实际: %v", r.OwnerIDs)
+	// 所有者 ou_luke 没授权：只落查看人 ou_viewer（A12）
+	if len(r.OwnerIDs) != 1 || r.OwnerIDs[0] != "ou_viewer" {
+		t.Fatalf("OwnerIDs 应只含 Viewer(ou_viewer), 实际: %v", r.OwnerIDs)
 	}
 }
 
